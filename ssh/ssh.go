@@ -11,7 +11,7 @@ import (
 	"sync"
 )
 
-const debug = true
+const debug = false
 
 type Host struct {
 	Name string
@@ -66,12 +66,10 @@ func RunAll(ctx context.Context, host Host, stdin io.Reader, stdout, stderr io.W
 	wg.Add(2)
 	go func() {
 		io.Copy(stderr, stderrPipe)
-		fmt.Println("stderr done")
 		wg.Done()
 	}()
 	go func() {
 		io.Copy(stdout, stdoutPipe)
-		fmt.Println("stdout done")
 		wg.Done()
 	}()
 
@@ -79,8 +77,6 @@ func RunAll(ctx context.Context, host Host, stdin io.Reader, stdout, stderr io.W
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	fmt.Println("wg wait")
 	wg.Wait()
-	fmt.Println("cmd wait")
 	return cmd.Wait()
 }
