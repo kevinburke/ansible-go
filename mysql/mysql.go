@@ -6,8 +6,8 @@ import (
 	"io"
 	"strings"
 
-	"github.com/kevinburke/go-ansible/shell"
-	"github.com/kevinburke/go-ansible/ssh"
+	"github.com/kevinburke/ansible-go/shell"
+	"github.com/kevinburke/ansible-go/ssh"
 )
 
 type DumpConfig struct {
