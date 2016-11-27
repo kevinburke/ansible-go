@@ -49,7 +49,10 @@ func RunAll(ctx context.Context, host Host, stdin io.Reader, stdout, stderr io.W
 	} else {
 		hostArg = host.User + "@" + host.Name
 	}
-	args0 := append([]string{hostArg, name}, args...)
+	args0 := append([]string{"-C", "-o", "ControlMaster=no", hostArg, name}, args...)
+	if debug {
+		args0 = append([]string{"-vvv"}, args0...)
+	}
 	cmd := exec.CommandContext(ctx, "ssh", args0...)
 	if debug {
 		fmt.Printf("RUN: %s\n", strings.Join(cmd.Args, " "))

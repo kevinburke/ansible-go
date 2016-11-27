@@ -11,7 +11,7 @@ import (
 )
 
 type DumpConfig struct {
-	CommandConfig
+	ExecConfig
 	SingleTransaction bool
 }
 
@@ -48,7 +48,7 @@ func CreateUser(ctx context.Context, host ssh.Host, name string, cfg CreateConfi
 	}
 	createCmd := fmt.Sprintf("CREATE USER IF NOT EXISTS %s@%s", shell.Escape(name), shell.Escape(cfg.Host))
 	if cfg.Password != "" {
-		createCmd = createCmd + fmt.Sprintf(" IDENTIFIED BY %s", shell.Escape(cfg.Password))
+		createCmd = createCmd + fmt.Sprintf(" IDENTIFIED BY '%s'", shell.Escape(cfg.Password))
 	}
 	grantCmd := fmt.Sprintf("%s TO %s@%s", cfg.Privilege.String(), name, cfg.Host)
 	args := []string{"--execute", strings.Join([]string{createCmd, grantCmd}, "; ")}
@@ -81,15 +81,21 @@ func DumpWriter(ctx context.Context, host ssh.Host, dbName string, target io.Wri
 	return ssh.RunCommandStdout(ctx, host, target, "mysqldump", shell.Escape(args...))
 }
 
-type CommandConfig struct {
+type ExecConfig struct {
 	User     string
 	Password string
 	Host     string
 	Port     string
 }
 
+type RunConfig struct {
+	ExecConfig
+	// Name of the database to run commands on
+	Database string
+}
+
 // RunCommands SSH's to the remote host, then pipes the given cmds to mysql.
-func RunCommands(ctx context.Context, host ssh.Host, dbName string, cmds io.Reader, cfg CommandConfig) error {
+func RunCommands(ctx context.Context, host ssh.Host, cmds io.Reader, cfg RunConfig) error {
 	if cfg.Port == "" {
 		cfg.Port = "3306"
 	}
@@ -103,6 +109,8 @@ func RunCommands(ctx context.Context, host ssh.Host, dbName string, cmds io.Read
 	if cfg.Password != "" {
 		args = append(args, fmt.Sprintf("--password=%s", cfg.Password))
 	}
-	args = append(args, dbName)
+	if cfg.Database != "" {
+		args = append(args, cfg.Database)
+	}
 	return ssh.RunCommandStdin(ctx, host, cmds, "mysql", shell.Escape(args...))
 }
