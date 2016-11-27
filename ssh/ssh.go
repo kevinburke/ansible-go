@@ -12,6 +12,7 @@ import (
 )
 
 const debug = false
+const debugSSH = false
 
 type Host struct {
 	Name string
@@ -49,13 +50,14 @@ func RunAll(ctx context.Context, host Host, stdin io.Reader, stdout, stderr io.W
 	} else {
 		hostArg = host.User + "@" + host.Name
 	}
+	fmt.Printf("RUN: %s %s\n", name, strings.Join(args, " "))
 	args0 := append([]string{"-C", "-o", "ControlMaster=no", hostArg, name}, args...)
-	if debug {
+	if debugSSH {
 		args0 = append([]string{"-vvv"}, args0...)
 	}
 	cmd := exec.CommandContext(ctx, "ssh", args0...)
 	if debug {
-		fmt.Printf("RUN: %s\n", strings.Join(cmd.Args, " "))
+		fmt.Printf("CMD: %s\n", strings.Join(cmd.Args, " "))
 	}
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
