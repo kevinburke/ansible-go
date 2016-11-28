@@ -145,6 +145,14 @@ func Expires(expires time.Time) func(au *AddUser) error {
 	}
 }
 
+// AppendGroups will append secondary Groups to the list of existing groups.
+func AppendGroups() func(au *AddUser) error {
+	return func(au *AddUser) error {
+		au.appendGroups = true
+		return nil
+	}
+}
+
 // AddUserCommand ensures that user with the given name exists with the given
 // UserOpts.
 func Add(ctx context.Context, host ssh.Host, name string, opts ...func(*AddUser) error) error {

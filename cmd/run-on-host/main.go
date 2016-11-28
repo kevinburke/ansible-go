@@ -49,20 +49,19 @@ func main() {
 	cmd.Stderr = buf
 	fmt.Fprintf(os.Stderr, "LOCAL: %s\n", strings.Join(cmd.Args, " "))
 	if err := cmd.Run(); err != nil {
-		io.Copy(buf, os.Stderr)
+		io.Copy(os.Stderr, buf)
 		log.Fatal(err)
 	}
 	fmt.Println("Compiled successfully")
 	firstPath := strings.Split(gopath, ":")[0]
-	binary := filepath.Join(firstPath, "bin", goos+"_"+goarch)
-	f, err := os.Open(binary)
+	// 3. scp it to host
+	binary := filepath.Join(firstPath, "bin", goos+"_"+goarch, filepath.Base(flag.Arg(0)))
+	fmt.Println("binary", binary)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer f.Close()
-	if err := ssh.RunCommandStdin(ctx, host, f, "cat", ">", "/tmp/remote-bin"); err != nil {
+	if err := ssh.PutFile(ctx, host, binary, "/tmp/remote-bin"); err != nil {
 		log.Fatal(err)
 	}
-	// 3. scp it to host
 	// 4. ssh to host and run binary with flags
 }
