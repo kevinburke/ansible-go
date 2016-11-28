@@ -37,6 +37,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	fmt.Fprintf(os.Stderr, "detected GOOS=%s, GOARCH=%s, compiling binary\n", goos, goarch)
 	// 2. cross compile a binary for that target
 	cmd := exec.CommandContext(ctx, "go", "install", flag.Arg(0))
 	cmd.Env = []string{
@@ -52,16 +53,20 @@ func main() {
 		io.Copy(os.Stderr, buf)
 		log.Fatal(err)
 	}
-	fmt.Println("Compiled successfully")
 	firstPath := strings.Split(gopath, ":")[0]
 	// 3. scp it to host
-	binary := filepath.Join(firstPath, "bin", goos+"_"+goarch, filepath.Base(flag.Arg(0)))
-	fmt.Println("binary", binary)
-	if err != nil {
+	base := filepath.Base(flag.Arg(0))
+	binary := filepath.Join(firstPath, "bin", goos+"_"+goarch, base)
+	remoteBinary := "/tmp/" + base
+	if err := ssh.PutFile(ctx, host, binary, remoteBinary); err != nil {
 		log.Fatal(err)
 	}
-	if err := ssh.PutFile(ctx, host, binary, "/tmp/remote-bin"); err != nil {
+	remoteConfig := fmt.Sprintf("/tmp/%s-config.yml", base)
+	if err := ssh.PutFile(ctx, host, *cfg, remoteConfig); err != nil {
 		log.Fatal(err)
 	}
 	// 4. ssh to host and run binary with flags
+	if err := ssh.RunCommand(ctx, host, remoteBinary, "--config", remoteConfig); err != nil {
+		log.Fatal(err)
+	}
 }

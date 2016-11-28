@@ -14,8 +14,8 @@ import (
 	yaml "gopkg.in/yaml.v2"
 )
 
-const debug = true
-const debugSSH = true
+const debug = false
+const debugSSH = false
 
 type Host struct {
 	Name string `yaml:"host"`
@@ -121,7 +121,6 @@ var sshCmdRunner = cmdRunner{cmd: "ssh"}
 var scpCmdRunner = cmdRunner{cmd: "scp"}
 
 func (c cmdRunner) RunAll(ctx context.Context, host Host, stdin io.Reader, stdout, stderr io.Writer, name string, args ...string) error {
-	fmt.Fprintf(os.Stderr, "RUN: %s %s\n", name, strings.Join(args, " "))
 	var hostArg string
 	if host.User == "" {
 		hostArg = host.Name
@@ -130,12 +129,14 @@ func (c cmdRunner) RunAll(ctx context.Context, host Host, stdin io.Reader, stdou
 	}
 	var cmd *exec.Cmd
 	if c.cmd == "ssh" {
+		fmt.Fprintf(os.Stderr, "RUN: %s %s\n", name, strings.Join(args, " "))
 		args0 := append([]string{"-C", "-o", "ControlMaster=no", hostArg, name}, args...)
 		if debugSSH {
 			args0 = append([]string{"-vvv"}, args0...)
 		}
 		cmd = exec.CommandContext(ctx, "ssh", args0...)
 	} else if c.cmd == "scp" {
+		fmt.Fprintf(os.Stderr, "LOCAL: scp %s\n", strings.Join(args, " "))
 		// name ignored for scp
 		cmd = exec.CommandContext(ctx, "scp", args...)
 	}
