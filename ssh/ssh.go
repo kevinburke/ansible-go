@@ -5,18 +5,70 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"os/exec"
 	"strings"
 	"sync"
+
+	yaml "gopkg.in/yaml.v2"
 )
 
-const debug = false
-const debugSSH = false
+const debug = true
+const debugSSH = true
 
 type Host struct {
-	Name string
-	User string
+	Name string `yaml:"host"`
+	User string `yaml:"user"`
+}
+
+func GetHostFromFile(filename string) (Host, error) {
+	data, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return Host{}, err
+	}
+	h := new(Host)
+	err = yaml.Unmarshal(data, h)
+	return *h, err
+}
+
+func DetectOSArch(ctx context.Context, host Host) (string, string, error) {
+	buf := new(bytes.Buffer)
+	err := RunCommandStdout(ctx, host, buf, "uname", "-sm")
+	if err != nil {
+		return "", "", err
+	}
+	str := strings.TrimSpace(buf.String())
+	parts := strings.Split(str, " ")
+	if len(parts) != 2 {
+		return "", "", fmt.Errorf("Invalid uname response: %s", str)
+	}
+	var goos, goarch string
+	switch strings.ToLower(parts[0]) {
+	case "darwin":
+		goos = "darwin"
+	case "linux":
+		goos = "linux"
+	case "freebsd":
+		goos = "freebsd"
+	case "dragonfly":
+		goos = "dragonfly"
+	default:
+		return "", "", fmt.Errorf("Unknown os: %s. Please report this", parts[0])
+	}
+	switch strings.ToLower(parts[1]) {
+	case "x86_64":
+		goarch = "amd64"
+	case "i386":
+		goarch = "386"
+	case "armv7l", "armv6l":
+		goarch = "arm"
+	case "2097":
+		goarch = "s390x"
+	default:
+		return "", "", fmt.Errorf("Unknown arch: %s. Please report this so we can fix it", parts[0])
+	}
+	return goos, goarch, nil
 }
 
 func RunCommand(ctx context.Context, host Host, name string, args ...string) error {
@@ -50,14 +102,14 @@ func RunAll(ctx context.Context, host Host, stdin io.Reader, stdout, stderr io.W
 	} else {
 		hostArg = host.User + "@" + host.Name
 	}
-	fmt.Printf("RUN: %s %s\n", name, strings.Join(args, " "))
+	fmt.Fprintf(os.Stderr, "RUN: %s %s\n", name, strings.Join(args, " "))
 	args0 := append([]string{"-C", "-o", "ControlMaster=no", hostArg, name}, args...)
 	if debugSSH {
 		args0 = append([]string{"-vvv"}, args0...)
 	}
 	cmd := exec.CommandContext(ctx, "ssh", args0...)
 	if debug {
-		fmt.Printf("CMD: %s\n", strings.Join(cmd.Args, " "))
+		fmt.Fprintf(os.Stderr, "CMD: %s\n", strings.Join(cmd.Args, " "))
 	}
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
