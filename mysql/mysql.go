@@ -2,10 +2,12 @@ package mysql
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
 
+	"github.com/kevinburke/ansible-go/core"
 	"github.com/kevinburke/ansible-go/shell"
 	"github.com/kevinburke/ansible-go/ssh"
 )
@@ -52,33 +54,34 @@ func CreateUser(ctx context.Context, host ssh.Host, name string, cfg CreateConfi
 	}
 	grantCmd := fmt.Sprintf("%s TO %s@%s", cfg.Privilege.String(), name, cfg.Host)
 	args := []string{"--execute", strings.Join([]string{createCmd, grantCmd}, "; ")}
-	return ssh.RunCommand(ctx, host, "mysql", shell.Escape(args...))
+	return core.RunCommand(ctx, "mysql", shell.Escape(args...))
 }
 
 // DumpWriter runs mysqldump on the remote host and writes the contents to
 // target.
 func DumpWriter(ctx context.Context, host ssh.Host, dbName string, target io.Writer, cfg DumpConfig) error {
-	if cfg.Port == "" {
-		cfg.Port = "3306"
-	}
-	if cfg.Host == "" {
-		cfg.Host = "localhost"
-	}
-	args := []string{
-		"--compress",
-		"--tz-utc", "--dump-date",
-	}
-	if cfg.SingleTransaction {
-		args = append(args, "--single-transaction")
-	}
-	if cfg.User != "" {
-		args = append(args, "--user", cfg.User)
-	}
-	if cfg.Password != "" {
-		args = append(args, fmt.Sprintf("--password=%s", cfg.Password))
-	}
-	args = append(args, "--databases", dbName)
-	return ssh.RunCommandStdout(ctx, host, target, "mysqldump", shell.Escape(args...))
+	return errors.New("need multiplex SSH")
+	//if cfg.Port == "" {
+	//cfg.Port = "3306"
+	//}
+	//if cfg.Host == "" {
+	//cfg.Host = "localhost"
+	//}
+	//args := []string{
+	//"--compress",
+	//"--tz-utc", "--dump-date",
+	//}
+	//if cfg.SingleTransaction {
+	//args = append(args, "--single-transaction")
+	//}
+	//if cfg.User != "" {
+	//args = append(args, "--user", cfg.User)
+	//}
+	//if cfg.Password != "" {
+	//args = append(args, fmt.Sprintf("--password=%s", cfg.Password))
+	//}
+	//args = append(args, "--databases", dbName)
+	//return ssh.RunCommandStdout(ctx, host, target, "mysqldump", shell.Escape(args...))
 }
 
 type ExecConfig struct {
@@ -94,8 +97,8 @@ type RunConfig struct {
 	Database string
 }
 
-// RunCommands SSH's to the remote host, then pipes the given cmds to mysql.
-func RunCommands(ctx context.Context, host ssh.Host, cmds io.Reader, cfg RunConfig) error {
+// RunCommands pipes the given cmds to mysql.
+func RunCommands(ctx context.Context, cmds io.Reader, cfg RunConfig) error {
 	if cfg.Port == "" {
 		cfg.Port = "3306"
 	}
@@ -112,5 +115,5 @@ func RunCommands(ctx context.Context, host ssh.Host, cmds io.Reader, cfg RunConf
 	if cfg.Database != "" {
 		args = append(args, cfg.Database)
 	}
-	return ssh.RunCommandStdin(ctx, host, cmds, "mysql", shell.Escape(args...))
+	return core.RunCommandStdin(ctx, cmds, "mysql", shell.Escape(args...))
 }

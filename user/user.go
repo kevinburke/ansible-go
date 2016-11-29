@@ -5,11 +5,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kevinburke/ansible-go/ssh"
+	"github.com/kevinburke/ansible-go/core"
 )
 
 type userModule interface {
-	Add(ctx context.Context, host ssh.Host, name string) error
+	Add(ctx context.Context, name string) error
 }
 
 type AddUser struct {
@@ -51,7 +51,7 @@ type AddUser struct {
 	home bool
 }
 
-func (i *AddUser) Add(ctx context.Context, host ssh.Host, name string) error {
+func (i *AddUser) Add(ctx context.Context, name string) error {
 	args := []string{}
 	if i.uid != "" {
 		args = append(args, "--uid", i.uid)
@@ -83,7 +83,7 @@ func (i *AddUser) Add(ctx context.Context, host ssh.Host, name string) error {
 		args = append(args, "--system")
 	}
 	args = append(args, name)
-	return ssh.RunCommand(ctx, host, "useradd", args...)
+	return core.RunCommand(ctx, "useradd", args...)
 }
 
 func System(au *AddUser) error {
@@ -155,12 +155,12 @@ func AppendGroups() func(au *AddUser) error {
 
 // AddUserCommand ensures that user with the given name exists with the given
 // UserOpts.
-func Add(ctx context.Context, host ssh.Host, name string, opts ...func(*AddUser) error) error {
+func Add(ctx context.Context, name string, opts ...func(*AddUser) error) error {
 	adduser := &AddUser{}
 	for _, o := range opts {
 		if err := o(adduser); err != nil {
 			return err
 		}
 	}
-	return adduser.Add(ctx, host, name)
+	return adduser.Add(ctx, name)
 }

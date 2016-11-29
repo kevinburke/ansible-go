@@ -137,7 +137,7 @@ func (c cmdRunner) RunAll(ctx context.Context, host Host, stdin io.Reader, stdou
 		cmd = exec.CommandContext(ctx, "ssh", args0...)
 	} else if c.cmd == "scp" {
 		fmt.Fprintf(os.Stderr, "LOCAL: scp %s\n", strings.Join(args, " "))
-		// name ignored for scp
+		// TODO name ignored for scp
 		cmd = exec.CommandContext(ctx, "scp", args...)
 	}
 	if debug {
