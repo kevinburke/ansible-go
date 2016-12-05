@@ -30,8 +30,7 @@ func (i *defaultGroupImpl) Add(ctx context.Context, name string, opts GroupOpts)
 }
 
 func (i *defaultGroupImpl) Exists(ctx context.Context, name string) (bool, error) {
-	// TODO log syscall here?
-	_, err := user.LookupGroup(name)
+	_, err := lookupGroup(name)
 	if err == nil {
 		return true, nil
 	}

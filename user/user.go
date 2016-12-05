@@ -10,6 +10,8 @@ import (
 
 type userModule interface {
 	Add(ctx context.Context, name string) error
+	Mod(ctx context.Context, name string) error
+	Exists(ctx context.Context, name string) (bool, error)
 }
 
 type AddUser struct {
@@ -49,6 +51,10 @@ type AddUser struct {
 
 	// If true, create a home directory for the user.
 	home bool
+}
+
+func (i *AddUser) Exists(ctx context.Context, name string) error {
+	return nil
 }
 
 func (i *AddUser) Add(ctx context.Context, name string) error {
@@ -156,6 +162,10 @@ func AppendGroups() func(au *AddUser) error {
 // AddUserCommand ensures that user with the given name exists with the given
 // UserOpts.
 func Add(ctx context.Context, name string, opts ...func(*AddUser) error) error {
+	// if the user exists:
+	//    call Mod
+	// else:
+	//    call Add
 	adduser := &AddUser{}
 	for _, o := range opts {
 		if err := o(adduser); err != nil {
