@@ -44,7 +44,7 @@ func (i *defaultGroupImpl) Exists(ctx context.Context, name string) (bool, error
 
 // Mod modifies the group
 func (i *defaultGroupImpl) Mod(ctx context.Context, name string, opts GroupOpts) error {
-	grp, err := user.LookupGroup(name)
+	grp, err := lookupGroup(name)
 	if err != nil {
 		return err
 	}

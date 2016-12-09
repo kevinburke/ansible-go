@@ -31,12 +31,36 @@ func findUserName(name string, r io.Reader) (bool, error) {
 		if len(parts) < 4 {
 			continue
 		}
-		if parts[0] == name && parts[2] != "" {
-			return &user.Group{Name: parts[0], Gid: parts[2]}, nil
+		if parts[0] == name {
+			return true, nil
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, err
+		return false, err
 	}
-	return nil, user.UnknownGroupError(name)
+	return false, user.UnknownUserError(name)
+}
+
+// removeComment returns line, removing any '#' byte and any following
+// bytes.
+func removeComment(line string) string {
+	if i := strings.Index(line, "#"); i != -1 {
+		return line[:i]
+	}
+	return line
+}
+
+func trimSpace(x string) string {
+	for len(x) > 0 && isSpace(x[0]) {
+		x = x[1:]
+	}
+	for len(x) > 0 && isSpace(x[len(x)-1]) {
+		x = x[:len(x)-1]
+	}
+	return x
+}
+
+// isSpace reports whether b is an ASCII space character.
+func isSpace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
 }
