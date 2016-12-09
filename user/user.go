@@ -2,6 +2,7 @@ package user
 
 import (
 	"context"
+	"os/user"
 	"strings"
 	"time"
 
@@ -14,12 +15,13 @@ type userModule interface {
 	Exists(ctx context.Context, name string) (bool, error)
 }
 
+// AddUser is not thread safe.
 type AddUser struct {
 	// The encrypted password, as returned by crypt(3).
 	// The default ("") disables the password.
 	password string
 
-	// The primary group for this user.
+	// The primary group for this user. (Name, not the gid)
 	group string
 
 	// Puts the user in this list of groups.
@@ -51,10 +53,57 @@ type AddUser struct {
 
 	// If true, create a home directory for the user.
 	home bool
+
+	// A user, cached
+	user *user.User
 }
 
-func (i *AddUser) Exists(ctx context.Context, name string) error {
-	return nil
+func (i *AddUser) Exists(ctx context.Context, name string) (bool, error) {
+	var u *user.User
+	var err error
+	done := make(chan bool, 1)
+	go func() {
+		u, err = lookupUser(name)
+		done <- true
+	}()
+	select {
+	case <-ctx.Done():
+		return false, ctx.Err()
+	case <-done:
+		break
+	}
+	switch err.(type) {
+	case nil:
+		i.user = u
+		return true, nil
+	case user.UnknownUserError:
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
+// Mod modifies an existing user. Mod panics if Exists has not been called (and
+// returned true).
+func (i *AddUser) Mod(ctx context.Context, name string) error {
+	if i.user == nil {
+		panic("Mod called without calling Exists")
+	}
+	args := []string{}
+	if i.uid != "" && i.user.Uid != i.uid {
+		args = append(args, "--uid", i.uid)
+	}
+	if i.group != "" {
+		grp, err := group.LookupGroupId(i.user.Gid)
+		if err != nil {
+			return err
+		}
+		if grp.Gid != i.group {
+
+		}
+	}
+	args = append(args, name)
+	return core.RunCommand(ctx, "usermod", args...)
 }
 
 func (i *AddUser) Add(ctx context.Context, name string) error {
@@ -162,15 +211,20 @@ func AppendGroups() func(au *AddUser) error {
 // AddUserCommand ensures that user with the given name exists with the given
 // UserOpts.
 func Add(ctx context.Context, name string, opts ...func(*AddUser) error) error {
-	// if the user exists:
-	//    call Mod
-	// else:
-	//    call Add
 	adduser := &AddUser{}
+	exists, err := adduser.Exists(ctx, name)
+	if err != nil {
+		return err
+	}
 	for _, o := range opts {
 		if err := o(adduser); err != nil {
 			return err
 		}
 	}
-	return adduser.Add(ctx, name)
+	if exists == false {
+		return adduser.Add(ctx, name)
+	} else {
+
+	}
+	return nil
 }

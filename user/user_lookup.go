@@ -10,35 +10,42 @@ import (
 
 const passwdFile = "/etc/passwd"
 
-func lookupUser(username string) (bool, error) {
+func lookupUser(username string) (*user.User, error) {
 	f, err := os.Open(passwdFile)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	defer f.Close()
-	return findUserName(username, f)
+	return findUser(username, f)
 }
 
-func findUserName(name string, r io.Reader) (bool, error) {
+func findUser(name string, r io.Reader) (*user.User, error) {
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		text := trimSpace(removeComment(scanner.Text()))
 		if len(text) == 0 {
 			continue
 		}
-		// wheel:*:0:root
+		// name:encpass:uid:gid:name/comment:homedir
+		// inburke:x:1019:1020::/home/inburke:
 		parts := strings.SplitN(text, ":", 4)
-		if len(parts) < 4 {
+		if len(parts) < 6 {
 			continue
 		}
 		if parts[0] == name {
-			return true, nil
+			return &user.User{
+				Username: parts[0],
+				Uid:      parts[1],
+				Gid:      parts[2],
+				Name:     parts[4],
+				HomeDir:  parts[5],
+			}, nil
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return false, err
+		return nil, err
 	}
-	return false, user.UnknownUserError(name)
+	return nil, user.UnknownUserError(name)
 }
 
 // removeComment returns line, removing any '#' byte and any following
