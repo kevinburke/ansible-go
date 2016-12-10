@@ -10,7 +10,7 @@ import (
 
 const groupFile = "/etc/group"
 
-func lookupGroup(groupname string) (*user.Group, error) {
+func LookupGroup(groupname string) (*user.Group, error) {
 	f, err := os.Open(groupFile)
 	if err != nil {
 		return nil, err

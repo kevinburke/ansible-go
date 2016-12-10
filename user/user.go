@@ -94,14 +94,27 @@ func (i *AddUser) Mod(ctx context.Context, name string) error {
 		args = append(args, "--uid", i.uid)
 	}
 	if i.group != "" {
-		grp, err := group.LookupGroupId(i.user.Gid)
+		grp, err := core.LookupGroup(i.group)
 		if err != nil {
 			return err
 		}
-		if grp.Gid != i.group {
-
+		if grp.Gid != i.user.Gid {
+			args = append(args, "--gid", i.group)
 		}
 	}
+	if len(i.groups) > 0 {
+		// TODO
+		panic("modifying groups is unimplemented")
+	}
+
+	// TODO idempotence checks; don't modify these if they are the same.
+	if i.shell != "" {
+		args = append(args, "--shell", i.shell)
+	}
+	if i.comment != "" {
+		args = append(args, "--comment", i.comment)
+	}
+	// TODO support home
 	args = append(args, name)
 	return core.RunCommand(ctx, "usermod", args...)
 }
@@ -167,7 +180,14 @@ func PrimaryGroup(grp string) func(au *AddUser) error {
 
 func Group(grp string) func(au *AddUser) error {
 	return func(au *AddUser) error {
-		au.groups = append(au.groups, grp)
+		au.group = grp
+		return nil
+	}
+}
+
+func Groups(grps []string) func(au *AddUser) error {
+	return func(au *AddUser) error {
+		au.groups = grps
 		return nil
 	}
 }
@@ -224,7 +244,6 @@ func Add(ctx context.Context, name string, opts ...func(*AddUser) error) error {
 	if exists == false {
 		return adduser.Add(ctx, name)
 	} else {
-
+		return adduser.Mod(ctx, name)
 	}
-	return nil
 }

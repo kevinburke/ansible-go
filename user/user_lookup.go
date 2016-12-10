@@ -28,7 +28,7 @@ func findUser(name string, r io.Reader) (*user.User, error) {
 		}
 		// name:encpass:uid:gid:name/comment:homedir
 		// inburke:x:1019:1020::/home/inburke:
-		parts := strings.SplitN(text, ":", 4)
+		parts := strings.SplitN(text, ":", 6)
 		if len(parts) < 6 {
 			continue
 		}

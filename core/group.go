@@ -30,7 +30,7 @@ func (i *defaultGroupImpl) Add(ctx context.Context, name string, opts GroupOpts)
 }
 
 func (i *defaultGroupImpl) Exists(ctx context.Context, name string) (bool, error) {
-	_, err := lookupGroup(name)
+	_, err := LookupGroup(name)
 	if err == nil {
 		return true, nil
 	}
@@ -44,7 +44,7 @@ func (i *defaultGroupImpl) Exists(ctx context.Context, name string) (bool, error
 
 // Mod modifies the group
 func (i *defaultGroupImpl) Mod(ctx context.Context, name string, opts GroupOpts) error {
-	grp, err := lookupGroup(name)
+	grp, err := LookupGroup(name)
 	if err != nil {
 		return err
 	}
