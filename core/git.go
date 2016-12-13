@@ -172,8 +172,22 @@ func isNotABranch(ctx context.Context, dest string) (bool, error) {
 	return false, nil
 }
 
-func headSplitter(ctx context.Context) {
-
+func headSplitter(ctx context.Context, headfile string, remote string) (string, error) {
+	if !exists(headfile) {
+		return "", nil
+	}
+	f, err := os.Open(headfile)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	line, err := bufio.NewReader(f).ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	replaced := strings.Replace(line, "refs/remotes/"+remote, "", 1)
+	parts := strings.Split(replaced, " ")
+	newRef := parts[len(parts)-1]
 }
 
 func gitGetHeadBranch(ctx context.Context, repo, dest string, opts GitOpts) (string, error) {
@@ -191,6 +205,10 @@ func gitGetHeadBranch(ctx context.Context, repo, dest string, opts GitOpts) (str
 	isNotBranch, _ := isNotABranch(ctx, dest)
 	if isNotBranch {
 		head := filepath.Join(repoPath, "refs", "remotes", remote, "HEAD")
+	}
+	hd, err := headSplitter(ctx, head)
+	if err != nil {
+		return "", err
 	}
 	return head, nil
 }
