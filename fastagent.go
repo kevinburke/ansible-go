@@ -1,0 +1,172 @@
+// Package fastagent implements a persistent Go agent that accelerates Ansible
+// remote execution. It speaks a newline-delimited JSON-RPC protocol over stdio.
+package fastagent
+
+import "encoding/json"
+
+// Version is the agent version. Bump this when the protocol or behavior changes.
+const Version = "0.1.0"
+
+// Request is a JSON-RPC request from the controller.
+type Request struct {
+	ID     int64           `json:"id"`
+	Method string          `json:"method"`
+	Params json.RawMessage `json:"params"`
+}
+
+// Response is a JSON-RPC response to the controller.
+type Response struct {
+	ID     int64      `json:"id"`
+	Result any        `json:"result,omitempty"`
+	Error  *ErrorInfo `json:"error,omitempty"`
+}
+
+// ErrorInfo describes an error in a Response.
+type ErrorInfo struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+// HelloParams is sent by the controller on connect.
+type HelloParams struct {
+	Version string `json:"version"`
+}
+
+// HelloResult is returned by the agent in response to Hello.
+type HelloResult struct {
+	Version      string   `json:"version"`
+	Capabilities []string `json:"capabilities"`
+}
+
+// ExecParams describes a command to execute.
+type ExecParams struct {
+	Argv            []string          `json:"argv,omitempty"`
+	CmdString       string            `json:"cmd_string,omitempty"`
+	UseShell        bool              `json:"use_shell,omitempty"`
+	Cwd             string            `json:"cwd,omitempty"`
+	Env             map[string]string `json:"env,omitempty"`
+	Stdin           string            `json:"stdin,omitempty"`
+	TimeoutSeconds  int               `json:"timeout,omitempty"`
+	Creates         string            `json:"creates,omitempty"`
+	Removes         string            `json:"removes,omitempty"`
+	StdinAddNewline *bool             `json:"stdin_add_newline,omitempty"`
+	StripEmptyEnds  *bool             `json:"strip_empty_ends,omitempty"`
+}
+
+// ExecResult is the result of command execution.
+type ExecResult struct {
+	RC      int    `json:"rc"`
+	Stdout  string `json:"stdout"`
+	Stderr  string `json:"stderr"`
+	Changed bool   `json:"changed"`
+	Skipped bool   `json:"skipped,omitempty"`
+	Msg     string `json:"msg,omitempty"`
+}
+
+// StatParams requests file status information.
+type StatParams struct {
+	Path     string `json:"path"`
+	Follow   bool   `json:"follow,omitempty"`
+	Checksum bool   `json:"checksum,omitempty"`
+}
+
+// StatResult contains file status information.
+type StatResult struct {
+	Exists   bool   `json:"exists"`
+	Path     string `json:"path"`
+	IsDir    bool   `json:"isdir,omitempty"`
+	IsLink   bool   `json:"islnk,omitempty"`
+	Mode     string `json:"mode,omitempty"`
+	Owner    string `json:"owner,omitempty"`
+	Group    string `json:"group,omitempty"`
+	Size     int64  `json:"size,omitempty"`
+	Checksum string `json:"checksum,omitempty"`
+	LinkDest string `json:"lnk_source,omitempty"`
+	Mtime    int64  `json:"mtime,omitempty"`
+	Atime    int64  `json:"atime,omitempty"`
+}
+
+// ReadFileParams requests file content.
+type ReadFileParams struct {
+	Path string `json:"path"`
+}
+
+// ReadFileResult contains the file content, base64-encoded.
+type ReadFileResult struct {
+	Content string `json:"content"`
+	Size    int64  `json:"size"`
+}
+
+// WriteFileParams writes a file atomically.
+type WriteFileParams struct {
+	Dest         string `json:"dest"`
+	Content      string `json:"content"` // base64-encoded
+	Owner        string `json:"owner,omitempty"`
+	Group        string `json:"group,omitempty"`
+	Mode         string `json:"mode,omitempty"`
+	Backup       bool   `json:"backup,omitempty"`
+	UnsafeWrites bool   `json:"unsafe_writes,omitempty"`
+	Validate     string `json:"validate,omitempty"`
+	Checksum     string `json:"checksum,omitempty"` // expected checksum of existing file; skip write if matches
+}
+
+// WriteFileResult is the result of a file write.
+type WriteFileResult struct {
+	Changed    bool   `json:"changed"`
+	Dest       string `json:"dest"`
+	Checksum   string `json:"checksum"`
+	BackupFile string `json:"backup_file,omitempty"`
+}
+
+// FileParams manages file/directory/link state.
+type FileParams struct {
+	Path    string `json:"path"`
+	State   string `json:"state"` // file, directory, link, hard, touch, absent
+	Owner   string `json:"owner,omitempty"`
+	Group   string `json:"group,omitempty"`
+	Mode    string `json:"mode,omitempty"`
+	Recurse bool   `json:"recurse,omitempty"`
+	Follow  bool   `json:"follow,omitempty"`
+	Src     string `json:"src,omitempty"` // for link/hard
+	Mtime   string `json:"mtime,omitempty"`
+	Atime   string `json:"atime,omitempty"`
+}
+
+// FileResult is the result of a file state operation.
+type FileResult struct {
+	Changed bool   `json:"changed"`
+	Path    string `json:"path"`
+	State   string `json:"state"`
+	Owner   string `json:"owner,omitempty"`
+	Group   string `json:"group,omitempty"`
+	Mode    string `json:"mode,omitempty"`
+}
+
+// PackageParams manages OS packages.
+type PackageParams struct {
+	Manager string   `json:"manager"` // apt, dnf, yum
+	Names   []string `json:"names"`
+	State   string   `json:"state"` // present, absent, latest
+}
+
+// PackageResult is the result of a package operation.
+type PackageResult struct {
+	Changed bool   `json:"changed"`
+	Msg     string `json:"msg,omitempty"`
+}
+
+// ServiceParams manages system services.
+type ServiceParams struct {
+	Manager string `json:"manager,omitempty"` // systemd, sysvinit
+	Name    string `json:"name"`
+	State   string `json:"state,omitempty"`   // started, stopped, restarted, reloaded
+	Enabled *bool  `json:"enabled,omitempty"` // pointer to distinguish unset from false
+}
+
+// ServiceResult is the result of a service operation.
+type ServiceResult struct {
+	Changed bool   `json:"changed"`
+	Name    string `json:"name"`
+	State   string `json:"state,omitempty"`
+	Enabled bool   `json:"enabled,omitempty"`
+}
