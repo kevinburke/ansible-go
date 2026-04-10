@@ -137,37 +137,6 @@ display = Display()
 # Agent version must match the Go constant.
 AGENT_VERSION = "0.1.0"
 
-# Module-level cache of agent sessions, keyed by (host, user, port).
-# Ansible closes the connection after every task (TaskExecutor.run finally
-# block), then creates a new Connection object for the next task. Without
-# caching, we'd SSH + launch agent on every task. This cache keeps the SSH
-# subprocess and agent alive across tasks for the same host.
-_agent_cache: dict[tuple, dict] = {}
-_agent_cache_lock = threading.Lock()
-
-
-def _kill_session(session: dict) -> None:
-    """Terminate an agent session and clean up resources."""
-    proc = session.get("process")
-    if proc is None:
-        return
-    try:
-        proc.stdin.close()
-    except Exception:
-        pass
-    try:
-        proc.terminate()
-        proc.wait(timeout=5)
-    except Exception:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-    thread = session.get("stderr_thread")
-    if thread is not None:
-        thread.join(timeout=2)
-
-
 class Connection(ConnectionBase):
     """fastagent connection plugin."""
 
@@ -181,7 +150,6 @@ class Connection(ConnectionBase):
         self._agent_client: FastAgentClient | None = None
         self._stderr_lines: collections.deque[str] = collections.deque(maxlen=100)
         self._stderr_thread: threading.Thread | None = None
-        self._cache_key: tuple | None = None
 
     def _connect(self) -> Connection:
         if self._connected:
@@ -190,29 +158,6 @@ class Connection(ConnectionBase):
         host = self.get_option("host")
         user = self.get_option("remote_user")
         port = self.get_option("port")
-        cache_key = (host, user or "", port or 22)
-        self._cache_key = cache_key
-
-        # Check for a cached agent session from a previous task. Note: this
-        # cache only works within a single process. With forks > 1 (the
-        # default), Ansible runs each task in a forked worker, so the cache
-        # won't hit. SSH ControlPersist handles TCP connection reuse in that
-        # case; the per-task overhead is just the agent launch (~100ms).
-        with _agent_cache_lock:
-            cached = _agent_cache.pop(cache_key, None)
-
-        if cached is not None:
-            proc = cached["process"]
-            if proc.poll() is None:
-                display.vvv(f"FASTAGENT: reusing cached connection to {host}", host=host)
-                self._ssh_process = proc
-                self._agent_client = cached["client"]
-                self._stderr_lines = cached["stderr_lines"]
-                self._stderr_thread = cached["stderr_thread"]
-                self._connected = True
-                return self
-            else:
-                display.vvv(f"FASTAGENT: cached agent for {host} has exited, reconnecting", host=host)
 
         display.vvv(f"FASTAGENT: connecting to {host}", host=host)
 
@@ -235,26 +180,58 @@ class Connection(ConnectionBase):
         # Bootstrap: upload agent if needed.
         self._ensure_agent_deployed(host, user, port, remote_agent_path, remote_arch)
 
-        # Launch agent via SSH. Enable debug logging at -vvv or higher.
-        agent_flags = "--serve"
-        if display.verbosity >= 3:
-            agent_flags += " --debug"
-        serve_cmd = f"{shlex.quote(remote_agent_path)} {agent_flags}"
-
+        # Determine become settings.
         become = self._play_context.become
         become_method = self._play_context.become_method
+        become_user = "root"
+        use_become = False
         if become:
             if become_method == "sudo" or become_method is None:
                 become_user = self._play_context.become_user or "root"
-                serve_cmd = f"sudo -u {shlex.quote(become_user)} {serve_cmd}"
+                use_become = True
             else:
                 display.warning(
                     f"fastagent: unsupported become_method {become_method!r}, "
                     f"falling back to direct execution"
                 )
 
-        ssh_cmd = self._build_ssh_command(host, user, port, serve_cmd)
-        display.vvv(f"FASTAGENT: launching agent: {' '.join(ssh_cmd)}", host=host)
+        # Socket path on the remote host, keyed by become user so different
+        # privilege contexts get separate daemons.
+        socket_path = f"/tmp/fastagent-{become_user}.sock" if use_become else "/tmp/fastagent.sock"
+        agent_bin = shlex.quote(remote_agent_path)
+
+        # Step 1: Ensure the daemon is running on the remote host.
+        debug_flag = " --debug" if display.verbosity >= 3 else ""
+        daemon_cmd = f"{agent_bin} --daemon --socket {shlex.quote(socket_path)}{debug_flag}"
+        if use_become:
+            daemon_cmd = f"sudo -u {shlex.quote(become_user)} {daemon_cmd}"
+
+        # Run the daemon start command. It exits immediately if already running.
+        # Use setsid to detach from the SSH session so the daemon survives
+        # after disconnect. Redirect all stdio to /dev/null and background.
+        start_cmd = (
+            f"setsid {daemon_cmd} </dev/null >/dev/null 2>&1 &"
+            f" for i in 1 2 3 4 5; do"
+            f"   test -S {shlex.quote(socket_path)} && exit 0;"
+            f"   sleep 0.1;"
+            f" done;"
+            f" echo 'timeout waiting for socket' >&2; exit 1"
+        )
+        rc, stdout, stderr = self._run_ssh_command(host, user, port, start_cmd)
+        if rc != 0:
+            raise AnsibleConnectionFailure(
+                f"fastagent: failed to start daemon: rc={rc}\n"
+                f"stdout: {stdout}\nstderr: {stderr}"
+            )
+        display.vvv(f"FASTAGENT: daemon running at {socket_path}", host=host)
+
+        # Step 2: Connect to the daemon via a stdio bridge.
+        connect_cmd = f"{agent_bin} --connect --socket {shlex.quote(socket_path)}"
+        if use_become:
+            connect_cmd = f"sudo -u {shlex.quote(become_user)} {connect_cmd}"
+
+        ssh_cmd = self._build_ssh_command(host, user, port, connect_cmd)
+        display.vvv(f"FASTAGENT: connecting to daemon: {' '.join(ssh_cmd)}", host=host)
 
         self._ssh_process = subprocess.Popen(
             ssh_cmd,
@@ -264,8 +241,8 @@ class Connection(ConnectionBase):
         )
 
         # Start a background thread to read agent stderr. This prevents the
-        # pipe buffer from filling up (which would deadlock the agent), and
-        # surfaces agent log output through Ansible's display system.
+        # pipe buffer from filling up (which would deadlock the bridge), and
+        # surfaces log output through Ansible's display system.
         self._stderr_lines = collections.deque(maxlen=100)
         self._stderr_thread = threading.Thread(
             target=self._read_stderr,
@@ -279,14 +256,34 @@ class Connection(ConnectionBase):
             self._ssh_process.stdout,
         )
 
-        # Handshake.
+        # Handshake. Check the daemon's version matches ours.
         try:
             result = self._agent_client.hello(AGENT_VERSION)
+            remote_version = result.get("version", "")
             display.vvv(
-                f"FASTAGENT: hello response: version={result.get('version')}, "
+                f"FASTAGENT: hello response: version={remote_version}, "
                 f"capabilities={result.get('capabilities')}",
                 host=host,
             )
+
+            if remote_version != AGENT_VERSION:
+                display.vvv(
+                    f"FASTAGENT: version mismatch (local={AGENT_VERSION}, "
+                    f"remote={remote_version}), restarting daemon",
+                    host=host,
+                )
+                self.close()
+                # Kill the old daemon and remove the stale socket.
+                kill_cmd = (
+                    f"pkill -f {shlex.quote(agent_bin + ' --daemon')} 2>/dev/null; "
+                    f"rm -f {shlex.quote(socket_path)} {shlex.quote(socket_path + '.pid')}"
+                )
+                if use_become:
+                    kill_cmd = f"sudo -u {shlex.quote(become_user)} sh -c {shlex.quote(kill_cmd)}"
+                self._run_ssh_command(host, user, port, kill_cmd)
+                # Recurse once to start the new daemon.
+                return self._connect()
+
         except Exception as e:
             stderr = "\n".join(self._stderr_lines)
             self.close()
@@ -379,50 +376,31 @@ class Connection(ConnectionBase):
             f.write(data)
 
     def close(self) -> None:
+        # Close the SSH bridge session. The daemon stays alive on the remote
+        # host — next task will reconnect to it cheaply.
         if self._ssh_process is not None:
-            host = self.get_option("host")
-            # Cache the session for reuse by the next task instead of killing
-            # the agent. Ansible calls close() after every task.
-            if self._cache_key is not None and self._ssh_process.poll() is None:
-                display.vvv("FASTAGENT: caching connection for reuse", host=host)
-                with _agent_cache_lock:
-                    # Kill any stale cached session for this key.
-                    old = _agent_cache.pop(self._cache_key, None)
-                    if old is not None:
-                        _kill_session(old)
-                    _agent_cache[self._cache_key] = {
-                        "process": self._ssh_process,
-                        "client": self._agent_client,
-                        "stderr_lines": self._stderr_lines,
-                        "stderr_thread": self._stderr_thread,
-                    }
-                self._ssh_process = None
-                self._agent_client = None
-            else:
-                display.vvv("FASTAGENT: closing connection", host=host)
-                _kill_session({
-                    "process": self._ssh_process,
-                    "client": self._agent_client,
-                    "stderr_lines": self._stderr_lines,
-                    "stderr_thread": self._stderr_thread,
-                })
-                self._ssh_process = None
-                self._agent_client = None
-        self._connected = False
-
-    def reset(self) -> None:
-        """Force-close the connection (no caching) and reconnect."""
-        # Discard the cache key so close() kills the process.
-        if self._ssh_process is not None:
-            _kill_session({
-                "process": self._ssh_process,
-                "client": self._agent_client,
-                "stderr_lines": self._stderr_lines,
-                "stderr_thread": self._stderr_thread,
-            })
+            display.vvv("FASTAGENT: closing bridge (daemon stays alive)", host=self.get_option("host"))
+            try:
+                self._ssh_process.stdin.close()
+            except Exception:
+                pass
+            try:
+                self._ssh_process.terminate()
+                self._ssh_process.wait(timeout=5)
+            except Exception:
+                try:
+                    self._ssh_process.kill()
+                except Exception:
+                    pass
+            if self._stderr_thread is not None:
+                self._stderr_thread.join(timeout=2)
+                self._stderr_thread = None
             self._ssh_process = None
             self._agent_client = None
         self._connected = False
+
+    def reset(self) -> None:
+        self.close()
         self._connect()
 
     # --- internal helpers ---
