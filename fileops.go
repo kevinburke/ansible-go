@@ -104,17 +104,14 @@ func (s *Server) handleWriteFile(params json.RawMessage) (any, error) {
 	h := sha256.Sum256(data)
 	newChecksum := hex.EncodeToString(h[:])
 
-	// Check if destination already has the right content.
-	if p.Checksum != "" && p.Checksum == newChecksum {
-		return WriteFileResult{
-			Changed:  false,
-			Dest:     p.Dest,
-			Checksum: newChecksum,
-		}, nil
+	// If the caller already knows the existing file's checksum, use it to
+	// skip the disk read. Otherwise read the file to check.
+	existingChecksum := p.Checksum
+	if existingChecksum == "" {
+		existingChecksum, _ = sha256File(p.Dest)
 	}
 
-	existingChecksum, err := sha256File(p.Dest)
-	if err == nil && existingChecksum == newChecksum {
+	if existingChecksum == newChecksum {
 		// File already has the correct content; still apply ownership/mode if needed.
 		changed, err := applyOwnershipAndMode(p.Dest, p.Owner, p.Group, p.Mode)
 		if err != nil {

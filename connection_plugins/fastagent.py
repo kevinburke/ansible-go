@@ -290,13 +290,11 @@ class Connection(ConnectionBase):
             data = f.read()
 
         content_b64 = base64.b64encode(data).decode("ascii")
-        checksum = hashlib.sha256(data).hexdigest()
 
         try:
             self._agent_client.write_file(
                 dest=out_path,
                 content=content_b64,
-                checksum=checksum,
             )
         except (FastAgentError, IOError) as e:
             agent_stderr = self._get_agent_stderr()
