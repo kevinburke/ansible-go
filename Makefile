@@ -27,6 +27,7 @@ deploy: build
 
 test:
 	go test -trimpath -count=1 ./...
+	cd module_utils && python3 -m unittest fastagent_client_test -v
 
 clean:
 	rm -rf tmp/

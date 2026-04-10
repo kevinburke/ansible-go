@@ -82,6 +82,9 @@ class ActionModule(BuiltinCopyAction):
         """Copy data bytes to dest via fastagent RPC."""
         result = super(BuiltinCopyAction, self).run(None, task_vars)
 
+        # Ensure the connection is established before accessing _agent_client.
+        self._connection._connect()
+
         check_mode = self._play_context.check_mode
         diff = self._play_context.diff
         backup = boolean(args.get("backup", False), strict=False)

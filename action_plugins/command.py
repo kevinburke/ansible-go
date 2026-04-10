@@ -38,6 +38,9 @@ class ActionModule(ActionBase):
                 ),
             )
 
+        # Ensure the connection is established before accessing _agent_client.
+        self._connection._connect()
+
         args = self._task.args
         uses_shell = args.get("_uses_shell", False)
         raw_params = args.get("_raw_params", "")
