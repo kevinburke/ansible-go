@@ -135,7 +135,7 @@ from fastagent_client import FastAgentClient, FastAgentError  # noqa: E402
 display = Display()
 
 # Agent version must match the Go constant.
-AGENT_VERSION = "0.1.0"
+AGENT_VERSION = "0.2.0"
 
 class Connection(ConnectionBase):
     """fastagent connection plugin."""
@@ -302,18 +302,25 @@ class Connection(ConnectionBase):
     ) -> tuple[int, bytes, bytes]:
         super().exec_command(cmd, in_data=in_data, sudoable=sudoable)
 
-        params: dict[str, t.Any] = {
-            "cmd_string": cmd,
-            "use_shell": True,
-        }
+        # The daemon runs as root. For commands that should NOT run as root
+        # (sudoable=False, or become not configured), drop privileges to the
+        # connecting user. This prevents things like temp dir creation from
+        # being owned by root in the user's home directory.
+        actual_cmd = cmd
+        become = self._play_context.become
+        remote_user = self.get_option("remote_user")
+        if remote_user and (not sudoable or not become):
+            actual_cmd = f"runuser -u {shlex.quote(remote_user)} -- sh -c {shlex.quote(cmd)}"
+
+        stdin_data = None
         if in_data is not None:
-            params["stdin"] = in_data.decode("utf-8", errors="surrogateescape")
+            stdin_data = in_data.decode("utf-8", errors="surrogateescape")
 
         try:
             result = self._agent_client.exec(
-                cmd_string=cmd,
+                cmd_string=actual_cmd,
                 use_shell=True,
-                stdin=params.get("stdin"),
+                stdin=stdin_data,
             )
         except IOError as e:
             agent_stderr = self._get_agent_stderr()
@@ -342,10 +349,16 @@ class Connection(ConnectionBase):
 
         content_b64 = base64.b64encode(data).decode("ascii")
 
+        # Set ownership to the connecting user so files in ~/.ansible/tmp/
+        # aren't owned by root.
+        remote_user = self.get_option("remote_user")
+
         try:
             self._agent_client.write_file(
                 dest=out_path,
                 content=content_b64,
+                owner=remote_user,
+                group=remote_user,
             )
         except (FastAgentError, IOError) as e:
             agent_stderr = self._get_agent_stderr()
