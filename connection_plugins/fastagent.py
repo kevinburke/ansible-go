@@ -193,7 +193,11 @@ class Connection(ConnectionBase):
         cache_key = (host, user or "", port or 22)
         self._cache_key = cache_key
 
-        # Check for a cached agent session from a previous task.
+        # Check for a cached agent session from a previous task. Note: this
+        # cache only works within a single process. With forks > 1 (the
+        # default), Ansible runs each task in a forked worker, so the cache
+        # won't hit. SSH ControlPersist handles TCP connection reuse in that
+        # case; the per-task overhead is just the agent launch (~100ms).
         with _agent_cache_lock:
             cached = _agent_cache.pop(cache_key, None)
 
