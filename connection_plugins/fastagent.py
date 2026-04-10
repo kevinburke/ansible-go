@@ -159,27 +159,6 @@ class Connection(ConnectionBase):
         user = self.get_option("remote_user")
         port = self.get_option("port")
 
-        display.vvv(f"FASTAGENT: connecting to {host}", host=host)
-
-        # Determine remote agent path.
-        remote_arch = self._detect_remote_arch(host, user, port)
-        agent_path_template = self.get_option("agent_path")
-        remote_agent_path = agent_path_template.format(
-            version=AGENT_VERSION,
-            os="linux",
-            arch=remote_arch,
-        )
-
-        # Expand ~ to the remote user's home directory so paths work in
-        # quoted contexts (shlex.quote, scp arguments).
-        if remote_agent_path.startswith("~/"):
-            rc, home, _ = self._run_ssh_command(host, user, port, "echo $HOME")
-            if rc == 0 and home.strip():
-                remote_agent_path = home.strip() + remote_agent_path[1:]
-
-        # Bootstrap: upload agent if needed.
-        self._ensure_agent_deployed(host, user, port, remote_agent_path, remote_arch)
-
         # Determine become settings.
         become = self._play_context.become
         become_method = self._play_context.become_method
@@ -195,22 +174,56 @@ class Connection(ConnectionBase):
                     f"falling back to direct execution"
                 )
 
-        # Socket path on the remote host, keyed by become user so different
-        # privilege contexts get separate daemons.
+        # Socket path on the remote host, keyed by become user.
         socket_path = f"/tmp/fastagent-{become_user}.sock" if use_become else "/tmp/fastagent.sock"
+
+        # Fast path: try connecting to an existing daemon directly. This
+        # skips arch detection, deployment check, and daemon startup — just
+        # one SSH command (the bridge). This is the common case after the
+        # first task has bootstrapped the daemon.
+        if self._try_connect_bridge(host, user, port, socket_path, use_become, become_user):
+            return self
+
+        display.vvv(f"FASTAGENT: fast path failed, doing full bootstrap", host=host)
+
+        # Full bootstrap: detect arch, deploy binary, start daemon, connect.
+        remote_arch = self._detect_remote_arch(host, user, port)
+        agent_path_template = self.get_option("agent_path")
+        remote_agent_path = agent_path_template.format(
+            version=AGENT_VERSION,
+            os="linux",
+            arch=remote_arch,
+        )
+
+        # Expand ~ to the remote user's home directory.
+        if remote_agent_path.startswith("~/"):
+            rc, home, _ = self._run_ssh_command(host, user, port, "echo $HOME")
+            if rc == 0 and home.strip():
+                remote_agent_path = home.strip() + remote_agent_path[1:]
+
+        # Upload agent binary if needed.
+        self._ensure_agent_deployed(host, user, port, remote_agent_path, remote_arch)
+
         agent_bin = shlex.quote(remote_agent_path)
 
-        # Step 1: Ensure the daemon is running on the remote host.
+        # Kill any old daemon (version mismatch or stale).
+        kill_cmd = (
+            f"pkill -f 'fastagent --daemon' 2>/dev/null;"
+            f" rm -f {shlex.quote(socket_path)} {shlex.quote(socket_path + '.pid')}"
+        )
+        if use_become:
+            kill_cmd = f"sudo sh -c {shlex.quote(kill_cmd)}"
+        self._run_ssh_command(host, user, port, kill_cmd)
+
+        # Start the daemon.
         debug_flag = " --debug" if display.verbosity >= 3 else ""
         daemon_cmd = f"{agent_bin} --daemon --socket {shlex.quote(socket_path)}{debug_flag}"
         if use_become:
             daemon_cmd = f"sudo -u {shlex.quote(become_user)} {daemon_cmd}"
 
-        # Run the daemon start command. It exits immediately if already running.
-        # Use setsid to detach from the SSH session so the daemon survives
-        # after disconnect. Redirect all stdio to /dev/null and background.
+        log_path = socket_path + ".log"
         start_cmd = (
-            f"setsid {daemon_cmd} </dev/null >/dev/null 2>&1 &"
+            f"setsid {daemon_cmd} </dev/null >>{shlex.quote(log_path)} 2>&1 &"
             f" for i in 1 2 3 4 5; do"
             f"   test -S {shlex.quote(socket_path)} && exit 0;"
             f"   sleep 0.1;"
@@ -223,76 +236,110 @@ class Connection(ConnectionBase):
                 f"fastagent: failed to start daemon: rc={rc}\n"
                 f"stdout: {stdout}\nstderr: {stderr}"
             )
-        display.vvv(f"FASTAGENT: daemon running at {socket_path}", host=host)
+        display.vvv(f"FASTAGENT: daemon started at {socket_path}", host=host)
 
-        # Step 2: Connect to the daemon via a stdio bridge.
-        connect_cmd = f"{agent_bin} --connect --socket {shlex.quote(socket_path)}"
+        # Now connect via bridge (pass known binary path to avoid glob).
+        if not self._try_connect_bridge(host, user, port, socket_path, use_become, become_user, agent_bin=agent_bin):
+            raise AnsibleConnectionFailure(
+                "fastagent: failed to connect to daemon after starting it"
+            )
+
+        return self
+
+    def _try_connect_bridge(
+        self,
+        host: str,
+        user: str | None,
+        port: int | None,
+        socket_path: str,
+        use_become: bool,
+        become_user: str,
+        agent_bin: str | None = None,
+    ) -> bool:
+        """Try to connect to an existing daemon. Returns True on success."""
+        if agent_bin is None:
+            # Fast path: find any fastagent binary using a glob. The shell
+            # expands $HOME and the glob, so no arch detection SSH needed.
+            agent_path_template = self.get_option("agent_path")
+            # Replace {version}, {os}, {arch} with the known version and wildcards.
+            glob_path = agent_path_template.format(
+                version=AGENT_VERSION, os="linux", arch="*",
+            )
+            if glob_path.startswith("~/"):
+                glob_path = glob_path.replace("~/", "$HOME/", 1)
+            # Use shell: find the first matching binary.
+            agent_bin_expr = f"$(ls -1 {glob_path} 2>/dev/null | head -1)"
+        else:
+            agent_bin_expr = agent_bin
+
+        connect_cmd = f"{agent_bin_expr} --connect --socket {shlex.quote(socket_path)}"
         if use_become:
             connect_cmd = f"sudo -u {shlex.quote(become_user)} {connect_cmd}"
 
         ssh_cmd = self._build_ssh_command(host, user, port, connect_cmd)
-        display.vvv(f"FASTAGENT: connecting to daemon: {' '.join(ssh_cmd)}", host=host)
+        display.vvv(f"FASTAGENT: trying fast connect to {host}", host=host)
 
-        self._ssh_process = subprocess.Popen(
+        proc = subprocess.Popen(
             ssh_cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
 
-        # Start a background thread to read agent stderr. This prevents the
-        # pipe buffer from filling up (which would deadlock the bridge), and
-        # surfaces log output through Ansible's display system.
-        self._stderr_lines = collections.deque(maxlen=100)
-        self._stderr_thread = threading.Thread(
+        stderr_lines: collections.deque[str] = collections.deque(maxlen=100)
+        stderr_thread = threading.Thread(
             target=self._read_stderr,
-            args=(self._ssh_process.stderr, host),
+            args=(proc.stderr, host),
             daemon=True,
         )
-        self._stderr_thread.start()
+        stderr_thread.start()
 
-        self._agent_client = FastAgentClient(
-            self._ssh_process.stdin,
-            self._ssh_process.stdout,
-        )
+        client = FastAgentClient(proc.stdin, proc.stdout)
 
-        # Handshake. Check the daemon's version matches ours.
+        # Try Hello with a short timeout. If the daemon isn't running or the
+        # binary doesn't exist, this will fail quickly.
         try:
-            result = self._agent_client.hello(AGENT_VERSION)
+            result = client.hello(AGENT_VERSION)
             remote_version = result.get("version", "")
             display.vvv(
-                f"FASTAGENT: hello response: version={remote_version}, "
-                f"capabilities={result.get('capabilities')}",
+                f"FASTAGENT: connected to daemon version={remote_version}",
                 host=host,
             )
 
             if remote_version != AGENT_VERSION:
                 display.vvv(
-                    f"FASTAGENT: version mismatch (local={AGENT_VERSION}, "
-                    f"remote={remote_version}), restarting daemon",
+                    f"FASTAGENT: version mismatch (want {AGENT_VERSION}, "
+                    f"got {remote_version})",
                     host=host,
                 )
-                self.close()
-                # Kill the old daemon and remove the stale socket.
-                kill_cmd = (
-                    f"pkill -f {shlex.quote(agent_bin + ' --daemon')} 2>/dev/null; "
-                    f"rm -f {shlex.quote(socket_path)} {shlex.quote(socket_path + '.pid')}"
-                )
-                if use_become:
-                    kill_cmd = f"sudo -u {shlex.quote(become_user)} sh -c {shlex.quote(kill_cmd)}"
-                self._run_ssh_command(host, user, port, kill_cmd)
-                # Recurse once to start the new daemon.
-                return self._connect()
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+                proc.terminate()
+                proc.wait(timeout=5)
+                return False
 
         except Exception as e:
-            stderr = "\n".join(self._stderr_lines)
-            self.close()
-            raise AnsibleConnectionFailure(
-                f"fastagent handshake failed: {e}\nagent stderr:\n{stderr}"
-            )
+            display.vvv(f"FASTAGENT: fast connect failed: {e}", host=host)
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+            return False
 
+        # Success — adopt this connection.
+        self._ssh_process = proc
+        self._agent_client = client
+        self._stderr_lines = stderr_lines
+        self._stderr_thread = stderr_thread
         self._connected = True
-        return self
+        return True
 
     def exec_command(
         self,
