@@ -260,9 +260,11 @@ class Connection(ConnectionBase):
             kill_cmd = f"sudo sh -c {shlex.quote(kill_cmd)}"
         self._run_ssh_command(host, user, port, kill_cmd)
 
-        # Start the daemon.
+        # Start the daemon. Pass --allow-user so the socket is accessible to
+        # the SSH user (needed for SSH socket forwarding).
         debug_flag = " --debug" if display.verbosity >= 3 else ""
-        daemon_cmd = f"{agent_bin} --daemon --socket {shlex.quote(remote_socket)}{debug_flag}"
+        allow_flag = f" --allow-user {shlex.quote(user)}" if user else ""
+        daemon_cmd = f"{agent_bin} --daemon --socket {shlex.quote(remote_socket)}{allow_flag}{debug_flag}"
         if use_become:
             daemon_cmd = f"sudo -u {shlex.quote(become_user)} {daemon_cmd}"
 

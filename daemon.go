@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -23,7 +24,7 @@ const DefaultIdleTimeout = 1 * time.Hour
 // If a daemon is already running on socketPath (responds to Hello), it prints
 // the socket path and returns nil. Otherwise it removes any stale socket,
 // creates a new listener, and serves until interrupted or idle timeout.
-func RunDaemon(socketPath string, idleTimeout time.Duration, logger *slog.Logger) error {
+func RunDaemon(socketPath string, allowUser string, idleTimeout time.Duration, logger *slog.Logger) error {
 	// Check if a daemon is already running.
 	if isDaemonRunning(socketPath) {
 		fmt.Println(socketPath)
@@ -46,10 +47,23 @@ func RunDaemon(socketPath string, idleTimeout time.Duration, logger *slog.Logger
 	defer listener.Close()
 	defer os.Remove(socketPath)
 
-	// Make the socket accessible to non-root users so SSH forwarding
-	// (which runs as the connecting user) can connect to it.
-	if err := os.Chmod(socketPath, 0o777); err != nil {
-		logger.Warn("failed to chmod socket", "path", socketPath, "error", err)
+	// Make the socket accessible to the connecting user so SSH forwarding
+	// can reach it. Default to 0700 (root only); if allowUser is set,
+	// chown to root:<user's group> with mode 0770.
+	if allowUser != "" {
+		u, err := user.Lookup(allowUser)
+		if err != nil {
+			logger.Warn("failed to lookup allow-user", "user", allowUser, "error", err)
+		} else {
+			gid, _ := strconv.Atoi(u.Gid)
+			if err := os.Chown(socketPath, 0, gid); err != nil {
+				logger.Warn("failed to chown socket", "error", err)
+			}
+			if err := os.Chmod(socketPath, 0o770); err != nil {
+				logger.Warn("failed to chmod socket", "error", err)
+			}
+			logger.Debug("socket accessible to user", "user", allowUser, "gid", gid)
+		}
 	}
 
 	// Write PID file.

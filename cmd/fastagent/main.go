@@ -23,6 +23,7 @@ func main() {
 	daemon := flag.Bool("daemon", false, "start persistent daemon on a Unix socket")
 	connect := flag.Bool("connect", false, "bridge stdin/stdout to a running daemon")
 	socket := flag.String("socket", "", "Unix socket path (for --daemon and --connect)")
+	allowUser := flag.String("allow-user", "", "grant this user access to the daemon socket (for --daemon)")
 	idleTimeout := flag.Duration("idle-timeout", fastagent.DefaultIdleTimeout, "daemon auto-shutdown after this idle duration")
 	version := flag.Bool("version", false, "print version and exit")
 	debug := flag.Bool("debug", false, "enable debug logging to stderr")
@@ -60,7 +61,7 @@ func main() {
 		if socketPath == "" {
 			socketPath = fmt.Sprintf("/tmp/fastagent-%d.sock", os.Getuid())
 		}
-		if err := fastagent.RunDaemon(socketPath, *idleTimeout, logger); err != nil {
+		if err := fastagent.RunDaemon(socketPath, *allowUser, *idleTimeout, logger); err != nil {
 			logger.Error("daemon failed", "error", err)
 			os.Exit(1)
 		}
