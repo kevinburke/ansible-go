@@ -46,6 +46,12 @@ func RunDaemon(socketPath string, idleTimeout time.Duration, logger *slog.Logger
 	defer listener.Close()
 	defer os.Remove(socketPath)
 
+	// Make the socket accessible to non-root users so SSH forwarding
+	// (which runs as the connecting user) can connect to it.
+	if err := os.Chmod(socketPath, 0o777); err != nil {
+		logger.Warn("failed to chmod socket", "path", socketPath, "error", err)
+	}
+
 	// Write PID file.
 	pidPath := socketPath + ".pid"
 	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
