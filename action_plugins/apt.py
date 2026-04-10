@@ -61,45 +61,27 @@ class ActionModule(ActionBase):
         client = self._connection._agent_client
         check_mode = self._play_context.check_mode
 
-        # Handle update_cache via Exec.
-        if update_cache:
-            if not check_mode:
-                try:
-                    exec_result = client.exec(
-                        cmd_string="apt-get update",
-                        use_shell=True,
-                    )
-                    if exec_result.get("rc", 1) != 0:
-                        result["failed"] = True
-                        result["msg"] = f"apt-get update failed: {exec_result.get('stderr', '')}"
-                        return result
-                except Exception as e:
-                    result["failed"] = True
-                    result["msg"] = f"apt-get update failed: {e}"
-                    return result
-
-            if not names:
-                result["changed"] = True
-                result["msg"] = "Cache updated"
-                result["cache_updated"] = True
-                return result
-
-        if not names:
-            result["changed"] = False
-            return result
-
         if check_mode:
-            result["changed"] = True
-            result["msg"] = f"Would {state} {', '.join(names)}"
+            if names:
+                result["changed"] = True
+                result["msg"] = f"Would {state} {', '.join(names)}"
+            else:
+                result["changed"] = update_cache
+                result["cache_updated"] = update_cache
             return result
 
+        # Send everything to the Package RPC — it handles update_cache
+        # deduplication internally (skips if cache was updated recently).
         try:
-            pkg_result = client.package(
-                manager="apt",
-                names=names,
-                state=state,
-            )
+            pkg_result = client.call("Package", {
+                "manager": "apt",
+                "names": names,
+                "state": state,
+                "update_cache": update_cache,
+                "cache_valid_time": cache_valid_time,
+            })
             result["changed"] = pkg_result.get("changed", False)
+            result["cache_updated"] = pkg_result.get("cache_updated", False)
             result["msg"] = pkg_result.get("msg", "")
         except Exception as e:
             result["failed"] = True

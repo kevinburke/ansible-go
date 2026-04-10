@@ -144,15 +144,18 @@ type FileResult struct {
 
 // PackageParams manages OS packages.
 type PackageParams struct {
-	Manager string   `json:"manager"` // apt, dnf, yum
-	Names   []string `json:"names"`
-	State   string   `json:"state"` // present, absent, latest
+	Manager        string   `json:"manager"`                    // apt, dnf, yum
+	Names          []string `json:"names"`
+	State          string   `json:"state"`                      // present, absent, latest
+	UpdateCache    bool     `json:"update_cache,omitempty"`     // run apt-get update first
+	CacheValidTime int     `json:"cache_valid_time,omitempty"` // skip update if cache is newer than this (seconds)
 }
 
 // PackageResult is the result of a package operation.
 type PackageResult struct {
-	Changed bool   `json:"changed"`
-	Msg     string `json:"msg,omitempty"`
+	Changed      bool   `json:"changed"`
+	Msg          string `json:"msg,omitempty"`
+	CacheUpdated bool   `json:"cache_updated,omitempty"`
 }
 
 // ServiceParams manages system services.
