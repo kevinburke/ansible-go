@@ -137,6 +137,36 @@ display = Display()
 # Agent version must match the Go constant.
 AGENT_VERSION = "0.1.0"
 
+# Module-level cache of agent sessions, keyed by (host, user, port).
+# Ansible closes the connection after every task (TaskExecutor.run finally
+# block), then creates a new Connection object for the next task. Without
+# caching, we'd SSH + launch agent on every task. This cache keeps the SSH
+# subprocess and agent alive across tasks for the same host.
+_agent_cache: dict[tuple, dict] = {}
+_agent_cache_lock = threading.Lock()
+
+
+def _kill_session(session: dict) -> None:
+    """Terminate an agent session and clean up resources."""
+    proc = session.get("process")
+    if proc is None:
+        return
+    try:
+        proc.stdin.close()
+    except Exception:
+        pass
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    thread = session.get("stderr_thread")
+    if thread is not None:
+        thread.join(timeout=2)
+
 
 class Connection(ConnectionBase):
     """fastagent connection plugin."""
@@ -151,6 +181,7 @@ class Connection(ConnectionBase):
         self._agent_client: FastAgentClient | None = None
         self._stderr_lines: collections.deque[str] = collections.deque(maxlen=100)
         self._stderr_thread: threading.Thread | None = None
+        self._cache_key: tuple | None = None
 
     def _connect(self) -> Connection:
         if self._connected:
@@ -159,6 +190,25 @@ class Connection(ConnectionBase):
         host = self.get_option("host")
         user = self.get_option("remote_user")
         port = self.get_option("port")
+        cache_key = (host, user or "", port or 22)
+        self._cache_key = cache_key
+
+        # Check for a cached agent session from a previous task.
+        with _agent_cache_lock:
+            cached = _agent_cache.pop(cache_key, None)
+
+        if cached is not None:
+            proc = cached["process"]
+            if proc.poll() is None:
+                display.vvv(f"FASTAGENT: reusing cached connection to {host}", host=host)
+                self._ssh_process = proc
+                self._agent_client = cached["client"]
+                self._stderr_lines = cached["stderr_lines"]
+                self._stderr_thread = cached["stderr_thread"]
+                self._connected = True
+                return self
+            else:
+                display.vvv(f"FASTAGENT: cached agent for {host} has exited, reconnecting", host=host)
 
         display.vvv(f"FASTAGENT: connecting to {host}", host=host)
 
@@ -327,32 +377,48 @@ class Connection(ConnectionBase):
     def close(self) -> None:
         if self._ssh_process is not None:
             host = self.get_option("host")
-            display.vvv("FASTAGENT: closing connection", host=host)
-            try:
-                self._ssh_process.stdin.close()
-            except Exception:
-                pass
-            try:
-                self._ssh_process.terminate()
-                self._ssh_process.wait(timeout=5)
-            except Exception:
-                self._ssh_process.kill()
-            if self._stderr_thread is not None:
-                self._stderr_thread.join(timeout=2)
-                self._stderr_thread = None
-            # Log any remaining stderr lines on close.
-            if self._stderr_lines:
-                display.vvv(
-                    f"FASTAGENT: agent stderr at close:\n"
-                    + "\n".join(self._stderr_lines),
-                    host=host,
-                )
-            self._ssh_process = None
-            self._agent_client = None
+            # Cache the session for reuse by the next task instead of killing
+            # the agent. Ansible calls close() after every task.
+            if self._cache_key is not None and self._ssh_process.poll() is None:
+                display.vvv("FASTAGENT: caching connection for reuse", host=host)
+                with _agent_cache_lock:
+                    # Kill any stale cached session for this key.
+                    old = _agent_cache.pop(self._cache_key, None)
+                    if old is not None:
+                        _kill_session(old)
+                    _agent_cache[self._cache_key] = {
+                        "process": self._ssh_process,
+                        "client": self._agent_client,
+                        "stderr_lines": self._stderr_lines,
+                        "stderr_thread": self._stderr_thread,
+                    }
+                self._ssh_process = None
+                self._agent_client = None
+            else:
+                display.vvv("FASTAGENT: closing connection", host=host)
+                _kill_session({
+                    "process": self._ssh_process,
+                    "client": self._agent_client,
+                    "stderr_lines": self._stderr_lines,
+                    "stderr_thread": self._stderr_thread,
+                })
+                self._ssh_process = None
+                self._agent_client = None
         self._connected = False
 
     def reset(self) -> None:
-        self.close()
+        """Force-close the connection (no caching) and reconnect."""
+        # Discard the cache key so close() kills the process.
+        if self._ssh_process is not None:
+            _kill_session({
+                "process": self._ssh_process,
+                "client": self._agent_client,
+                "stderr_lines": self._stderr_lines,
+                "stderr_thread": self._stderr_thread,
+            })
+            self._ssh_process = None
+            self._agent_client = None
+        self._connected = False
         self._connect()
 
     # --- internal helpers ---
