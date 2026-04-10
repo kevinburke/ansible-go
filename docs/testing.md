@@ -31,8 +31,42 @@ module_utils = /path/to/ansible-go/module_utils
 
 ```bash
 cd "$ANSIBLE_GO_DIR"
-make build
-# produces tmp/fastagent-linux-amd64 and tmp/fastagent-linux-arm64
+make deploy
+```
+
+This cross-compiles the agent for linux/amd64 and linux/arm64, then copies the
+versioned binaries to `~/.ansible/fastagent/`:
+
+```
+~/.ansible/fastagent/fastagent-0.1.0-linux-amd64
+~/.ansible/fastagent/fastagent-0.1.0-linux-arm64
+```
+
+The connection plugin auto-uploads the correct binary to each remote host on
+first connect (via scp). On the remote host, it's placed at
+`~/.ansible/fastagent/fastagent-<version>-linux-<arch>`. If the correct version
+is already present on the remote host, the upload is skipped.
+
+The plugin searches for the local binary in this order:
+
+1. `fastagent_local_agent_dir` inventory variable (if set)
+2. `~/.ansible/fastagent/` (where `make deploy` puts them)
+3. `tmp/` relative to the plugin directory (raw `make build` output)
+
+You can override the remote path with `fastagent_agent_path`:
+
+```ini
+[all:vars]
+fastagent_agent_path=/usr/local/bin/fastagent
+```
+
+If the upload fails or you prefer to deploy the binary yourself, copy it
+manually:
+
+```bash
+scp ~/.ansible/fastagent/fastagent-0.1.0-linux-amd64 \
+  yourhost:~/.ansible/fastagent/fastagent-0.1.0-linux-amd64
+ssh yourhost chmod +x ~/.ansible/fastagent/fastagent-0.1.0-linux-amd64
 ```
 
 ### Step 2: Smoke test locally (no remote host needed)

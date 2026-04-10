@@ -171,6 +171,13 @@ class Connection(ConnectionBase):
             arch=remote_arch,
         )
 
+        # Expand ~ to the remote user's home directory so paths work in
+        # quoted contexts (shlex.quote, scp arguments).
+        if remote_agent_path.startswith("~/"):
+            rc, home, _ = self._run_ssh_command(host, user, port, "echo $HOME")
+            if rc == 0 and home.strip():
+                remote_agent_path = home.strip() + remote_agent_path[1:]
+
         # Bootstrap: upload agent if needed.
         self._ensure_agent_deployed(host, user, port, remote_agent_path, remote_arch)
 
@@ -492,7 +499,7 @@ class Connection(ConnectionBase):
         if port:
             scp_cmd.extend(["-P", str(port)])
 
-        scp_target = f"{host}:{shlex.quote(remote_path)}"
+        scp_target = f"{host}:{remote_path}"
         if user:
             scp_target = f"{user}@{scp_target}"
 
@@ -513,11 +520,20 @@ class Connection(ConnectionBase):
     def _find_local_binary(self, arch: str) -> str | None:
         """Find the local agent binary for the given architecture."""
         binary_name = f"fastagent-linux-{arch}"
+        versioned_name = f"fastagent-{AGENT_VERSION}-linux-{arch}"
 
         # Check explicit config.
         local_dir = self.get_option("local_agent_dir")
         if local_dir:
-            path = os.path.join(local_dir, binary_name)
+            for name in (versioned_name, binary_name):
+                path = os.path.join(local_dir, name)
+                if os.path.isfile(path):
+                    return path
+
+        # Check ~/.ansible/fastagent/ (where `make deploy` puts them).
+        home_dir = os.path.join(os.path.expanduser("~"), ".ansible", "fastagent")
+        for name in (versioned_name, binary_name):
+            path = os.path.join(home_dir, name)
             if os.path.isfile(path):
                 return path
 
