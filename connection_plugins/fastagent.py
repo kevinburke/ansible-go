@@ -106,13 +106,13 @@ options:
 """
 
 import base64
-import collections
 import hashlib
 import os
 import shlex
+import socket as socket_mod
 import subprocess
 import sys
-import threading
+import time as time_mod
 import typing as t
 
 from ansible.errors import AnsibleConnectionFailure, AnsibleFileNotFound
@@ -146,10 +146,8 @@ class Connection(ConnectionBase):
 
     def __init__(self, *args: t.Any, **kwargs: t.Any) -> None:
         super().__init__(*args, **kwargs)
-        self._ssh_process: subprocess.Popen | None = None
+        self._socket: socket_mod.socket | None = None
         self._agent_client: FastAgentClient | None = None
-        self._stderr_lines: collections.deque[str] = collections.deque(maxlen=100)
-        self._stderr_thread: threading.Thread | None = None
 
     def _connect(self) -> Connection:
         if self._connected:
@@ -174,42 +172,89 @@ class Connection(ConnectionBase):
                     f"falling back to direct execution"
                 )
 
-        # Socket path on the remote host, keyed by become user.
-        socket_path = f"/tmp/fastagent-{become_user}.sock" if use_become else "/tmp/fastagent.sock"
+        # Socket paths.
+        remote_socket = f"/tmp/fastagent-{become_user}.sock" if use_become else "/tmp/fastagent.sock"
+        local_socket = f"/tmp/fastagent-local-{host}-{become_user}.sock"
 
-        # Fast path: try connecting to an existing daemon directly. This
-        # skips arch detection, deployment check, and daemon startup — just
-        # one SSH command (the bridge). This is the common case after the
-        # first task has bootstrapped the daemon.
-        if self._try_connect_bridge(host, user, port, socket_path, use_become, become_user):
+        # Fast path: try connecting to the local forwarding socket directly.
+        # This is a local Unix socket connect (~1ms), no SSH involved.
+        if self._try_local_socket(local_socket, host):
             return self
 
-        display.vvv(f"FASTAGENT: fast path failed, doing full bootstrap", host=host)
+        display.vvv(f"FASTAGENT: local socket not available, setting up", host=host)
 
-        # Full bootstrap: detect arch, deploy binary, start daemon, connect.
+        # Ensure the remote daemon is running.
+        self._ensure_remote_daemon(host, user, port, remote_socket, use_become, become_user)
+
+        # Start SSH socket forwarding if not already running.
+        self._ensure_ssh_forwarding(host, user, port, local_socket, remote_socket)
+
+        # Now connect to the local socket.
+        if not self._try_local_socket(local_socket, host):
+            raise AnsibleConnectionFailure(
+                f"fastagent: failed to connect to local forwarding socket {local_socket}"
+            )
+
+        return self
+
+    def _try_local_socket(self, local_socket: str, host: str) -> bool:
+        """Try connecting to the local forwarding socket. Returns True on success."""
+        if not os.path.exists(local_socket):
+            return False
+
+        try:
+            sock = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+            sock.settimeout(2)
+            sock.connect(local_socket)
+            client = FastAgentClient(sock.makefile("wb"), sock.makefile("rb"))
+            display.vvv(f"FASTAGENT: connected via local socket", host=host)
+            self._socket = sock
+            self._agent_client = client
+            self._connected = True
+            return True
+        except Exception as e:
+            display.vvv(f"FASTAGENT: local socket connect failed: {e}", host=host)
+            return False
+
+    def _ensure_remote_daemon(
+        self,
+        host: str,
+        user: str | None,
+        port: int | None,
+        remote_socket: str,
+        use_become: bool,
+        become_user: str,
+    ) -> None:
+        """Ensure the remote daemon is running, bootstrapping if needed."""
+        # Check if daemon is already running by testing the remote socket.
+        rc, _, _ = self._run_ssh_command(
+            host, user, port, f"test -S {shlex.quote(remote_socket)}"
+        )
+        if rc == 0:
+            display.vvv(f"FASTAGENT: remote daemon already running", host=host)
+            return
+
+        display.vvv(f"FASTAGENT: bootstrapping remote daemon", host=host)
+
+        # Detect arch and deploy binary.
         remote_arch = self._detect_remote_arch(host, user, port)
         agent_path_template = self.get_option("agent_path")
         remote_agent_path = agent_path_template.format(
-            version=AGENT_VERSION,
-            os="linux",
-            arch=remote_arch,
+            version=AGENT_VERSION, os="linux", arch=remote_arch,
         )
-
-        # Expand ~ to the remote user's home directory.
         if remote_agent_path.startswith("~/"):
             rc, home, _ = self._run_ssh_command(host, user, port, "echo $HOME")
             if rc == 0 and home.strip():
                 remote_agent_path = home.strip() + remote_agent_path[1:]
 
-        # Upload agent binary if needed.
         self._ensure_agent_deployed(host, user, port, remote_agent_path, remote_arch)
 
         agent_bin = shlex.quote(remote_agent_path)
 
-        # Kill any old daemon (version mismatch or stale).
+        # Kill any old daemon.
         kill_cmd = (
             f"pkill -f 'fastagent --daemon' 2>/dev/null;"
-            f" rm -f {shlex.quote(socket_path)} {shlex.quote(socket_path + '.pid')}"
+            f" rm -f {shlex.quote(remote_socket)} {shlex.quote(remote_socket + '.pid')}"
         )
         if use_become:
             kill_cmd = f"sudo sh -c {shlex.quote(kill_cmd)}"
@@ -217,15 +262,15 @@ class Connection(ConnectionBase):
 
         # Start the daemon.
         debug_flag = " --debug" if display.verbosity >= 3 else ""
-        daemon_cmd = f"{agent_bin} --daemon --socket {shlex.quote(socket_path)}{debug_flag}"
+        daemon_cmd = f"{agent_bin} --daemon --socket {shlex.quote(remote_socket)}{debug_flag}"
         if use_become:
             daemon_cmd = f"sudo -u {shlex.quote(become_user)} {daemon_cmd}"
 
-        log_path = socket_path + ".log"
+        log_path = remote_socket + ".log"
         start_cmd = (
             f"setsid {daemon_cmd} </dev/null >>{shlex.quote(log_path)} 2>&1 &"
             f" for i in 1 2 3 4 5; do"
-            f"   test -S {shlex.quote(socket_path)} && exit 0;"
+            f"   test -S {shlex.quote(remote_socket)} && exit 0;"
             f"   sleep 0.1;"
             f" done;"
             f" echo 'timeout waiting for socket' >&2; exit 1"
@@ -236,110 +281,66 @@ class Connection(ConnectionBase):
                 f"fastagent: failed to start daemon: rc={rc}\n"
                 f"stdout: {stdout}\nstderr: {stderr}"
             )
-        display.vvv(f"FASTAGENT: daemon started at {socket_path}", host=host)
+        display.vvv(f"FASTAGENT: daemon started at {remote_socket}", host=host)
 
-        # Now connect via bridge (pass known binary path to avoid glob).
-        if not self._try_connect_bridge(host, user, port, socket_path, use_become, become_user, agent_bin=agent_bin):
-            raise AnsibleConnectionFailure(
-                "fastagent: failed to connect to daemon after starting it"
-            )
-
-        return self
-
-    def _try_connect_bridge(
+    def _ensure_ssh_forwarding(
         self,
         host: str,
         user: str | None,
         port: int | None,
-        socket_path: str,
-        use_become: bool,
-        become_user: str,
-        agent_bin: str | None = None,
-    ) -> bool:
-        """Try to connect to an existing daemon. Returns True on success."""
-        if agent_bin is None:
-            # Fast path: find any fastagent binary using a glob. The shell
-            # expands $HOME and the glob, so no arch detection SSH needed.
-            agent_path_template = self.get_option("agent_path")
-            # Replace {version}, {os}, {arch} with the known version and wildcards.
-            glob_path = agent_path_template.format(
-                version=AGENT_VERSION, os="linux", arch="*",
-            )
-            if glob_path.startswith("~/"):
-                glob_path = glob_path.replace("~/", "$HOME/", 1)
-            # Use shell: find the first matching binary.
-            agent_bin_expr = f"$(ls -1 {glob_path} 2>/dev/null | head -1)"
-        else:
-            agent_bin_expr = agent_bin
+        local_socket: str,
+        remote_socket: str,
+    ) -> None:
+        """Start a background SSH session that forwards local_socket to remote_socket."""
+        # Clean up stale local socket.
+        if os.path.exists(local_socket):
+            os.remove(local_socket)
 
-        connect_cmd = f"{agent_bin_expr} --connect --socket {shlex.quote(socket_path)}"
-        if use_become:
-            connect_cmd = f"sudo -u {shlex.quote(become_user)} {connect_cmd}"
+        ssh_executable = self.get_option("ssh_executable") or "ssh"
+        cmd = [ssh_executable]
 
-        ssh_cmd = self._build_ssh_command(host, user, port, connect_cmd)
-        display.vvv(f"FASTAGENT: trying fast connect to {host}", host=host)
+        ssh_args = self.get_option("ssh_args")
+        if ssh_args:
+            cmd.extend(shlex.split(ssh_args))
 
-        proc = subprocess.Popen(
-            ssh_cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        private_key = self.get_option("private_key")
+        if private_key:
+            cmd.extend(["-o", f"IdentityFile={private_key}"])
 
-        stderr_lines: collections.deque[str] = collections.deque(maxlen=100)
-        stderr_thread = threading.Thread(
-            target=self._read_stderr,
-            args=(proc.stderr, host),
-            daemon=True,
-        )
-        stderr_thread.start()
+        if user:
+            cmd.extend(["-o", f"User={user}"])
+        if port:
+            cmd.extend(["-o", f"Port={port}"])
 
-        client = FastAgentClient(proc.stdin, proc.stdout)
+        # -f: go to background after authentication
+        # -N: no remote command
+        # -L: forward local Unix socket to remote Unix socket
+        cmd.extend([
+            "-f", "-N",
+            "-o", "ExitOnForwardFailure=yes",
+            "-L", f"{local_socket}:{remote_socket}",
+            host,
+        ])
 
-        # Try Hello with a short timeout. If the daemon isn't running or the
-        # binary doesn't exist, this will fail quickly.
-        try:
-            result = client.hello(AGENT_VERSION)
-            remote_version = result.get("version", "")
-            display.vvv(
-                f"FASTAGENT: connected to daemon version={remote_version}",
-                host=host,
+        display.vvv(f"FASTAGENT: starting SSH forwarding: {' '.join(cmd)}", host=host)
+
+        result = subprocess.run(cmd, capture_output=True, timeout=30)
+        if result.returncode != 0:
+            raise AnsibleConnectionFailure(
+                f"fastagent: SSH forwarding failed: "
+                f"{result.stderr.decode('utf-8', errors='replace')}"
             )
 
-            if remote_version != AGENT_VERSION:
-                display.vvv(
-                    f"FASTAGENT: version mismatch (want {AGENT_VERSION}, "
-                    f"got {remote_version})",
-                    host=host,
-                )
-                try:
-                    proc.stdin.close()
-                except Exception:
-                    pass
-                proc.terminate()
-                proc.wait(timeout=5)
-                return False
+        # Wait for the local socket to appear.
+        for _ in range(10):
+            if os.path.exists(local_socket):
+                display.vvv(f"FASTAGENT: SSH forwarding established", host=host)
+                return
+            time_mod.sleep(0.05)
 
-        except Exception as e:
-            display.vvv(f"FASTAGENT: fast connect failed: {e}", host=host)
-            try:
-                proc.stdin.close()
-            except Exception:
-                pass
-            try:
-                proc.terminate()
-                proc.wait(timeout=5)
-            except Exception:
-                proc.kill()
-            return False
-
-        # Success — adopt this connection.
-        self._ssh_process = proc
-        self._agent_client = client
-        self._stderr_lines = stderr_lines
-        self._stderr_thread = stderr_thread
-        self._connected = True
-        return True
+        raise AnsibleConnectionFailure(
+            f"fastagent: SSH forwarding socket {local_socket} did not appear"
+        )
 
     def exec_command(
         self,
@@ -370,11 +371,7 @@ class Connection(ConnectionBase):
                 stdin=stdin_data,
             )
         except IOError as e:
-            agent_stderr = self._get_agent_stderr()
-            msg = f"fastagent exec_command failed: {e}"
-            if agent_stderr:
-                msg += f"\nagent stderr:\n{agent_stderr}"
-            return (1, b"", to_bytes(msg))
+            return (1, b"", to_bytes(f"fastagent exec_command failed: {e}"))
         except FastAgentError as e:
             return (1, b"", to_bytes(str(e)))
 
@@ -408,11 +405,7 @@ class Connection(ConnectionBase):
                 group=remote_user,
             )
         except (FastAgentError, IOError) as e:
-            agent_stderr = self._get_agent_stderr()
-            msg = f"fastagent put_file failed: {e}"
-            if agent_stderr:
-                msg += f"\nagent stderr:\n{agent_stderr}"
-            raise AnsibleConnectionFailure(msg)
+            raise AnsibleConnectionFailure(f"fastagent put_file failed: {e}")
 
     def fetch_file(self, in_path: str, out_path: str) -> None:
         super().fetch_file(in_path, out_path)
@@ -422,11 +415,7 @@ class Connection(ConnectionBase):
         try:
             result = self._agent_client.read_file(in_path)
         except (FastAgentError, IOError) as e:
-            agent_stderr = self._get_agent_stderr()
-            msg = f"fastagent fetch_file failed: {e}"
-            if agent_stderr:
-                msg += f"\nagent stderr:\n{agent_stderr}"
-            raise AnsibleConnectionFailure(msg)
+            raise AnsibleConnectionFailure(f"fastagent fetch_file failed: {e}")
 
         data = base64.b64decode(result["content"])
         out_dir = os.path.dirname(out_path)
@@ -436,55 +425,21 @@ class Connection(ConnectionBase):
             f.write(data)
 
     def close(self) -> None:
-        # Close the SSH bridge session. The daemon stays alive on the remote
-        # host — next task will reconnect to it cheaply.
-        if self._ssh_process is not None:
-            display.vvv("FASTAGENT: closing bridge (daemon stays alive)", host=self.get_option("host"))
+        # Close the local socket connection. The SSH forwarding session and
+        # remote daemon both stay alive for the next task.
+        if self._socket is not None:
+            display.vvv("FASTAGENT: closing socket", host=self.get_option("host"))
             try:
-                self._ssh_process.stdin.close()
+                self._socket.close()
             except Exception:
                 pass
-            try:
-                self._ssh_process.terminate()
-                self._ssh_process.wait(timeout=5)
-            except Exception:
-                try:
-                    self._ssh_process.kill()
-                except Exception:
-                    pass
-            if self._stderr_thread is not None:
-                self._stderr_thread.join(timeout=2)
-                self._stderr_thread = None
-            self._ssh_process = None
+            self._socket = None
             self._agent_client = None
         self._connected = False
 
     def reset(self) -> None:
         self.close()
         self._connect()
-
-    # --- internal helpers ---
-
-    def _read_stderr(self, stderr_pipe, host: str) -> None:
-        """Background thread: read agent stderr line-by-line.
-
-        Each line is stored in a bounded deque (last 100 lines) and forwarded
-        to Ansible's display at -vvv verbosity. This prevents the pipe buffer
-        from filling up and surfaces agent log messages and crash output.
-        """
-        try:
-            for raw_line in stderr_pipe:
-                line = raw_line.decode("utf-8", errors="replace").rstrip("\n")
-                self._stderr_lines.append(line)
-                display.vvv(f"FASTAGENT [{host}]: {line}", host=host)
-        except Exception:
-            pass
-
-    def _get_agent_stderr(self) -> str:
-        """Return recent agent stderr lines, for inclusion in error messages."""
-        if not self._stderr_lines:
-            return ""
-        return "\n".join(self._stderr_lines)
 
     def _build_ssh_command(
         self,
