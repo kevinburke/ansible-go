@@ -1,0 +1,31 @@
+env:
+  TZ: UTC
+  GO_VERSION: "1.26.2"
+  STATICCHECK_VERSION: "v0.7.0"
+  DIFFER_VERSION: "v0.0.0-20260403230520-c0574ebcacb2"
+
+steps:
+  - label: ":go: Format"
+    key: "format"
+    command: "bash .buildkite/ci.sh format"
+    timeout_in_minutes: 10
+
+  - label: ":go: Lint"
+    key: "lint"
+    command: "bash .buildkite/ci.sh lint"
+    timeout_in_minutes: 10
+
+  - label: ":go: Test"
+    key: "test"
+    command: "bash .buildkite/ci.sh test"
+    timeout_in_minutes: 15
+
+  - label: ":go: Build"
+    key: "build"
+    command: "bash .buildkite/ci.sh build"
+    timeout_in_minutes: 10
+
+  - label: ":python: Test"
+    key: "python-test"
+    command: "bash .buildkite/ci.sh python-test"
+    timeout_in_minutes: 15

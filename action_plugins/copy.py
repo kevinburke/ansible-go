@@ -20,37 +20,53 @@ import stat
 from ansible.errors import AnsibleActionFail, AnsibleFileNotFound
 from ansible.module_utils.common.text.converters import to_bytes, to_text
 from ansible.module_utils.parsing.convert_bool import boolean
-from ansible.plugins.action.copy import ActionModule as BuiltinCopyAction
+from ansible.plugins.action import ActionBase
 from ansible.utils.hashing import checksum
 
 
-class ActionModule(BuiltinCopyAction):
+class ActionModule(ActionBase):
+
+    def _run_builtin_copy(self, tmp, task_vars):
+        """Delegate to the builtin copy action via _execute_module."""
+        return self._execute_module(
+            module_name="ansible.builtin.copy",
+            task_vars=task_vars,
+        )
 
     def run(self, tmp=None, task_vars=None):
         if task_vars is None:
             task_vars = dict()
 
+        result = super().run(tmp, task_vars)
+        del tmp
+
         # Fall back for non-fastagent connections.
         if self._connection.transport != "fastagent":
-            return super().run(tmp=tmp, task_vars=task_vars)
+            return self._run_builtin_copy(None, task_vars)
 
         args = self._task.args
         remote_src = boolean(args.get("remote_src", False), strict=False)
 
         # Fall back for cases we don't handle in the fast path.
         if remote_src:
-            return super().run(tmp=tmp, task_vars=task_vars)
+            return self._run_builtin_copy(None, task_vars)
 
         source = args.get("src")
         content = args.get("content")
         dest = args.get("dest")
 
         if not dest:
-            return self._ensure_invocation({"failed": True, "msg": "dest is required"})
+            result["failed"] = True
+            result["msg"] = "dest is required"
+            return result
         if not source and content is None:
-            return self._ensure_invocation({"failed": True, "msg": "src (or content) is required"})
+            result["failed"] = True
+            result["msg"] = "src (or content) is required"
+            return result
         if source and content is not None:
-            return self._ensure_invocation({"failed": True, "msg": "src and content are mutually exclusive"})
+            result["failed"] = True
+            result["msg"] = "src and content are mutually exclusive"
+            return result
 
         # Handle content parameter: write to bytes directly.
         if content is not None:
@@ -64,13 +80,13 @@ class ActionModule(BuiltinCopyAction):
         try:
             source = self._find_needle("files", source)
         except Exception:
-            return super().run(tmp=tmp, task_vars=task_vars)
+            return self._run_builtin_copy(None, task_vars)
 
         source_stat = os.stat(source)
 
         # Fall back if source is a directory (recursive copy is complex).
         if stat.S_ISDIR(source_stat.st_mode):
-            return super().run(tmp=tmp, task_vars=task_vars)
+            return self._run_builtin_copy(None, task_vars)
 
         # Simple file copy fast path.
         with open(source, "rb") as f:
@@ -80,7 +96,7 @@ class ActionModule(BuiltinCopyAction):
 
     def _fastagent_copy_data(self, data, dest, args, task_vars):
         """Copy data bytes to dest via fastagent RPC."""
-        result = super(BuiltinCopyAction, self).run(None, task_vars)
+        result = super().run(None, task_vars)
 
         # Ensure the connection is established before accessing _agent_client.
         self._connection._connect()
@@ -105,7 +121,7 @@ class ActionModule(BuiltinCopyAction):
         except Exception as e:
             result["failed"] = True
             result["msg"] = f"fastagent stat failed: {e}"
-            return self._ensure_invocation(result)
+            return result
 
         # If dest is a directory, append the source basename.
         if remote_stat.get("exists") and remote_stat.get("isdir"):
@@ -118,11 +134,11 @@ class ActionModule(BuiltinCopyAction):
             except Exception as e:
                 result["failed"] = True
                 result["msg"] = f"fastagent stat failed: {e}"
-                return self._ensure_invocation(result)
+                return result
 
         changed = True
 
-        if remote_stat.get("exists") and not remote_stat.get("isdir"):
+        if remote_stat.get("exists") and not remote_stat.get("isdir", False):
             remote_checksum = remote_stat.get("checksum", "")
             if remote_checksum == local_checksum and force:
                 changed = False
@@ -149,12 +165,12 @@ class ActionModule(BuiltinCopyAction):
                     result["failed"] = True
                     result["msg"] = f"fastagent file attrs failed: {e}"
 
-            return self._ensure_invocation(result)
+            return result
 
         # Build diff if requested.
         if diff:
             result["diff"] = []
-            if remote_stat.get("exists") and not remote_stat.get("isdir"):
+            if remote_stat.get("exists") and not remote_stat.get("isdir", False):
                 try:
                     old = client.read_file(dest)
                     old_content = base64.b64decode(old["content"])
@@ -170,7 +186,7 @@ class ActionModule(BuiltinCopyAction):
         if check_mode:
             result["changed"] = True
             result["dest"] = dest
-            return self._ensure_invocation(result)
+            return result
 
         # Write the file.
         content_b64 = base64.b64encode(data).decode("ascii")
@@ -188,7 +204,7 @@ class ActionModule(BuiltinCopyAction):
         except Exception as e:
             result["failed"] = True
             result["msg"] = f"fastagent write failed: {e}"
-            return self._ensure_invocation(result)
+            return result
 
         result["changed"] = write_result.get("changed", True)
         result["dest"] = dest
@@ -196,7 +212,7 @@ class ActionModule(BuiltinCopyAction):
         if write_result.get("backup_file"):
             result["backup_file"] = write_result["backup_file"]
 
-        return self._ensure_invocation(result)
+        return result
 
     def _format_mode(self, mode):
         """Format mode for the agent (expects octal string like '0644')."""
