@@ -135,7 +135,7 @@ from fastagent_client import FastAgentClient, FastAgentError  # noqa: E402
 display = Display()
 
 # Agent version must match the Go constant.
-AGENT_VERSION = "0.2.0"
+AGENT_VERSION = "0.3.0"
 
 class Connection(ConnectionBase):
     """fastagent connection plugin."""
