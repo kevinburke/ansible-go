@@ -1,6 +1,7 @@
 package fastagent
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,12 +11,57 @@ import (
 	"time"
 )
 
-// aptCacheState tracks when apt-get update was last run so we can skip
-// redundant updates within the same daemon session.
+// aptState tracks apt cache freshness and installed packages so we can
+// skip redundant operations within the same daemon session.
 var (
-	aptCacheMu      sync.Mutex
-	aptCacheUpdated time.Time
+	aptMu             sync.Mutex
+	aptCacheUpdated   time.Time
+	aptInstalledPkgs  map[string]bool // package name → true if installed
+	aptInstalledValid bool            // whether the map is populated
 )
+
+// loadInstalledPackages reads dpkg status to build the installed package set.
+// Must be called with aptMu held.
+func loadInstalledPackages(logger interface{ Debug(string, ...any) }) {
+	pkgs := make(map[string]bool)
+
+	f, err := os.Open("/var/lib/dpkg/status")
+	if err != nil {
+		logger.Debug("cannot read dpkg status, disabling package cache", "error", err)
+		aptInstalledValid = false
+		return
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	var currentPkg string
+	var installed bool
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if pkg, ok := strings.CutPrefix(line, "Package: "); ok {
+			currentPkg = pkg
+			installed = false
+		} else if strings.HasPrefix(line, "Status: ") {
+			// "Status: install ok installed" means the package is installed.
+			installed = strings.Contains(line, " installed")
+		} else if line == "" {
+			if currentPkg != "" && installed {
+				pkgs[currentPkg] = true
+			}
+			currentPkg = ""
+			installed = false
+		}
+	}
+	// Handle last entry if file doesn't end with blank line.
+	if currentPkg != "" && installed {
+		pkgs[currentPkg] = true
+	}
+
+	aptInstalledPkgs = pkgs
+	aptInstalledValid = true
+	logger.Debug("loaded dpkg package cache", "count", len(pkgs))
+}
 
 func (s *Server) handlePackage(params json.RawMessage) (any, error) {
 	var p PackageParams
@@ -42,27 +88,21 @@ func (s *Server) handlePackageApt(p PackageParams) (any, error) {
 	if p.UpdateCache {
 		skip := false
 
-		// Check if the apt cache is fresh enough to skip the update.
-		// Use whichever is more recent: our in-memory timestamp or the
-		// on-disk apt cache timestamp.
 		validTime := p.CacheValidTime
 		if validTime <= 0 {
-			// Default: skip if we already ran apt-get update in this
-			// daemon session within the last 60 seconds.
 			validTime = 60
 		}
 
-		aptCacheMu.Lock()
+		aptMu.Lock()
 		if !aptCacheUpdated.IsZero() && time.Since(aptCacheUpdated) < time.Duration(validTime)*time.Second {
 			skip = true
 			s.Logger.Debug("apt cache fresh, skipping update",
 				"age", time.Since(aptCacheUpdated).String(),
 				"valid_time", validTime)
 		}
-		aptCacheMu.Unlock()
+		aptMu.Unlock()
 
 		if !skip {
-			// Also check the on-disk cache timestamp.
 			if info, err := os.Stat("/var/lib/apt/lists/lock"); err == nil {
 				if time.Since(info.ModTime()) < time.Duration(validTime)*time.Second {
 					skip = true
@@ -80,9 +120,11 @@ func (s *Server) handlePackageApt(p PackageParams) (any, error) {
 			if err != nil {
 				return nil, fmt.Errorf("apt-get update: %s\n%s", err, string(out))
 			}
-			aptCacheMu.Lock()
+			aptMu.Lock()
 			aptCacheUpdated = time.Now()
-			aptCacheMu.Unlock()
+			// Invalidate the installed packages cache since repos may have changed.
+			aptInstalledValid = false
+			aptMu.Unlock()
 			cacheUpdated = true
 		}
 	}
@@ -93,6 +135,35 @@ func (s *Server) handlePackageApt(p PackageParams) (any, error) {
 			CacheUpdated: cacheUpdated,
 			Msg:          "Cache updated",
 		}, nil
+	}
+
+	// For state=present, check if all packages are already installed using
+	// the dpkg cache. This avoids shelling out to apt-get entirely.
+	if p.State == "present" {
+		aptMu.Lock()
+		if !aptInstalledValid {
+			loadInstalledPackages(s.Logger)
+		}
+		if aptInstalledValid {
+			allInstalled := true
+			for _, name := range p.Names {
+				if !aptInstalledPkgs[name] {
+					allInstalled = false
+					break
+				}
+			}
+			if allInstalled {
+				aptMu.Unlock()
+				s.Logger.Debug("all packages already installed (dpkg cache)",
+					"packages", strings.Join(p.Names, ", "))
+				return PackageResult{
+					Changed:      cacheUpdated,
+					CacheUpdated: cacheUpdated,
+					Msg:          "All packages already installed",
+				}, nil
+			}
+		}
+		aptMu.Unlock()
 	}
 
 	var args []string
@@ -117,6 +188,13 @@ func (s *Server) handlePackageApt(p PackageParams) (any, error) {
 	// Detect whether anything actually changed.
 	changed := !strings.Contains(string(out), "0 newly installed") ||
 		!strings.Contains(string(out), "0 to remove")
+
+	// If packages were installed or removed, invalidate the cache.
+	if changed {
+		aptMu.Lock()
+		aptInstalledValid = false
+		aptMu.Unlock()
+	}
 
 	return PackageResult{
 		Changed:      changed || cacheUpdated,
