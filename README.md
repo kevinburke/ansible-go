@@ -10,56 +10,149 @@ fastagent:       22s   (56% faster)
 
 Fastagent keeps standard Ansible YAML, inventory, variables, and templating
 unchanged. It substitutes a faster execution engine underneath using supported
-Ansible extension points (connection plugin, action plugin overrides).
+Ansible extension points (connection plugin and action plugin overrides).
 
-## How it works
+## Requirements
 
-1. On first connect, the connection plugin uploads a small Go binary to the
-   remote host and starts it as a persistent daemon on a Unix socket.
-2. An SSH socket forwarding session bridges a local Unix socket to the remote
-   daemon. This session persists across tasks.
-3. Each Ansible task connects to the local socket (~1ms), sends JSON-RPC
-   requests to the daemon, and disconnects. No SSH process per task.
-4. Action plugin overrides for common modules (`command`, `shell`, `file`,
-   `stat`, `copy`, `apt`, `systemd`) bypass Python module transfer entirely,
-   sending RPCs directly to the daemon.
+**Controller** (the machine running `ansible-playbook`):
 
-Tasks using modules without overrides still work normally through the standard
-Ansible module execution path, but benefit from the persistent connection.
+- Ansible 2.12 or newer
+- Python 3.8 or newer
+- `ssh` and `scp` (already required by stock Ansible)
+- Network access to `github.com` for the first-time agent download (or a
+  locally built binary — see [Building from source](#building-from-source))
 
-## Quick start
+**Remote hosts** (the machines being managed):
 
-### 1. Install the collection
+- Linux on `amd64` or `arm64`
+- Works on glibc and musl distros (Debian, Ubuntu, RHEL/Rocky/Alma, Fedora,
+  Amazon Linux, Alpine) — the agent is a statically linked Go binary, no libc
+  dependency
+- `sudo` access for the connecting user, since the agent runs as root to
+  handle privilege escalation
+- `systemd` is only required if you use the `systemd` action plugin override;
+  everything else is independent of init system
+
+The agent binary is ~5 MB and is uploaded to `~/.ansible/fastagent/` on the
+remote host on first run. It auto-exits after 1 hour of inactivity.
+
+## Install
+
+### Option A — From a Git tag (works today)
+
+```bash
+ansible-galaxy collection install \
+    git+https://github.com/kevinburke/ansible-go.git,v0.3.1
+```
+
+This pulls the collection straight from this repo at the `v0.3.1` tag. No
+Galaxy account needed.
+
+### Option B — Via `requirements.yml` (recommended for teams)
+
+Add to your playbook repo's `requirements.yml`:
+
+```yaml
+collections:
+  - name: kevinburke.fastagent
+    source: https://github.com/kevinburke/ansible-go.git
+    type: git
+    version: v0.3.1
+```
+
+Install:
+
+```bash
+ansible-galaxy collection install -r requirements.yml
+```
+
+### Option C — From Ansible Galaxy
+
+Coming soon. Once published, you'll be able to do:
 
 ```bash
 ansible-galaxy collection install kevinburke.fastagent
 ```
 
-That's it for the controller side. The connection plugin auto-downloads the
-prebuilt Linux agent binary from GitHub Releases on first use and caches it
-under `~/.ansible/fastagent/`. No Go toolchain required.
+After install, the connection plugin auto-downloads the prebuilt Linux agent
+binary from GitHub Releases on first use and caches it under
+`~/.ansible/fastagent/` on the controller. **No Go toolchain required.**
 
-### 2. Enable it per host
+## Enable it on a host
 
-Set the connection in your inventory (the FQCN namespace is
-`kevinburke.fastagent.fastagent`):
+In your inventory, set the connection on the hosts you want to accelerate.
+The connection name is the FQCN `kevinburke.fastagent.fastagent`.
 
-```ini
-[webservers]
-myhost ansible_connection=kevinburke.fastagent.fastagent ansible_user=deploy
-```
-
-Or group-wide in `group_vars/all.yml`:
+YAML inventory:
 
 ```yaml
+all:
+  children:
+    fastagent_canary:
+      hosts:
+        web1.example.com:
+        web2.example.com:
+      vars:
+        ansible_connection: kevinburke.fastagent.fastagent
+        ansible_user: deploy
+```
+
+Or INI:
+
+```ini
+[fastagent_canary]
+web1.example.com
+web2.example.com
+
+[fastagent_canary:vars]
+ansible_connection=kevinburke.fastagent.fastagent
+ansible_user=deploy
+```
+
+Or via `group_vars/`:
+
+```yaml
+# group_vars/fastagent_canary.yml
 ansible_connection: kevinburke.fastagent.fastagent
 ```
 
-### 3. Use unqualified module names
+For a first rollout, put **one or two non-critical hosts** in a `fastagent_canary`
+group and leave the rest of your fleet alone — they'll keep using the default
+SSH connection. Expand the group as you build confidence. See
+[Disabling fastagent](#disabling-fastagent) for the escape hatch.
+
+## Verify it works
+
+Smoke test from the controller:
+
+```bash
+ansible fastagent_canary -m ping -vvv
+```
+
+Look for these things in the output:
+
+1. `FASTAGENT:` log lines showing the bootstrap sequence (binary upload → daemon
+   start → SSH socket forwarding up). These appear on the **first** task only.
+2. `pong` in the result — the daemon is up and answering RPCs.
+3. The first task takes a few seconds longer than usual because of the
+   bootstrap. From the second task onward, latency drops sharply.
+
+To time the difference end-to-end on a real playbook, use the `profile_tasks`
+callback:
+
+```bash
+ANSIBLE_STDOUT_CALLBACK=profile_tasks \
+    ansible-playbook -i inventory site.yml --limit fastagent_canary
+```
+
+Compare against the same playbook run without the connection override.
+
+## Use unqualified module names
 
 Fastagent overrides modules via Ansible's `ansible.legacy` resolution path.
-Tasks using fully-qualified names like `ansible.builtin.command:` bypass this
-and go through the standard (slower) execution path. Use unqualified names:
+Tasks using fully-qualified names like `ansible.builtin.command:` bypass the
+override and go through the standard (slower) execution path. Use unqualified
+names:
 
 ```yaml
 # Fast (uses fastagent override):
@@ -69,28 +162,31 @@ and go through the standard (slower) execution path. Use unqualified names:
 - ansible.builtin.command: uptime
 ```
 
-To convert an existing playbook:
+To convert an existing playbook in-place:
 
 ```bash
-find roles/ -name '*.yml' -exec sed -i 's/ansible\.builtin\.\([a-z0-9_]*\):/\1:/g' {} +
+find roles/ -name '*.yml' -exec \
+    sed -i 's/ansible\.builtin\.\([a-z0-9_]*\):/\1:/g' {} +
 ```
 
-### Building from source (optional)
+Modules that don't have an override (e.g. `git`, `user`, `cron`) still work
+normally — they go through the standard Ansible module path but still benefit
+from the persistent connection.
 
-If you prefer to build the agent binary yourself — e.g. for air-gapped
-environments, or to pin to an unreleased commit — clone this repo and run:
+## How it works
 
-```bash
-make deploy
-```
+1. On first connect, the connection plugin uploads a small Go binary to the
+   remote host and starts it as a persistent daemon on a Unix socket.
+2. An SSH socket forwarding session bridges a local Unix socket to the remote
+   daemon. This session persists across tasks.
+3. Each Ansible task connects to the local socket (~1 ms), sends JSON-RPC
+   requests to the daemon, and disconnects. No SSH process per task.
+4. Action plugin overrides for common modules bypass Python module transfer
+   entirely, sending RPCs directly to the daemon.
 
-This cross-compiles for linux/amd64 and linux/arm64 and copies the binaries to
-`~/.ansible/fastagent/`. The connection plugin checks this directory before
-attempting any download, so a locally built binary always takes precedence.
-Requires Go 1.21+.
-
-To disable the auto-download entirely, set `fastagent_download_url` to an
-empty string in inventory, or `FASTAGENT_DOWNLOAD_URL=` in the environment.
+Tasks using modules without overrides still work normally through the
+standard Ansible module execution path, but benefit from the persistent
+connection.
 
 ## What gets accelerated
 
@@ -105,6 +201,7 @@ empty string in inventory, or `FASTAGENT_DOWNLOAD_URL=` in the environment.
 | Everything else | Connection plugin | Persistent daemon + SSH forwarding |
 
 The `apt` override includes two optimizations:
+
 - **dpkg cache**: reads `/var/lib/dpkg/status` once, then skips `apt-get
   install` entirely for already-installed packages (map lookup instead of
   subprocess).
@@ -123,7 +220,7 @@ Controller                          Remote Host
 +------------------+                +------------------+
 ```
 
-- **Daemon**: persistent Go process on the remote host, accepts JSON-RPC over
+- **Daemon**: persistent Go process on the remote host. Accepts JSON-RPC over
   a Unix socket. Handles Exec, Stat, ReadFile, WriteFile, File, Package,
   Service RPCs. Auto-exits after 1 hour idle.
 - **SSH forwarding**: `ssh -fN -L local.sock:remote.sock` runs once per host,
@@ -133,7 +230,45 @@ Controller                          Remote Host
 - **Action plugins**: intercept common modules and send RPCs directly instead
   of transferring Python modules.
 
-## Debugging
+## Updating
+
+```bash
+ansible-galaxy collection install --upgrade -r requirements.yml
+```
+
+The connection plugin detects daemon version mismatches automatically: when
+it talks to a remote daemon running an older version, it kills it and uploads
+the new binary on the next task. No coordinated upgrade needed.
+
+## Disabling fastagent
+
+To take a single host **out** of fastagent without uninstalling anything,
+override `ansible_connection` in `host_vars/`:
+
+```yaml
+# host_vars/web1.example.com.yml
+ansible_connection: ssh
+```
+
+The host falls back to standard SSH on the next run. Useful as an escape
+hatch if a particular host triggers a bug.
+
+To remove the daemon and binary from a remote host entirely:
+
+```bash
+ssh myhost 'sudo pkill fastagent; sudo rm -rf /tmp/fastagent-* ~/.ansible/fastagent'
+```
+
+To disable the auto-download of the agent binary on the controller (e.g. for
+air-gapped environments where you ship the binary out-of-band):
+
+```bash
+export FASTAGENT_DOWNLOAD_URL=
+```
+
+…or set `fastagent_download_url: ""` in inventory.
+
+## Troubleshooting
 
 ### Verbose output
 
@@ -147,7 +282,7 @@ timestamps).
 
 ### Daemon log
 
-The daemon logs to a file next to its socket:
+The daemon logs to a file next to its socket on the remote host:
 
 ```bash
 ssh myhost "sudo cat /tmp/fastagent-root.sock.log"
@@ -155,9 +290,22 @@ ssh myhost "sudo cat /tmp/fastagent-root.sock.log"
 
 ### Common issues
 
+**"failed to download agent binary from \<URL\>"**
+
+The connection plugin tries to download the prebuilt binary from GitHub
+Releases on first use. If the controller can't reach `github.com`:
+
+1. Check the URL works manually: `curl -I https://github.com/kevinburke/ansible-go/releases/download/v0.3.1/fastagent-0.3.1-linux-amd64`
+2. If you're behind a proxy, set the standard `https_proxy` / `HTTPS_PROXY`
+   env var on the controller.
+3. As a fallback, build the binary locally and put it at
+   `~/.ansible/fastagent/fastagent-0.3.1-linux-amd64` (and same for `arm64`).
+   The connection plugin checks that path **before** trying to download.
+
 **"local socket not available, setting up" on every task**
 
-The SSH forwarding session died. Check if the SSH ControlMaster is working:
+The SSH forwarding session died between tasks. Check if the SSH ControlMaster
+is working:
 
 ```bash
 ssh -O check myhost
@@ -165,9 +313,9 @@ ssh -O check myhost
 
 **"timeout waiting for socket"**
 
-The daemon failed to start. Check the daemon log on the remote host.
-Common causes: the binary wasn't uploaded (version mismatch), or a stale
-daemon process is holding the socket.
+The daemon failed to start. Check the daemon log on the remote host. Common
+causes: the binary wasn't uploaded (version mismatch), or a stale daemon
+process is holding the socket.
 
 ```bash
 ssh myhost "sudo pkill fastagent; sudo rm -f /tmp/fastagent-root.sock*"
@@ -189,42 +337,42 @@ rm -f /tmp/fastagent-local-*
 Fastagent action overrides return a simplified result dict. If a downstream
 task depends on specific fields from a `register:` result (e.g. `result.uid`
 from `file`), the override may not include them. Fix: check what fields your
-playbook uses and add them to the override, or remove `ansible_connection`
-for that host to fall back to SSH.
+playbook uses and add them to the override, or set `ansible_connection: ssh`
+in `host_vars/` to fall back per-host.
 
 **Temp directories owned by root**
 
 The daemon runs as root. Commands that should run as the connecting user
-(e.g. temp dir creation) are wrapped with `runuser`. If you see
-permission errors on `~/.ansible/tmp/`, fix with:
+(e.g. temp dir creation) are wrapped with `runuser`. If you see permission
+errors on `~/.ansible/tmp/`, fix with:
 
 ```bash
 ssh myhost "sudo chown -R youruser:youruser ~/.ansible/tmp"
 ```
 
-## Updating
+## Building from source
 
-For third-party users, upgrade the collection:
-
-```bash
-ansible-galaxy collection install --upgrade kevinburke.fastagent
-```
-
-The connection plugin detects version mismatches automatically: if the remote
-daemon is running an old version, it kills it and uploads the new binary on
-the next run.
-
-When working on the agent itself, bump the version in `fastagent.go` and run:
+If you prefer to build the agent binary yourself — for air-gapped environments,
+to pin to an unreleased commit, or to hack on the agent — clone this repo and
+run:
 
 ```bash
-make clean && make deploy
+make deploy
 ```
 
-To build everything for a release (binaries plus collection tarball):
+This cross-compiles for `linux/amd64` and `linux/arm64` and copies the
+binaries to `~/.ansible/fastagent/`. The connection plugin checks this
+directory **before** attempting any download, so a locally built binary
+always takes precedence. Requires Go 1.21+.
+
+To cut a full release (binaries plus collection tarball):
 
 ```bash
 make release
 ```
+
+To run the release end-to-end with safety checks (tag, push, GitHub release,
+optional Galaxy publish), see `scripts/release.sh`.
 
 ## Security
 
