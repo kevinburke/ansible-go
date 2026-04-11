@@ -15,7 +15,11 @@ from fastagent_client import FastAgentClient, FastAgentError
 
 def _build_agent():
     """Build the agent binary for the current platform and return its path."""
-    repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # __file__ is plugins/module_utils/fastagent_client_test.py — go up three
+    # levels to reach the repo root where go.mod lives.
+    repo_dir = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
     tmp_dir = os.path.join(repo_dir, "tmp")
     os.makedirs(tmp_dir, exist_ok=True)
     binary = os.path.join(tmp_dir, "fastagent-test")

@@ -93,6 +93,17 @@ options:
             Expected layout: fastagent-linux-amd64, fastagent-linux-arm64, etc.
         vars:
             - name: fastagent_local_agent_dir
+    download_url:
+        description: >
+            URL template used to download the agent binary when it is not
+            already present locally. The tokens {version} and {arch} are
+            substituted with the agent version and target architecture
+            (amd64 or arm64). Set to an empty string to disable auto-download.
+        default: "https://github.com/kevinburke/ansible-go/releases/download/v{version}/fastagent-{version}-linux-{arch}"
+        env:
+            - name: FASTAGENT_DOWNLOAD_URL
+        vars:
+            - name: fastagent_download_url
     private_key:
         description: SSH private key file
         ini:
@@ -111,26 +122,21 @@ import os
 import shlex
 import socket as socket_mod
 import subprocess
-import sys
+import tempfile
 import time as time_mod
 import typing as t
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from ansible.errors import AnsibleConnectionFailure, AnsibleFileNotFound
 from ansible.plugins.connection import ConnectionBase
 from ansible.utils.display import Display
 from ansible.module_utils.common.text.converters import to_bytes, to_text
 
-# The fastagent_client module lives in module_utils/ next to connection_plugins/.
-# Ansible's module_utils config only injects paths for remote module execution,
-# not for controller-side plugin imports, so we add it to sys.path ourselves.
-_module_utils_dir = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "module_utils",
+from ansible_collections.kevinburke.fastagent.plugins.module_utils.fastagent_client import (
+    FastAgentClient,
+    FastAgentError,
 )
-if _module_utils_dir not in sys.path:
-    sys.path.insert(0, _module_utils_dir)
-
-from fastagent_client import FastAgentClient, FastAgentError  # noqa: E402
 
 display = Display()
 
@@ -538,12 +544,13 @@ class Connection(ConnectionBase):
             display.vvv("FASTAGENT: agent already deployed", host=host)
             return
 
-        # Find local binary.
+        # Find local binary (or download a prebuilt one).
         local_binary = self._find_local_binary(arch)
         if local_binary is None:
             raise AnsibleConnectionFailure(
-                f"fastagent: cannot find local agent binary for linux-{arch}. "
-                f"Build it with: make build"
+                f"fastagent: cannot find local agent binary for linux-{arch} "
+                f"and fastagent_download_url is empty. Build from source with "
+                f"`make build` or set fastagent_local_agent_dir."
             )
 
         display.vvv(f"FASTAGENT: uploading {local_binary} -> {remote_path}", host=host)
@@ -581,30 +588,115 @@ class Connection(ConnectionBase):
         display.vvv("FASTAGENT: agent deployed successfully", host=host)
 
     def _find_local_binary(self, arch: str) -> str | None:
-        """Find the local agent binary for the given architecture."""
+        """Find or download the local agent binary for the given architecture.
+
+        Resolution order:
+        1. fastagent_local_agent_dir (explicit override)
+        2. ~/.ansible/fastagent/ (canonical cache — also where downloads land)
+        3. tmp/ next to the repo root (for in-repo development builds)
+        4. Download from fastagent_download_url if set
+        """
         binary_name = f"fastagent-linux-{arch}"
         versioned_name = f"fastagent-{AGENT_VERSION}-linux-{arch}"
 
         # Check explicit config.
         local_dir = self.get_option("local_agent_dir")
         if local_dir:
+            local_dir = os.path.expanduser(local_dir)
             for name in (versioned_name, binary_name):
                 path = os.path.join(local_dir, name)
                 if os.path.isfile(path):
                     return path
 
-        # Check ~/.ansible/fastagent/ (where `make deploy` puts them).
-        home_dir = os.path.join(os.path.expanduser("~"), ".ansible", "fastagent")
+        # Check ~/.ansible/fastagent/ (canonical cache location).
+        cache_dir = os.path.join(os.path.expanduser("~"), ".ansible", "fastagent")
         for name in (versioned_name, binary_name):
-            path = os.path.join(home_dir, name)
+            path = os.path.join(cache_dir, name)
             if os.path.isfile(path):
                 return path
 
-        # Check tmp/ relative to the plugin's directory (build output).
-        plugin_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        for subdir in ("tmp", "build", "."):
-            path = os.path.join(plugin_dir, subdir, binary_name)
+        # Check tmp/ at the repo root (for in-repo development builds).
+        # __file__ is plugins/connection/fastagent.py, so go up three levels.
+        repo_root = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        )
+        for subdir in ("tmp", "build"):
+            path = os.path.join(repo_root, subdir, binary_name)
             if os.path.isfile(path):
                 return path
 
-        return None
+        # Fall back to downloading a pre-built binary from the configured URL.
+        return self._download_binary(arch, cache_dir, versioned_name)
+
+    def _download_binary(
+        self, arch: str, cache_dir: str, versioned_name: str
+    ) -> str | None:
+        """Download the agent binary from the configured release URL.
+
+        Returns the path to the cached binary on success, None on failure or
+        when auto-download is disabled.
+        """
+        url_template = self.get_option("download_url")
+        if not url_template:
+            return None
+
+        url = url_template.format(version=AGENT_VERSION, arch=arch)
+        dest_path = os.path.join(cache_dir, versioned_name)
+
+        display.vvv(
+            f"FASTAGENT: downloading agent binary from {url} -> {dest_path}",
+        )
+
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+        except OSError as exc:
+            display.warning(
+                f"fastagent: could not create cache dir {cache_dir}: {exc}"
+            )
+            return None
+
+        # Write to a temp file in the same directory so the final rename is
+        # atomic even if another process is racing us.
+        tmp_fd, tmp_path = None, None
+        try:
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                prefix=f".{versioned_name}.", dir=cache_dir
+            )
+            os.close(tmp_fd)
+            tmp_fd = None
+
+            req = Request(url, headers={"User-Agent": f"fastagent/{AGENT_VERSION}"})
+            with urlopen(req, timeout=60) as resp:
+                if resp.status != 200:
+                    raise AnsibleConnectionFailure(
+                        f"fastagent: download of {url} returned HTTP {resp.status}"
+                    )
+                with open(tmp_path, "wb") as out:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+            os.chmod(tmp_path, 0o755)
+            os.replace(tmp_path, dest_path)
+            tmp_path = None
+            display.vvv(f"FASTAGENT: cached agent binary at {dest_path}")
+            return dest_path
+        except (HTTPError, URLError, OSError) as exc:
+            raise AnsibleConnectionFailure(
+                f"fastagent: failed to download agent binary from {url}: {exc}. "
+                f"Build from source with `make build` or set "
+                f"fastagent_local_agent_dir to a directory containing "
+                f"{versioned_name}."
+            )
+        finally:
+            if tmp_fd is not None:
+                try:
+                    os.close(tmp_fd)
+                except OSError:
+                    pass
+            if tmp_path is not None and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass

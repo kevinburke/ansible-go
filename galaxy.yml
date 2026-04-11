@@ -1,0 +1,35 @@
+---
+namespace: kevinburke
+name: fastagent
+version: 0.3.0
+readme: README.md
+authors:
+  - Kevin Burke <kevin@burke.dev>
+description: >
+  Drop-in Ansible accelerator. Replaces the default SSH execution path with
+  a persistent Go agent and a Unix socket, cutting playbook run times by
+  50% or more.
+license:
+  - MIT
+tags:
+  - ssh
+  - performance
+  - infrastructure
+  - linux
+repository: https://github.com/kevinburke/ansible-go
+issues: https://github.com/kevinburke/ansible-go/issues
+build_ignore:
+  - '*.go'
+  - 'go.mod'
+  - 'go.sum'
+  - 'cmd'
+  - 'tmp'
+  - 'worktrees'
+  - 'docs'
+  - '.buildkite'
+  - '.claude'
+  - '.git*'
+  - 'Makefile'
+  - 'tests'
+  - 'plugins/module_utils/fastagent_client_test.py'
+  - 'plugins/module_utils/tmp'

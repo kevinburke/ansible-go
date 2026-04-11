@@ -29,49 +29,33 @@ Ansible module execution path, but benefit from the persistent connection.
 
 ## Quick start
 
-### 1. Build and deploy the agent binary
-
-Requires Go 1.21+.
+### 1. Install the collection
 
 ```bash
-make deploy
+ansible-galaxy collection install kevinburke.fastagent
 ```
 
-This cross-compiles for linux/amd64 and linux/arm64 and copies the binaries to
-`~/.ansible/fastagent/`.
+That's it for the controller side. The connection plugin auto-downloads the
+prebuilt Linux agent binary from GitHub Releases on first use and caches it
+under `~/.ansible/fastagent/`. No Go toolchain required.
 
-### 2. Configure your playbook repo
+### 2. Enable it per host
 
-Add to your `ansible.cfg`:
-
-```ini
-[defaults]
-connection_plugins = /path/to/ansible-go/connection_plugins
-action_plugins = /path/to/ansible-go/action_plugins
-library = /path/to/ansible-go/library
-module_utils = /path/to/ansible-go/module_utils
-```
-
-Or use environment variables:
-
-```bash
-export ANSIBLE_GO_DIR="/path/to/ansible-go"
-export ANSIBLE_CONNECTION_PLUGINS="$ANSIBLE_GO_DIR/connection_plugins"
-export ANSIBLE_ACTION_PLUGINS="$ANSIBLE_GO_DIR/action_plugins"
-export ANSIBLE_LIBRARY="$ANSIBLE_GO_DIR/library"
-export ANSIBLE_MODULE_UTILS="$ANSIBLE_GO_DIR/module_utils"
-```
-
-### 3. Enable per host
-
-Set `ansible_connection=fastagent` in your inventory:
+Set the connection in your inventory (the FQCN namespace is
+`kevinburke.fastagent.fastagent`):
 
 ```ini
 [webservers]
-myhost ansible_connection=fastagent ansible_user=deploy
+myhost ansible_connection=kevinburke.fastagent.fastagent ansible_user=deploy
 ```
 
-### 4. Use unqualified module names
+Or group-wide in `group_vars/all.yml`:
+
+```yaml
+ansible_connection: kevinburke.fastagent.fastagent
+```
+
+### 3. Use unqualified module names
 
 Fastagent overrides modules via Ansible's `ansible.legacy` resolution path.
 Tasks using fully-qualified names like `ansible.builtin.command:` bypass this
@@ -90,6 +74,23 @@ To convert an existing playbook:
 ```bash
 find roles/ -name '*.yml' -exec sed -i 's/ansible\.builtin\.\([a-z0-9_]*\):/\1:/g' {} +
 ```
+
+### Building from source (optional)
+
+If you prefer to build the agent binary yourself — e.g. for air-gapped
+environments, or to pin to an unreleased commit — clone this repo and run:
+
+```bash
+make deploy
+```
+
+This cross-compiles for linux/amd64 and linux/arm64 and copies the binaries to
+`~/.ansible/fastagent/`. The connection plugin checks this directory before
+attempting any download, so a locally built binary always takes precedence.
+Requires Go 1.21+.
+
+To disable the auto-download entirely, set `fastagent_download_url` to an
+empty string in inventory, or `FASTAGENT_DOWNLOAD_URL=` in the environment.
 
 ## What gets accelerated
 
@@ -203,16 +204,27 @@ ssh myhost "sudo chown -R youruser:youruser ~/.ansible/tmp"
 
 ## Updating
 
-When you update the Go agent code:
+For third-party users, upgrade the collection:
 
 ```bash
-# Bump the version in fastagent.go, then:
-make clean && make deploy
+ansible-galaxy collection install --upgrade kevinburke.fastagent
 ```
 
 The connection plugin detects version mismatches automatically: if the remote
 daemon is running an old version, it kills it and uploads the new binary on
 the next run.
+
+When working on the agent itself, bump the version in `fastagent.go` and run:
+
+```bash
+make clean && make deploy
+```
+
+To build everything for a release (binaries plus collection tarball):
+
+```bash
+make release
+```
 
 ## Security
 
