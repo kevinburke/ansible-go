@@ -108,36 +108,15 @@ if [ "$local_head" != "$origin_head" ]; then
 fi
 
 # ---- version: canonical source is fastagent.go ----------------------------
+#
+# Delegate to scripts/check-versions.sh so the same consistency check runs
+# in CI on every push and at release time. If any of fastagent.go,
+# galaxy.yml, or plugins/connection/fastagent.py disagree on the version,
+# this exits with a clear error.
 
-log "reading version from fastagent.go"
-
-VERSION=$(awk -F'"' '/^const Version/ { print $2 }' fastagent.go)
-if [ -z "$VERSION" ]; then
-    err "could not extract Version constant from fastagent.go"
-    exit 1
-fi
+log "verifying all version references agree"
+VERSION=$("$SCRIPT_DIR/check-versions.sh" --print)
 log "canonical version: $VERSION"
-
-# Verify every other version reference matches. The goal: make it impossible
-# to publish a release where fastagent.go, galaxy.yml, and the connection
-# plugin disagree about which version they are.
-
-galaxy_version=$(awk '/^version:/ { print $2 }' galaxy.yml)
-if [ "$galaxy_version" != "$VERSION" ]; then
-    err "galaxy.yml version '$galaxy_version' != fastagent.go Version '$VERSION'"
-    err "bump galaxy.yml to $VERSION and retry."
-    exit 1
-fi
-
-plugin_version=$(awk -F'"' '/^AGENT_VERSION/ { print $2 }' \
-    plugins/connection/fastagent.py)
-if [ "$plugin_version" != "$VERSION" ]; then
-    err "plugins/connection/fastagent.py AGENT_VERSION '$plugin_version' != '$VERSION'"
-    err "bump AGENT_VERSION to $VERSION and retry."
-    exit 1
-fi
-
-log "all version references agree at $VERSION"
 
 # ---- preflight: tag must not already exist --------------------------------
 

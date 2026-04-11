@@ -17,19 +17,23 @@ readonly GO_VERSION="${GO_VERSION:?GO_VERSION is required}"
 readonly OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 readonly ARCH="$(uname -m)"
 
+# Use a lowercase local var for the host arch — never `GOARCH`. Marking
+# GOARCH readonly here would break callers that use the standard
+# `GOARCH=amd64 go build ...` syntax to cross-compile, since bash refuses
+# even temporary prefix-assignments to readonly variables.
 case "${ARCH}" in
   x86_64 | amd64)
-    readonly GOARCH="amd64"
+    host_goarch="amd64"
     ;;
   aarch64 | arm64)
-    readonly GOARCH="arm64"
+    host_goarch="arm64"
     ;;
   *)
     fail "unsupported architecture: ${ARCH}"
     ;;
 esac
 
-readonly PLATFORM="${OS}-${GOARCH}"
+readonly PLATFORM="${OS}-${host_goarch}"
 readonly GO_ROOT="${GO_SETUP_REPO_ROOT}/.go/${GO_VERSION}/${PLATFORM}"
 readonly GO_BIN="${GO_ROOT}/bin/go"
 readonly ARCHIVE_DIR="${GO_SETUP_REPO_ROOT}/.go/cache"

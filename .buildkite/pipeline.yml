@@ -3,6 +3,7 @@ env:
   GO_VERSION: "1.26.2"
   STATICCHECK_VERSION: "v0.7.0"
   DIFFER_VERSION: "v0.0.0-20260403230520-c0574ebcacb2"
+  ANSIBLE_VERSION: "2.18.5"
 
 steps:
   - label: ":go: Format"
@@ -14,6 +15,11 @@ steps:
     key: "lint"
     command: "bash .buildkite/ci.sh lint"
     timeout_in_minutes: 10
+
+  - label: ":lock: Check Versions"
+    key: "check-versions"
+    command: "bash .buildkite/ci.sh check-versions"
+    timeout_in_minutes: 5
 
   - label: ":go: Test"
     key: "test"
