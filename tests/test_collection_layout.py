@@ -114,6 +114,10 @@ class TestTarballContents(unittest.TestCase):
         self.assertIn("MANIFEST.json", self.members)
         self.assertIn("FILES.json", self.members)
 
+    def test_runtime_yml_present(self):
+        """meta/runtime.yml is required by Ansible Galaxy import."""
+        self.assertIn("meta/runtime.yml", self.members)
+
     def test_connection_plugin_present(self):
         self.assertIn("plugins/connection/fastagent.py", self.members)
 
@@ -132,7 +136,7 @@ class TestTarballContents(unittest.TestCase):
 
     def test_no_go_sources_leaked(self):
         """Go source and build artifacts must not ship in the collection."""
-        forbidden_prefixes = ("cmd/", "tmp/", "worktrees/", "docs/", ".buildkite/")
+        forbidden_prefixes = ("cmd/", "tmp/", "worktrees/", "docs/", ".buildkite/", "scripts/")
         forbidden_exts = (".go", "go.mod", "go.sum")
         leaked = [
             m for m in self.members
