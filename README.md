@@ -38,15 +38,11 @@ remote host on first run. It auto-exits after 1 hour of inactivity.
 
 ## Install
 
-### Option A — From a Git tag (works today)
+### Option A — From Ansible Galaxy (recommended)
 
 ```bash
-ansible-galaxy collection install \
-    git+https://github.com/kevinburke/ansible-go.git,v0.3.1
+ansible-galaxy collection install kevinburke.fastagent
 ```
-
-This pulls the collection straight from this repo at the `v0.3.1` tag. No
-Galaxy account needed.
 
 ### Option B — Via `requirements.yml` (recommended for teams)
 
@@ -55,9 +51,6 @@ Add to your playbook repo's `requirements.yml`:
 ```yaml
 collections:
   - name: kevinburke.fastagent
-    source: https://github.com/kevinburke/ansible-go.git
-    type: git
-    version: v0.3.1
 ```
 
 Install:
@@ -66,13 +59,15 @@ Install:
 ansible-galaxy collection install -r requirements.yml
 ```
 
-### Option C — From Ansible Galaxy
-
-Coming soon. Once published, you'll be able to do:
+### Option C — From a Git tag
 
 ```bash
-ansible-galaxy collection install kevinburke.fastagent
+ansible-galaxy collection install \
+    git+https://github.com/kevinburke/ansible-go.git,v0.3.3
 ```
+
+This pulls the collection straight from this repo at a specific tag.
+Useful if you want to pin to an exact commit.
 
 After install, the connection plugin auto-downloads the prebuilt Linux agent
 binary from GitHub Releases on first use and caches it under
@@ -295,12 +290,13 @@ ssh myhost "sudo cat /tmp/fastagent-root.sock.log"
 The connection plugin tries to download the prebuilt binary from GitHub
 Releases on first use. If the controller can't reach `github.com`:
 
-1. Check the URL works manually: `curl -I https://github.com/kevinburke/ansible-go/releases/download/v0.3.1/fastagent-0.3.1-linux-amd64`
+1. Check the URL works manually — copy the URL from the error message and
+   `curl -I <url>`.
 2. If you're behind a proxy, set the standard `https_proxy` / `HTTPS_PROXY`
    env var on the controller.
-3. As a fallback, build the binary locally and put it at
-   `~/.ansible/fastagent/fastagent-0.3.1-linux-amd64` (and same for `arm64`).
-   The connection plugin checks that path **before** trying to download.
+3. As a fallback, build the binary locally (`make deploy`) and it will be
+   placed at `~/.ansible/fastagent/`. The connection plugin checks that
+   directory **before** attempting any download.
 
 **"local socket not available, setting up" on every task**
 
