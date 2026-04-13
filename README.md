@@ -112,6 +112,14 @@ Or via `group_vars/`:
 ansible_connection: kevinburke.fastagent.fastagent
 ```
 
+**Avoid setting `ansible_connection` in a `group_vars/` file that test
+playbooks load via `vars_files`.** Ansible variable precedence means a
+`vars_files` entry overrides the play-level `connection: local` keyword,
+causing fastagent to try SSHing into localhost. If your tests load
+`group_vars/all.yml` this way, set `ansible_connection` in the inventory
+file's `[all:vars]` section instead — inventory variables don't leak into
+`vars_files` includes.
+
 For a first rollout, put **one or two non-critical hosts** in a `fastagent_canary`
 group and leave the rest of your fleet alone — they'll keep using the default
 SSH connection. Expand the group as you build confidence. See
