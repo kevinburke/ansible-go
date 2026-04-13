@@ -18,7 +18,8 @@ Ansible extension points (connection plugin and action plugin overrides).
 
 - Ansible 2.12 or newer
 - Python 3.8 or newer
-- `ssh` and `scp` (already required by stock Ansible)
+- `ssh`, `scp`, and `curl` (`curl` is used to download the agent binary on
+  first use; not needed if you build from source)
 - Network access to `github.com` for the first-time agent download (or a
   locally built binary — see [Building from source](#building-from-source))
 
