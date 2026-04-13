@@ -4,9 +4,16 @@ A drop-in Ansible accelerator. Replace your remote execution path with a
 persistent Go agent and cut playbook run times by 50%+.
 
 ```
-SSH (default):   50s
-fastagent:       22s   (56% faster)
+SSH (default):   55s
+fastagent:       22s   (60% faster)
 ```
+
+The speedup comes from **action plugin overrides** that replace Python module
+transfer with direct Go RPCs for common modules (`command`, `shell`, `copy`,
+`file`, `stat`, `apt`, `systemd`). This requires using **unqualified module
+names** in your playbooks (e.g. `command:` not `ansible.builtin.command:`).
+Without the overrides, fastagent is roughly the same speed as plain SSH — see
+[Use unqualified module names](#use-unqualified-module-names).
 
 Fastagent keeps standard Ansible YAML, inventory, variables, and templating
 unchanged. It substitutes a faster execution engine underneath using supported
@@ -151,18 +158,25 @@ ANSIBLE_STDOUT_CALLBACK=profile_tasks \
 
 Compare against the same playbook run without the connection override.
 
-## Use unqualified module names
+## Use unqualified module names (required for speedup)
+
+**This step is required.** Without it, fastagent provides no speedup over
+plain SSH.
 
 Fastagent overrides modules via Ansible's `ansible.legacy` resolution path.
-Tasks using fully-qualified names like `ansible.builtin.command:` bypass the
-override and go through the standard (slower) execution path. Use unqualified
-names:
+When you write `command:`, Ansible checks for an override before falling back
+to the builtin — and fastagent's override handles it as a direct Go RPC,
+skipping Python module transfer entirely. When you write
+`ansible.builtin.command:`, Ansible resolves directly to the builtin, the
+override never fires, and the task goes through the standard Python module
+path. The persistent connection doesn't help here because Ansible's native
+SSH ControlMaster already provides connection reuse.
 
 ```yaml
-# Fast (uses fastagent override):
+# Fast — override fires, Go RPC, no Python transfer:
 - command: uptime
 
-# Slow (bypasses override, uses builtin):
+# No speedup — override bypassed, full Python module transfer:
 - ansible.builtin.command: uptime
 ```
 
@@ -174,8 +188,8 @@ find roles/ -name '*.yml' -exec \
 ```
 
 Modules that don't have an override (e.g. `git`, `user`, `cron`) still work
-normally — they go through the standard Ansible module path but still benefit
-from the persistent connection.
+normally — they go through the standard Ansible module path at roughly the
+same speed as plain SSH.
 
 ## How it works
 
@@ -189,8 +203,8 @@ from the persistent connection.
    entirely, sending RPCs directly to the daemon.
 
 Tasks using modules without overrides still work normally through the
-standard Ansible module execution path, but benefit from the persistent
-connection.
+standard Ansible module execution path, at roughly the same speed as
+plain SSH.
 
 ## What gets accelerated
 
