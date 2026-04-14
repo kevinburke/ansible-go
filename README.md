@@ -18,7 +18,8 @@ Ansible extension points (connection plugin and action plugin overrides).
 
 - Ansible 2.12 or newer
 - Python 3.8 or newer
-- `ssh` and `scp` (already required by stock Ansible)
+- `ssh`, `scp`, and `curl` (`curl` is used to download the agent binary on
+  first use; not needed if you build from source)
 - Network access to `github.com` for the first-time agent download (or a
   locally built binary — see [Building from source](#building-from-source))
 
@@ -110,6 +111,14 @@ Or via `group_vars/`:
 # group_vars/fastagent_canary.yml
 ansible_connection: kevinburke.fastagent.fastagent
 ```
+
+**Avoid setting `ansible_connection` in a `group_vars/` file that test
+playbooks load via `vars_files`.** Ansible variable precedence means a
+`vars_files` entry overrides the play-level `connection: local` keyword,
+causing fastagent to try SSHing into localhost. If your tests load
+`group_vars/all.yml` this way, set `ansible_connection` in the inventory
+file's `[all:vars]` section instead — inventory variables don't leak into
+`vars_files` includes.
 
 For a first rollout, put **one or two non-critical hosts** in a `fastagent_canary`
 group and leave the rest of your fleet alone — they'll keep using the default

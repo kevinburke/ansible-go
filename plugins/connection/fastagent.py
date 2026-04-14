@@ -117,7 +117,6 @@ options:
 """
 
 import base64
-import hashlib
 import os
 import shlex
 import socket as socket_mod
@@ -125,13 +124,10 @@ import subprocess
 import tempfile
 import time as time_mod
 import typing as t
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
-
 from ansible.errors import AnsibleConnectionFailure, AnsibleFileNotFound
 from ansible.plugins.connection import ConnectionBase
 from ansible.utils.display import Display
-from ansible.module_utils.common.text.converters import to_bytes, to_text
+from ansible.module_utils.common.text.converters import to_bytes
 
 from ansible_collections.kevinburke.fastagent.plugins.module_utils.fastagent_client import (
     FastAgentClient,
@@ -178,9 +174,15 @@ class Connection(ConnectionBase):
                     f"falling back to direct execution"
                 )
 
-        # Socket paths.
+        # Socket paths. The local socket name must differ between the become
+        # and non-become cases so a stale forwarding session from one mode
+        # cannot be reused by the other (they point at different remote
+        # sockets).
         remote_socket = f"/tmp/fastagent-{become_user}.sock" if use_become else "/tmp/fastagent.sock"
-        local_socket = f"/tmp/fastagent-local-{host}-{become_user}.sock"
+        if use_become:
+            local_socket = f"/tmp/fastagent-local-{host}-{become_user}.sock"
+        else:
+            local_socket = f"/tmp/fastagent-local-{host}.sock"
 
         # Fast path: try connecting to the local forwarding socket directly.
         # This is a local Unix socket connect (~1ms), no SSH involved.
@@ -358,14 +360,18 @@ class Connection(ConnectionBase):
     ) -> tuple[int, bytes, bytes]:
         super().exec_command(cmd, in_data=in_data, sudoable=sudoable)
 
-        # The daemon runs as root. For commands that should NOT run as root
-        # (sudoable=False, or become not configured), drop privileges to the
-        # connecting user. This prevents things like temp dir creation from
-        # being owned by root in the user's home directory.
+        # When become is enabled, the daemon runs as root. For commands that
+        # should NOT run as root (sudoable=False), drop privileges to the
+        # connecting user via runuser. This prevents things like temp dir
+        # creation from being owned by root in the user's home directory.
+        #
+        # When become is NOT enabled, the daemon already runs as the
+        # connecting user, so runuser is neither needed nor possible (it
+        # requires root).
         actual_cmd = cmd
         become = self._play_context.become
         remote_user = self.get_option("remote_user")
-        if remote_user and (not sudoable or not become):
+        if become and remote_user and not sudoable:
             actual_cmd = f"runuser -u {shlex.quote(remote_user)} -- sh -c {shlex.quote(cmd)}"
 
         stdin_data = None
@@ -635,6 +641,9 @@ class Connection(ConnectionBase):
 
         Returns the path to the cached binary on success, None on failure or
         when auto-download is disabled.
+
+        Uses curl in a subprocess instead of urllib to avoid SSL crashes in
+        Ansible's forked worker processes (macOS fork + SSL is unsafe).
         """
         url_template = self.get_option("download_url")
         if not url_template:
@@ -643,7 +652,7 @@ class Connection(ConnectionBase):
         url = url_template.format(version=AGENT_VERSION, arch=arch)
         dest_path = os.path.join(cache_dir, versioned_name)
 
-        display.vvv(
+        display.v(
             f"FASTAGENT: downloading agent binary from {url} -> {dest_path}",
         )
 
@@ -665,24 +674,43 @@ class Connection(ConnectionBase):
             os.close(tmp_fd)
             tmp_fd = None
 
-            req = Request(url, headers={"User-Agent": f"fastagent/{AGENT_VERSION}"})
-            with urlopen(req, timeout=60) as resp:
-                if resp.status != 200:
-                    raise AnsibleConnectionFailure(
-                        f"fastagent: download of {url} returned HTTP {resp.status}"
-                    )
-                with open(tmp_path, "wb") as out:
-                    while True:
-                        chunk = resp.read(65536)
-                        if not chunk:
-                            break
-                        out.write(chunk)
+            result = subprocess.run(
+                [
+                    "curl",
+                    "--silent", "--show-error",
+                    "--fail",
+                    "--location",
+                    "--output", tmp_path,
+                    "--user-agent", f"fastagent/{AGENT_VERSION}",
+                    "--max-time", "120",
+                    url,
+                ],
+                capture_output=True,
+                timeout=130,
+            )
+            if result.returncode != 0:
+                stderr = result.stderr.decode("utf-8", errors="replace").strip()
+                raise AnsibleConnectionFailure(
+                    f"fastagent: download of {url} failed (curl exit {result.returncode}): "
+                    f"{stderr}"
+                )
+
+            # Sanity check: the binary should be at least 1 MB.
+            file_size = os.path.getsize(tmp_path)
+            if file_size < 1_000_000:
+                raise AnsibleConnectionFailure(
+                    f"fastagent: downloaded file is suspiciously small "
+                    f"({file_size} bytes) from {url}"
+                )
+
             os.chmod(tmp_path, 0o755)
             os.replace(tmp_path, dest_path)
             tmp_path = None
-            display.vvv(f"FASTAGENT: cached agent binary at {dest_path}")
+            display.v(f"FASTAGENT: cached agent binary at {dest_path}")
             return dest_path
-        except (HTTPError, URLError, OSError) as exc:
+        except AnsibleConnectionFailure:
+            raise
+        except Exception as exc:
             raise AnsibleConnectionFailure(
                 f"fastagent: failed to download agent binary from {url}: {exc}. "
                 f"Build from source with `make build` or set "
