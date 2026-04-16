@@ -212,8 +212,12 @@ class Connection(ConnectionBase):
 
         try:
             sock = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+            # Short timeout on connect so a stale socket file can't hang us.
+            # Clear it after connecting so subsequent RPC reads block as long
+            # as the remote work takes (e.g. ufw reloading iptables).
             sock.settimeout(2)
             sock.connect(local_socket)
+            sock.settimeout(None)
             client = FastAgentClient(sock.makefile("wb"), sock.makefile("rb"))
             display.vvv(f"FASTAGENT: connected via local socket", host=host)
             self._socket = sock

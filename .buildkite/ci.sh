@@ -71,7 +71,11 @@ run_python_test() {
   (cd "${REPO_ROOT}/plugins/module_utils" && \
     python3 -m unittest fastagent_client_test -v)
 
-  # 2. Collection layout tests: build the tarball, install it to a temp
+  # 2. Connection plugin regression tests (socket timeout, etc.).
+  (cd "${REPO_ROOT}/plugins/connection" && \
+    python3 -m unittest fastagent_test -v)
+
+  # 3. Collection layout tests: build the tarball, install it to a temp
   #    ANSIBLE_COLLECTIONS_PATH, and verify ansible-doc + module_utils
   #    imports resolve through the installed collection.
   (cd "${REPO_ROOT}" && \
