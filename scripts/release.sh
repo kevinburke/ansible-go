@@ -165,6 +165,13 @@ log "tagging $TAG"
 run git tag -a "$TAG" -m "fastagent $TAG"
 run git push origin "$TAG"
 
+# The GitHub CLI needs the tag on GitHub, not just on the local origin.
+# Push both the branch and tag to the 'github' remote if it exists.
+if git remote get-url github >/dev/null 2>&1; then
+    log "pushing to github remote"
+    run git push github main "$TAG"
+fi
+
 # ---- GitHub release --------------------------------------------------------
 
 log "creating GitHub release $TAG"
