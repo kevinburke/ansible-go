@@ -29,4 +29,5 @@ install_tool() {
 }
 
 install_tool differ github.com/kevinburke/differ "${DIFFER_VERSION:?DIFFER_VERSION is required}"
+install_tool goimports golang.org/x/tools/cmd/goimports "${GOIMPORTS_VERSION:?GOIMPORTS_VERSION is required}"
 install_tool staticcheck honnef.co/go/tools/cmd/staticcheck "${STATICCHECK_VERSION:?STATICCHECK_VERSION is required}"

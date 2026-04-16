@@ -10,10 +10,12 @@ readonly REPO_ROOT="$(
 
 cd "${REPO_ROOT}"
 
-export GO_VERSION="${GO_VERSION:-1.26.2}"
-export STATICCHECK_VERSION="${STATICCHECK_VERSION:-v0.7.0}"
-export DIFFER_VERSION="${DIFFER_VERSION:-v0.0.0-20260403230520-c0574ebcacb2}"
-export ANSIBLE_VERSION="${ANSIBLE_VERSION:-2.18.5}"
+: "${GO_VERSION:?GO_VERSION is required (set in pipeline.yml or environment)}"
+: "${STATICCHECK_VERSION:?STATICCHECK_VERSION is required}"
+: "${GOIMPORTS_VERSION:?GOIMPORTS_VERSION is required}"
+: "${DIFFER_VERSION:?DIFFER_VERSION is required}"
+: "${ANSIBLE_VERSION:?ANSIBLE_VERSION is required}"
+export GO_VERSION STATICCHECK_VERSION GOIMPORTS_VERSION DIFFER_VERSION ANSIBLE_VERSION
 export GOTOOLCHAIN=local
 
 goflags="${GOFLAGS:-}"
@@ -53,6 +55,7 @@ run_test() {
 
 run_build() {
   local build_dir
+  mkdir -p "${REPO_ROOT}/tmp"
   build_dir="$(mktemp -d "${REPO_ROOT}/tmp/buildkite-ci.XXXXXX")"
   trap "rm -rf '${build_dir}'" EXIT
 

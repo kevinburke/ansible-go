@@ -63,6 +63,10 @@ class AgentSession:
         except Exception:
             pass
         try:
+            self.proc.stdout.close()
+        except Exception:
+            pass
+        try:
             self.proc.stderr.close()
         except Exception:
             pass
