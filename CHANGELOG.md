@@ -2,6 +2,36 @@
 
 All notable changes to fastagent are documented in this file.
 
+## 0.5.4 — April 20, 2026
+
+### Bug fixes
+
+- **Connection plugin: run the remote daemon as root in become mode.**
+  0.5.2/0.5.3 launched the daemon as the target `become_user` (via
+  `sudo -u <user>`). That was fine for sudoers but failed for any
+  `become_user` that wasn't itself in `/etc/sudoers` (e.g. dedicated
+  app users like `returns`): ansible's become layer still wraps
+  every module with `sudo -u <user> /bin/sh -c …` and hands that
+  wrapped command to the connection plugin, so the daemon — already
+  running as `<user>` — executed `sudo` and hit
+  `<user> is not in the sudoers file.` The daemon now runs as root
+  (one instance per host), matching the invariant the `runuser`-
+  dropping logic in `exec_command` was originally written against,
+  and ansible's `sudo -u X` wrapper works because root can re-exec
+  as any uid regardless of sudoers policy.
+
+### Other changes
+
+- Removed the 0.5.3 `system_agent_path` option. With the daemon
+  running as root it can exec the binary from the connecting user's
+  0700 home, so the `/usr/local/libexec/` staging dance is no longer
+  needed. The one-path `agent_path` option (unchanged default
+  `~/.ansible/fastagent/…`) covers every case.
+- Remote socket path is now `/tmp/fastagent-root.sock` for all
+  become tasks regardless of target `become_user`, replacing the
+  per-user `/tmp/fastagent-<user>.sock` naming. Non-become tasks
+  keep `/tmp/fastagent.sock`.
+
 ## 0.5.3 — April 20, 2026
 
 ### Bug fixes

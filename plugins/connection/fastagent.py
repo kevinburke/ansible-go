@@ -84,24 +84,13 @@ options:
             Path on the remote host where the agent binary is stored.
             The string {version} is replaced with the agent version,
             {os} with the target OS, and {arch} with the target architecture.
-            Used for direct execution and for become_user=root, where the
-            binary lives in the connecting user's home.
+            The daemon runs as the SSH user (direct) or as root (when
+            become is enabled), so the binary can always live in the
+            connecting user's home — the become_user never needs to exec
+            it itself.
         default: "~/.ansible/fastagent/fastagent-{version}-{os}-{arch}"
         vars:
             - name: fastagent_agent_path
-    system_agent_path:
-        description: >
-            Path on the remote host where the agent binary is staged when
-            becoming a non-root user that differs from the connecting user.
-            The default directory (/usr/local/libexec/fastagent) is
-            root-owned but world-traversable, so any become_user can exec
-            the binary — the connecting user's home directory is typically
-            mode 0700 and blocks that. The plugin stages via scp to /tmp
-            and then `sudo install` into this path, so the become user
-            needs sudo (which it already does for `become: yes`).
-        default: "/usr/local/libexec/fastagent/fastagent-{version}-{os}-{arch}"
-        vars:
-            - name: fastagent_system_agent_path
     local_agent_dir:
         description: >
             Local directory containing pre-built agent binaries.
@@ -175,7 +164,7 @@ from ansible_collections.kevinburke.fastagent.plugins.module_utils.fastagent_cli
 display = Display()
 
 # Agent version must match the Go constant.
-AGENT_VERSION = "0.5.3"
+AGENT_VERSION = "0.5.4"
 
 class Connection(ConnectionBase):
     """fastagent connection plugin."""
@@ -214,14 +203,18 @@ class Connection(ConnectionBase):
                     f"falling back to direct execution"
                 )
 
-        # Socket paths. The local socket name must differ between the become
-        # and non-become cases so a stale forwarding session from one mode
+        # Socket paths. When become is enabled the daemon always runs as
+        # root (it re-executes commands via ansible's own `sudo -u X`
+        # wrapper), so one socket serves every become_user on the host.
+        # The local socket name must still differ between the become and
+        # non-become cases so a stale forwarding session from one mode
         # cannot be reused by the other (they point at different remote
-        # sockets).
-        remote_socket = f"/tmp/fastagent-{become_user}.sock" if use_become else "/tmp/fastagent.sock"
+        # sockets owned by different uids).
         if use_become:
-            local_socket = f"/tmp/fastagent-local-{host}-{become_user}.sock"
+            remote_socket = "/tmp/fastagent-root.sock"
+            local_socket = f"/tmp/fastagent-local-{host}-root.sock"
         else:
+            remote_socket = "/tmp/fastagent.sock"
             local_socket = f"/tmp/fastagent-local-{host}.sock"
 
         # Fast path: try connecting to the local forwarding socket directly.
@@ -303,22 +296,11 @@ class Connection(ConnectionBase):
 
         display.vvv(f"FASTAGENT: bootstrapping remote daemon", host=host)
 
-        # Detect arch and deploy binary.
+        # Detect arch and deploy binary. The daemon runs as root when
+        # become is enabled, so it can always exec the binary out of the
+        # connecting user's home — no need to stage to a system path.
         remote_arch = self._detect_remote_arch(host, user, port)
-        # When becoming a non-root user that differs from the connecting
-        # user, stage the binary under a root-owned, world-traversable
-        # path. The default ~/.ansible/fastagent/ lives under a 0700
-        # home directory, which blocks execve for the become_user even
-        # though the binary itself is world-executable.
-        needs_system_path = (
-            use_become
-            and become_user != (user or "")
-            and become_user != "root"
-        )
-        if needs_system_path:
-            agent_path_template = self.get_option("system_agent_path")
-        else:
-            agent_path_template = self.get_option("agent_path")
+        agent_path_template = self.get_option("agent_path")
         remote_agent_path = agent_path_template.format(
             version=AGENT_VERSION, os="linux", arch=remote_arch,
         )
@@ -329,7 +311,6 @@ class Connection(ConnectionBase):
 
         self._ensure_agent_deployed(
             host, user, port, remote_agent_path, remote_arch,
-            install_via_sudo=needs_system_path,
         )
 
         agent_bin = shlex.quote(remote_agent_path)
@@ -357,7 +338,12 @@ class Connection(ConnectionBase):
         allow_flag = f" --allow-user {shlex.quote(user)}" if user else ""
         daemon_cmd = f"{agent_bin} --daemon --socket {shlex.quote(remote_socket)}{allow_flag}{debug_flag}"
         if use_become:
-            daemon_cmd = f"sudo -u {shlex.quote(become_user)} {daemon_cmd}"
+            # Daemon runs as root so a single instance can sudo to any
+            # become_user the play requests (including non-sudoers, where
+            # launching the daemon as that user would produce recursive
+            # sudo-not-in-sudoers failures when ansible's own `sudo -u`
+            # wrapper arrives).
+            daemon_cmd = f"sudo {daemon_cmd}"
 
         log_path = remote_socket + ".log"
         start_cmd = (
@@ -443,10 +429,14 @@ class Connection(ConnectionBase):
     ) -> tuple[int, bytes, bytes]:
         super().exec_command(cmd, in_data=in_data, sudoable=sudoable)
 
-        # When become is enabled, the daemon runs as root. For commands that
-        # should NOT run as root (sudoable=False), drop privileges to the
-        # connecting user via runuser. This prevents things like temp dir
-        # creation from being owned by root in the user's home directory.
+        # When become is enabled, the daemon runs as root, and ansible's
+        # own become layer wraps sudoable commands with `sudo -u X …` —
+        # which root can execute for any target user (including non-
+        # sudoers like `returns`). For commands that should NOT run as
+        # root (sudoable=False, typically connection-layer housekeeping
+        # like temp dir creation), drop to the connecting user via
+        # runuser so those files don't end up root-owned in the user's
+        # home.
         #
         # When become is NOT enabled, the daemon already runs as the
         # connecting user, so runuser is neither needed nor possible (it
@@ -627,16 +617,8 @@ class Connection(ConnectionBase):
         port: int | None,
         remote_path: str,
         arch: str,
-        install_via_sudo: bool = False,
     ) -> None:
-        """Upload agent binary if not already present with the correct version.
-
-        When install_via_sudo is True, the binary is scp'd to a staging
-        location under /tmp (writable by the SSH user) and then moved into
-        remote_path via `sudo install`. This lets us place the binary in
-        a root-owned, world-traversable directory (/usr/local/libexec)
-        so non-root become_users can exec it.
-        """
+        """Upload agent binary if not already present with the correct version."""
         # Check if the correct version is already deployed.
         rc, stdout, _ = self._run_ssh_command(
             host, user, port,
@@ -657,14 +639,8 @@ class Connection(ConnectionBase):
 
         display.vvv(f"FASTAGENT: uploading {local_binary} -> {remote_path}", host=host)
 
-        # Pick the scp destination: staged under /tmp when we'll sudo-install,
-        # otherwise the final remote_path directly.
-        if install_via_sudo:
-            scp_dest = f"/tmp/fastagent-{AGENT_VERSION}-linux-{arch}.staged"
-        else:
-            remote_dir = os.path.dirname(remote_path)
-            self._run_ssh_command(host, user, port, f"mkdir -p {shlex.quote(remote_dir)}")
-            scp_dest = remote_path
+        remote_dir = os.path.dirname(remote_path)
+        self._run_ssh_command(host, user, port, f"mkdir -p {shlex.quote(remote_dir)}")
 
         # Upload via scp.
         scp_executable = self.get_option("scp_executable") or "scp"
@@ -676,7 +652,7 @@ class Connection(ConnectionBase):
         if port:
             scp_cmd.extend(["-P", str(port)])
 
-        scp_target = f"{host}:{scp_dest}"
+        scp_target = f"{host}:{remote_path}"
         if user:
             scp_target = f"{user}@{scp_target}"
 
@@ -689,27 +665,10 @@ class Connection(ConnectionBase):
                 f"{result.stderr.decode('utf-8', errors='replace')}"
             )
 
-        if install_via_sudo:
-            # Move into place with `sudo install`: creates parent dirs
-            # (mode 0755 by default, so they're world-traversable), sets
-            # mode/ownership on the binary atomically, then clean up the
-            # staging file.
-            install_cmd = (
-                f"sudo install -D -m 0755 -o root -g root"
-                f" {shlex.quote(scp_dest)} {shlex.quote(remote_path)}"
-                f" && rm -f {shlex.quote(scp_dest)}"
-            )
-            rc, stdout, stderr = self._run_ssh_command(host, user, port, install_cmd)
-            if rc != 0:
-                raise AnsibleConnectionFailure(
-                    f"fastagent: sudo install of agent to {remote_path} failed: "
-                    f"rc={rc} stdout={stdout} stderr={stderr}"
-                )
-        else:
-            # Make executable.
-            self._run_ssh_command(
-                host, user, port, f"chmod +x {shlex.quote(remote_path)}"
-            )
+        # Make executable.
+        self._run_ssh_command(
+            host, user, port, f"chmod +x {shlex.quote(remote_path)}"
+        )
 
         display.vvv("FASTAGENT: agent deployed successfully", host=host)
 
