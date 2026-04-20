@@ -2,6 +2,28 @@
 
 All notable changes to fastagent are documented in this file.
 
+## 0.5.3 — April 20, 2026
+
+### Bug fixes
+
+- **Connection plugin: stage the agent under `/usr/local/libexec` for
+  non-root `become_user`.** The default agent path
+  (`~/.ansible/fastagent/`) lives inside the connecting user's home
+  directory, which is typically mode 0700. That works for
+  `become_user: root` (root bypasses DAC) but fails for any other
+  `become_user`: sudo drops privileges before execve and the target
+  uid cannot traverse `/home/<ssh_user>`, so the daemon never starts
+  and the error surfaces as
+  `fastagent: failed to start daemon: rc=1 / timeout waiting for
+  socket`. The plugin now detects this case and stages the binary via
+  `scp` to `/tmp/` followed by `sudo install -D -m 0755` into
+  `/usr/local/libexec/fastagent/`, which is root-owned and
+  world-traversable (0755), so any `become_user` can exec it. A new
+  option `system_agent_path` (ansible var
+  `fastagent_system_agent_path`) overrides this destination if a site
+  needs something different. `become_user: root` and direct (non-
+  become) execution keep the existing `~/.ansible/fastagent/` path.
+
 ## 0.5.2 — April 20, 2026
 
 ### Bug fixes
