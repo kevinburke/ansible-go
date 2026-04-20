@@ -84,9 +84,24 @@ options:
             Path on the remote host where the agent binary is stored.
             The string {version} is replaced with the agent version,
             {os} with the target OS, and {arch} with the target architecture.
+            Used for direct execution and for become_user=root, where the
+            binary lives in the connecting user's home.
         default: "~/.ansible/fastagent/fastagent-{version}-{os}-{arch}"
         vars:
             - name: fastagent_agent_path
+    system_agent_path:
+        description: >
+            Path on the remote host where the agent binary is staged when
+            becoming a non-root user that differs from the connecting user.
+            The default directory (/usr/local/libexec/fastagent) is
+            root-owned but world-traversable, so any become_user can exec
+            the binary — the connecting user's home directory is typically
+            mode 0700 and blocks that. The plugin stages via scp to /tmp
+            and then `sudo install` into this path, so the become user
+            needs sudo (which it already does for `become: yes`).
+        default: "/usr/local/libexec/fastagent/fastagent-{version}-{os}-{arch}"
+        vars:
+            - name: fastagent_system_agent_path
     local_agent_dir:
         description: >
             Local directory containing pre-built agent binaries.
@@ -290,7 +305,20 @@ class Connection(ConnectionBase):
 
         # Detect arch and deploy binary.
         remote_arch = self._detect_remote_arch(host, user, port)
-        agent_path_template = self.get_option("agent_path")
+        # When becoming a non-root user that differs from the connecting
+        # user, stage the binary under a root-owned, world-traversable
+        # path. The default ~/.ansible/fastagent/ lives under a 0700
+        # home directory, which blocks execve for the become_user even
+        # though the binary itself is world-executable.
+        needs_system_path = (
+            use_become
+            and become_user != (user or "")
+            and become_user != "root"
+        )
+        if needs_system_path:
+            agent_path_template = self.get_option("system_agent_path")
+        else:
+            agent_path_template = self.get_option("agent_path")
         remote_agent_path = agent_path_template.format(
             version=AGENT_VERSION, os="linux", arch=remote_arch,
         )
@@ -299,7 +327,10 @@ class Connection(ConnectionBase):
             if rc == 0 and home.strip():
                 remote_agent_path = home.strip() + remote_agent_path[1:]
 
-        self._ensure_agent_deployed(host, user, port, remote_agent_path, remote_arch)
+        self._ensure_agent_deployed(
+            host, user, port, remote_agent_path, remote_arch,
+            install_via_sudo=needs_system_path,
+        )
 
         agent_bin = shlex.quote(remote_agent_path)
 
@@ -596,8 +627,16 @@ class Connection(ConnectionBase):
         port: int | None,
         remote_path: str,
         arch: str,
+        install_via_sudo: bool = False,
     ) -> None:
-        """Upload agent binary if not already present with the correct version."""
+        """Upload agent binary if not already present with the correct version.
+
+        When install_via_sudo is True, the binary is scp'd to a staging
+        location under /tmp (writable by the SSH user) and then moved into
+        remote_path via `sudo install`. This lets us place the binary in
+        a root-owned, world-traversable directory (/usr/local/libexec)
+        so non-root become_users can exec it.
+        """
         # Check if the correct version is already deployed.
         rc, stdout, _ = self._run_ssh_command(
             host, user, port,
@@ -618,9 +657,14 @@ class Connection(ConnectionBase):
 
         display.vvv(f"FASTAGENT: uploading {local_binary} -> {remote_path}", host=host)
 
-        # Ensure remote directory exists.
-        remote_dir = os.path.dirname(remote_path)
-        self._run_ssh_command(host, user, port, f"mkdir -p {shlex.quote(remote_dir)}")
+        # Pick the scp destination: staged under /tmp when we'll sudo-install,
+        # otherwise the final remote_path directly.
+        if install_via_sudo:
+            scp_dest = f"/tmp/fastagent-{AGENT_VERSION}-linux-{arch}.staged"
+        else:
+            remote_dir = os.path.dirname(remote_path)
+            self._run_ssh_command(host, user, port, f"mkdir -p {shlex.quote(remote_dir)}")
+            scp_dest = remote_path
 
         # Upload via scp.
         scp_executable = self.get_option("scp_executable") or "scp"
@@ -632,7 +676,7 @@ class Connection(ConnectionBase):
         if port:
             scp_cmd.extend(["-P", str(port)])
 
-        scp_target = f"{host}:{remote_path}"
+        scp_target = f"{host}:{scp_dest}"
         if user:
             scp_target = f"{user}@{scp_target}"
 
@@ -645,8 +689,27 @@ class Connection(ConnectionBase):
                 f"{result.stderr.decode('utf-8', errors='replace')}"
             )
 
-        # Make executable.
-        self._run_ssh_command(host, user, port, f"chmod +x {shlex.quote(remote_path)}")
+        if install_via_sudo:
+            # Move into place with `sudo install`: creates parent dirs
+            # (mode 0755 by default, so they're world-traversable), sets
+            # mode/ownership on the binary atomically, then clean up the
+            # staging file.
+            install_cmd = (
+                f"sudo install -D -m 0755 -o root -g root"
+                f" {shlex.quote(scp_dest)} {shlex.quote(remote_path)}"
+                f" && rm -f {shlex.quote(scp_dest)}"
+            )
+            rc, stdout, stderr = self._run_ssh_command(host, user, port, install_cmd)
+            if rc != 0:
+                raise AnsibleConnectionFailure(
+                    f"fastagent: sudo install of agent to {remote_path} failed: "
+                    f"rc={rc} stdout={stdout} stderr={stderr}"
+                )
+        else:
+            # Make executable.
+            self._run_ssh_command(
+                host, user, port, f"chmod +x {shlex.quote(remote_path)}"
+            )
 
         display.vvv("FASTAGENT: agent deployed successfully", host=host)
 
