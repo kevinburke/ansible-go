@@ -2,6 +2,34 @@
 
 All notable changes to fastagent are documented in this file.
 
+## 0.5.2 — April 20, 2026
+
+### Bug fixes
+
+- **Connection plugin: kill the right daemon on bootstrap.** The kill
+  step before starting a new daemon used `pkill -f 'fastagent --daemon'`,
+  a literal pattern that never matched the real cmdline
+  (`fastagent-X.Y.Z-OS-ARCH --daemon`, no space after `fastagent`).
+  On a version upgrade the old daemon kept the socket bound, the new
+  daemon failed to start, and the error surfaced as
+  `fastagent: failed to start daemon: rc=1 / timeout waiting for
+  socket`. The kill path now uses `pkill -F {socket}.pid` (integer-
+  parsed from the daemon's own pid file, so a garbage or adversarial
+  pid file can't be used to signal arbitrary PIDs) with a corrected
+  backstop regex `fastagent[^ ]* --daemon`.
+
+- **Connection plugin: detect stale SSH -L forwarders.** The fast-path
+  `_try_local_socket` only checked that the local socket file existed
+  and that `connect()` did not block. A stale forwarder pointing at a
+  dead remote socket accepts the local connect, but the remote side's
+  connect to the dead daemon returns ECONNREFUSED, so the first RPC
+  read saw EOF and ansible reported
+  `fastagent: no response (agent process may have exited)`. The plugin
+  now sends a `Hello` inside the existing 2s probe timeout and only
+  declares the fast path usable after a valid response; otherwise it
+  closes the socket and falls through to bootstrap. Regression tests
+  added in `plugins/connection/fastagent_test.py`.
+
 ## 0.5.1 — April 20, 2026
 
 ### Bug fixes
