@@ -231,26 +231,41 @@ class Connection(ConnectionBase):
         return self
 
     def _try_local_socket(self, local_socket: str, host: str) -> bool:
-        """Try connecting to the local forwarding socket. Returns True on success."""
+        """Try connecting to the local forwarding socket and probe the daemon.
+
+        A stale SSH -L forwarder pointing at a dead remote socket will accept
+        local connects but the first RPC read will see EOF. So in addition to
+        connecting, we send a Hello and only declare success once we get a
+        valid response back. If any step fails we tear down the socket so the
+        caller falls through to the bootstrap path.
+        """
         if not os.path.exists(local_socket):
             return False
 
+        sock = None
         try:
             sock = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
-            # Short timeout on connect so a stale socket file can't hang us.
-            # Clear it after connecting so subsequent RPC reads block as long
-            # as the remote work takes (e.g. ufw reloading iptables).
+            # Short timeout for connect + handshake so a stale socket/tunnel
+            # can't hang us. Clear it after the probe so subsequent RPC reads
+            # block as long as the remote work takes (e.g. ufw reloading
+            # iptables).
             sock.settimeout(2)
             sock.connect(local_socket)
-            sock.settimeout(None)
             client = FastAgentClient(sock.makefile("wb"), sock.makefile("rb"))
+            client.hello(AGENT_VERSION)
+            sock.settimeout(None)
             display.vvv(f"FASTAGENT: connected via local socket", host=host)
             self._socket = sock
             self._agent_client = client
             self._connected = True
             return True
         except Exception as e:
-            display.vvv(f"FASTAGENT: local socket connect failed: {e}", host=host)
+            display.vvv(f"FASTAGENT: local socket probe failed: {e}", host=host)
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
             return False
 
     def _ensure_remote_daemon(
@@ -288,10 +303,18 @@ class Connection(ConnectionBase):
 
         agent_bin = shlex.quote(remote_agent_path)
 
-        # Kill any old daemon.
+        # Kill any old daemon. Prefer the PID file (the daemon writes it at
+        # {socket}.pid); `pkill -F` parses it as an integer, so a garbage or
+        # adversarial pid file can't trick us into signalling arbitrary PIDs
+        # the way `kill $(cat …)` would. Fall back to pkill with a pattern
+        # that matches the versioned binary name (fastagent-X.Y.Z-OS-ARCH) —
+        # a literal 'fastagent --daemon' pattern never matches since the
+        # cmdline has no space between 'fastagent' and the version suffix.
+        pid_file = remote_socket + ".pid"
         kill_cmd = (
-            f"pkill -f 'fastagent --daemon' 2>/dev/null;"
-            f" rm -f {shlex.quote(remote_socket)} {shlex.quote(remote_socket + '.pid')}"
+            f"pkill -F {shlex.quote(pid_file)} 2>/dev/null || true;"
+            f" pkill -f 'fastagent[^ ]* --daemon' 2>/dev/null || true;"
+            f" rm -f {shlex.quote(remote_socket)} {shlex.quote(pid_file)}"
         )
         if use_become:
             kill_cmd = f"sudo sh -c {shlex.quote(kill_cmd)}"

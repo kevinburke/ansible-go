@@ -95,9 +95,12 @@ class _MockSocket:
 class _PipeEchoServer:
     """Echo server that reads/writes JSON-RPC via pipes.
 
-    Reads one JSON-RPC line, waits `delay_s`, then writes back a single
-    valid response echoing the request id. Replaces _DelayedEchoServer
-    so tests run without the AF_UNIX socket() syscall.
+    Reads JSON-RPC lines in a loop, echoing each request id back. The first
+    response (the connect-time Hello probe) is always sent immediately so
+    the probe timeout doesn't fire; `delay_s` applies only to subsequent
+    responses, simulating slow real work like `ufw` reloading iptables.
+    Replaces _DelayedEchoServer so tests run without the AF_UNIX socket()
+    syscall.
     """
 
     def __init__(self, delay_s, server_r, server_w):
@@ -108,17 +111,58 @@ class _PipeEchoServer:
         self._thread.start()
 
     def _run(self):
+        count = 0
         try:
-            req_line = self._server_r.readline()
-            if not req_line:
-                return
-            req_id = json.loads(req_line).get("id", 0)
-            time.sleep(self._delay_s)
-            resp = json.dumps({"id": req_id, "result": {"ok": True}}) + "\n"
-            self._server_w.write(resp.encode("utf-8"))
-            self._server_w.flush()
+            while True:
+                req_line = self._server_r.readline()
+                if not req_line:
+                    return
+                req_id = json.loads(req_line).get("id", 0)
+                count += 1
+                if count > 1:
+                    time.sleep(self._delay_s)
+                resp = json.dumps({"id": req_id, "result": {"ok": True}}) + "\n"
+                self._server_w.write(resp.encode("utf-8"))
+                self._server_w.flush()
         except Exception:
             pass
+
+    def close(self):
+        for f in (self._server_r, self._server_w):
+            try:
+                f.close()
+            except Exception:
+                pass
+
+
+class _SilentServer:
+    """Server that reads but never responds. Simulates a stale SSH -L
+    tunnel whose remote-side connect to the dead daemon socket got
+    refused: local connect succeeds, but the first read sees EOF once
+    the server side closes its write end.
+    """
+
+    def __init__(self, server_r, server_w, *, close_on_read=True):
+        self._server_r = server_r
+        self._server_w = server_w
+        self._close_on_read = close_on_read
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        try:
+            self._server_r.readline()
+            if self._close_on_read:
+                self._server_w.close()
+        except Exception:
+            pass
+
+    def close(self):
+        for f in (self._server_r, self._server_w):
+            try:
+                f.close()
+            except Exception:
+                pass
 
     def close(self):
         for f in (self._server_r, self._server_w):
@@ -199,6 +243,23 @@ class TestTryLocalSocket(unittest.TestCase):
         conn = _bare_connection()
         missing = os.path.join(tempfile.gettempdir(), "fastagent-nonexistent.sock")
         self.assertFalse(conn._try_local_socket(missing, "test-host"))
+        self.assertFalse(conn._connected)
+        self.assertIsNone(conn._socket)
+
+    def test_stale_tunnel_probe_fails(self) -> None:
+        # A stale SSH -L tunnel pointing at a dead remote socket accepts
+        # local connects and even local writes, but the first read sees EOF.
+        # The Hello probe must catch this and fall through to bootstrap.
+        client_r, client_w, server_r, server_w = _make_pipe_pair()
+        server = _SilentServer(server_r=server_r, server_w=server_w)
+        self.addCleanup(server.close)
+        mock_sock = _MockSocket(client_r, client_w)
+        self.addCleanup(mock_sock.close)
+
+        conn = _bare_connection()
+        with mock.patch.object(fastagent_plugin.socket_mod, "socket", return_value=mock_sock), \
+             mock.patch.object(fastagent_plugin.os.path, "exists", return_value=True):
+            self.assertFalse(conn._try_local_socket("/fake/socket.sock", "test-host"))
         self.assertFalse(conn._connected)
         self.assertIsNone(conn._socket)
 
