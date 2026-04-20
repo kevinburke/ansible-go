@@ -46,8 +46,11 @@ release: build collection
 
 test:
 	go test -trimpath -count=1 ./...
-	cd plugins/module_utils && python3 -m unittest fastagent_client_test -v
-	python3 -m unittest tests.test_collection_layout -v
+	python3 -m unittest -v \
+		plugins.connection.fastagent_test \
+		plugins.module_utils.fastagent_client_test \
+		tests.test_collection_layout \
+		tests.test_file_action
 
 clean:
 	rm -rf tmp/

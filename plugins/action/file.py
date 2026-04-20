@@ -7,12 +7,17 @@ For non-fastagent connections, falls back to normal module execution.
 
 from __future__ import annotations
 
-import os
-
 from ansible.plugins.action import ActionBase
 from ansible.module_utils.common.text.converters import to_text
 from ansible.module_utils.parsing.convert_bool import boolean
 from ansible.utils.vars import merge_hash
+
+try:
+    from ansible_collections.kevinburke.fastagent.plugins.module_utils.file_state import (
+        infer_file_state,
+    )
+except ImportError:
+    from plugins.module_utils.file_state import infer_file_state
 
 
 class ActionModule(ActionBase):
@@ -59,12 +64,14 @@ class ActionModule(ActionBase):
         client = self._connection._agent_client
         check_mode = self._play_context.check_mode
 
-        # If state is not specified, infer from other args or default to "file".
-        if state is None:
-            if src:
-                state = "link"
-            else:
-                state = "file"
+        # Match ansible.builtin.file defaults: existing directories remain
+        # directories, recurse implies directory, and src implies link.
+        try:
+            state = infer_file_state(client, path, state, src, recurse, follow)
+        except Exception as e:
+            result["failed"] = True
+            result["msg"] = f"fastagent stat failed: {e}"
+            return result
 
         # For state=absent, we don't need to stat first.
         if state == "absent":

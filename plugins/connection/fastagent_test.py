@@ -48,7 +48,14 @@ sys.modules[
 ] = fastagent_client
 
 sys.path.insert(0, _PLUGIN_DIR)
-import fastagent as fastagent_plugin  # noqa: E402
+_FASTAGENT_IMPORT_ERROR = None
+try:
+    import fastagent as fastagent_plugin  # noqa: E402
+except ModuleNotFoundError as e:
+    if e.name == "ansible":
+        _FASTAGENT_IMPORT_ERROR = e
+    else:
+        raise
 
 
 class _MockSocket:
@@ -150,6 +157,10 @@ def _bare_connection() -> fastagent_plugin.Connection:
     return conn
 
 
+@unittest.skipIf(
+    _FASTAGENT_IMPORT_ERROR is not None,
+    "ansible is required to run connection plugin tests",
+)
 class TestTryLocalSocket(unittest.TestCase):
     def test_connect_clears_probe_timeout(self) -> None:
         client_r, client_w, server_r, server_w = _make_pipe_pair()

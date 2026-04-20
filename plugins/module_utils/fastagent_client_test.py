@@ -13,33 +13,27 @@ import unittest
 from fastagent_client import FastAgentClient, FastAgentError
 
 
-def _build_agent():
-    """Build the agent binary for the current platform and return its path."""
-    # __file__ is plugins/module_utils/fastagent_client_test.py — go up three
-    # levels to reach the repo root where go.mod lives.
-    repo_dir = os.path.dirname(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    )
-    tmp_dir = os.path.join(repo_dir, "tmp")
-    os.makedirs(tmp_dir, exist_ok=True)
-    binary = os.path.join(tmp_dir, "fastagent-test")
-    subprocess.run(
-        ["go", "build", "-trimpath", "-o", binary, "./cmd/fastagent"],
-        cwd=repo_dir,
-        check=True,
-        capture_output=True,
-    )
-    return binary
-
-
 # Build once for all tests.
 _agent_binary = None
+_agent_tmp_dir = None
 
 
 def _get_agent_binary():
-    global _agent_binary
+    global _agent_binary, _agent_tmp_dir
     if _agent_binary is None:
-        _agent_binary = _build_agent()
+        _agent_tmp_dir = tempfile.mkdtemp(prefix="fastagent-test-")
+        _agent_binary = os.path.join(_agent_tmp_dir, "fastagent-test")
+        # __file__ is plugins/module_utils/fastagent_client_test.py — go up
+        # three levels to reach the repo root where go.mod lives.
+        repo_dir = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        )
+        subprocess.run(
+            ["go", "build", "-trimpath", "-o", _agent_binary, "./cmd/fastagent"],
+            cwd=repo_dir,
+            check=True,
+            capture_output=True,
+        )
     return _agent_binary
 
 
