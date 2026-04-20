@@ -198,6 +198,33 @@ the override automatically. No per-play or per-role changes needed.
 non-overridden module pays an extra `put_file` round-trip per task. The
 fastagent connection plugin honors this setting just like the SSH plugin.
 
+#### One-shot install snippet
+
+If you'd rather not hand-edit `ansible.cfg`, run this once from the root
+of your playbook repo. It installs the collection and idempotently appends
+the stanza so re-running the snippet is a no-op:
+
+```bash
+ansible-galaxy collection install kevinburke.fastagent
+
+grep -q 'kevinburke/fastagent/plugins/modules' ansible.cfg 2>/dev/null || \
+cat >> ansible.cfg <<'EOF'
+
+[defaults]
+library        = ~/.ansible/collections/ansible_collections/kevinburke/fastagent/plugins/modules
+action_plugins = ~/.ansible/collections/ansible_collections/kevinburke/fastagent/plugins/action
+
+[ssh_connection]
+pipelining = True
+EOF
+```
+
+The paths assume the default `ansible-galaxy` install location
+(`~/.ansible/collections/`). If you set `ANSIBLE_COLLECTIONS_PATH` or use
+`ansible-galaxy collection install -p <dir>` to install somewhere else,
+adjust the paths accordingly — they need to point at
+`<install-root>/ansible_collections/kevinburke/fastagent/plugins/{modules,action}`.
+
 ### Alternative: per-play and per-role `collections:` keyword
 
 If you'd rather stay collection-pure (no legacy paths), declare the
