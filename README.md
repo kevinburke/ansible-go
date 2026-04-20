@@ -1,19 +1,26 @@
 # fastagent
 
 A drop-in Ansible accelerator. Replace your remote execution path with a
-persistent Go agent and cut playbook run times by 50%+.
+persistent Go agent and cut playbook run times.
 
 ```
-SSH (default):   55s
-fastagent:       22s   (60% faster)
+SSH + pipelining (baseline):  57-69s
+fastagent (overrides firing): 30s     (~50% faster)
 ```
+
+Measured on a converged 250-task playbook against a low-latency LAN host.
+Speedup grows with task count, network latency, and number of changed tasks.
+On a fast LAN with mostly-converged ("ok") tasks, the floor is set by Ansible's
+own per-task Python overhead (~50ms per task), not the connection plugin.
 
 The speedup comes from **action plugin overrides** that replace Python module
 transfer with direct Go RPCs for common modules (`command`, `shell`, `copy`,
-`file`, `stat`, `apt`, `systemd`). This requires using **unqualified module
-names** in your playbooks (e.g. `command:` not `ansible.builtin.command:`).
-Without the overrides, fastagent is roughly the same speed as plain SSH — see
-[Use unqualified module names](#use-unqualified-module-names).
+`file`, `stat`, `apt`, `systemd`). For the overrides to fire, the
+`kevinburke.fastagent` plugin paths must be wired into Ansible's module
+resolution — see [Wire up the override routing](#wire-up-the-override-routing).
+Without that step, fastagent is roughly the same speed as plain SSH (or
+slightly slower — the persistent daemon adds a hop without offsetting Python
+startup).
 
 Fastagent keeps standard Ansible YAML, inventory, variables, and templating
 unchanged. It substitutes a faster execution engine underneath using supported
@@ -158,38 +165,90 @@ ANSIBLE_STDOUT_CALLBACK=profile_tasks \
 
 Compare against the same playbook run without the connection override.
 
-## Use unqualified module names (required for speedup)
+## Wire up the override routing (required for speedup)
 
-**This step is required.** Without it, fastagent provides no speedup over
-plain SSH.
+**This step is required.** Without it, fastagent's action overrides never
+fire, and you'll see roughly the same wall-clock time as plain SSH (with
+some extra hop overhead). The persistent connection alone doesn't help
+because Ansible's native SSH ControlMaster already provides connection
+reuse.
 
-Fastagent overrides modules via Ansible's `ansible.legacy` resolution path.
-When you write `command:`, Ansible checks for an override before falling back
-to the builtin — and fastagent's override handles it as a direct Go RPC,
-skipping Python module transfer entirely. When you write
-`ansible.builtin.command:`, Ansible resolves directly to the builtin, the
-override never fires, and the task goes through the standard Python module
-path. The persistent connection doesn't help here because Ansible's native
-SSH ControlMaster already provides connection reuse.
+Once installed as a collection, Ansible's resolver maps unqualified module
+names like `command:` to `ansible.builtin.command` — *not* to our
+`kevinburke.fastagent.command`. So the action plugin override never gets
+selected. You need to point Ansible at our plugin directories explicitly.
+
+### Recommended: legacy paths in `ansible.cfg` (one-line, fleet-wide)
+
+```ini
+[defaults]
+library        = ~/.ansible/collections/ansible_collections/kevinburke/fastagent/plugins/modules
+action_plugins = ~/.ansible/collections/ansible_collections/kevinburke/fastagent/plugins/action
+
+[ssh_connection]
+pipelining = True
+```
+
+This places fastagent's modules and action plugins into Ansible's
+`ansible.legacy` namespace, which is searched **before** `ansible.builtin`
+for unqualified names. Every task — including tasks inside roles — picks up
+the override automatically. No per-play or per-role changes needed.
+
+`pipelining = True` is independently important: without it, every
+non-overridden module pays an extra `put_file` round-trip per task. The
+fastagent connection plugin honors this setting just like the SSH plugin.
+
+### Alternative: per-play and per-role `collections:` keyword
+
+If you'd rather stay collection-pure (no legacy paths), declare the
+collection at every level:
 
 ```yaml
-# Fast — override fires, Go RPC, no Python transfer:
+- hosts: web
+  collections:
+    - kevinburke.fastagent
+  roles:
+    - common_hardening
+```
+
+```yaml
+# roles/common_hardening/meta/main.yml
+collections:
+  - kevinburke.fastagent
+```
+
+Both are required: the play-level `collections:` keyword does **not**
+propagate into tasks inside roles. Each role that runs overridden modules
+needs its own `meta/main.yml` declaration. This is invasive in large
+playbooks, which is why we recommend the legacy-paths approach.
+
+### Module name forms
+
+```yaml
+# Fast — override fires (with either setup approach above):
 - command: uptime
 
-# No speedup — override bypassed, full Python module transfer:
+# Fast — override fires (FQCN bypasses the resolution dance):
+- kevinburke.fastagent.command: uptime
+
+# No speedup — Ansible resolves directly to builtin, our override never sees it:
 - ansible.builtin.command: uptime
 ```
 
-To convert an existing playbook in-place:
+To strip FQCN-prefixed module names back to unqualified in an existing
+playbook:
 
 ```bash
 find roles/ -name '*.yml' -exec \
     sed -i 's/ansible\.builtin\.\([a-z0-9_]*\):/\1:/g' {} +
 ```
 
-Modules that don't have an override (e.g. `git`, `user`, `cron`) still work
-normally — they go through the standard Ansible module path at roughly the
-same speed as plain SSH.
+Modules without an override (e.g. `git`, `user`, `cron`, `lineinfile`,
+`community.general.ufw`) still work normally — they go through the standard
+Ansible module path. Pipelining keeps the per-task overhead low for those,
+but no Go RPC fast path exists. `template:` benefits indirectly because
+Ansible's builtin template action renders locally and then invokes the
+`copy` action plugin (which is overridden).
 
 ## How it works
 

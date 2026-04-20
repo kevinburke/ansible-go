@@ -27,12 +27,16 @@ class ActionModule(ActionBase):
         result = super().run(tmp, task_vars)
         del tmp
 
-        # Fall back to builtin for non-fastagent connections.
+        # Fall back to builtin for non-fastagent connections (e.g. when a
+        # task uses delegate_to: localhost with the local connection).
+        # Use ansible.builtin.command rather than ansible.legacy.command
+        # because if the user has wired up library = .../fastagent/modules
+        # in ansible.cfg, our command shim shadows ansible.legacy.command.
         if self._connection.transport != "fastagent":
             return merge_hash(
                 result,
                 self._execute_module(
-                    module_name="ansible.legacy.command",
+                    module_name="ansible.builtin.command",
                     task_vars=task_vars,
                     wrap_async=self._task.async_val,
                 ),
@@ -118,12 +122,27 @@ class ActionModule(ActionBase):
             return merge_hash(result, r)
 
         # Execute via fastagent RPC.
+        # For non-shell command tasks, send the shlex-parsed argv rather than
+        # the raw cmd_string. The agent's cmd_string handling uses naive
+        # whitespace splitting (strings.Fields), which corrupts quoted
+        # arguments like `su - plex -c 'systemctl --user daemon-reload'`.
+        # For shell tasks, send cmd_string so the remote shell does the
+        # parsing.
+        exec_argv = argv
+        exec_cmd_string = None
+        if exec_argv:
+            pass
+        elif uses_shell:
+            exec_cmd_string = cmd_string
+        else:
+            exec_argv = cmd_parts
+
         start = datetime.datetime.now()
 
         try:
             exec_result = self._connection._agent_client.exec(
-                argv=argv,
-                cmd_string=cmd_string if not argv else None,
+                argv=exec_argv,
+                cmd_string=exec_cmd_string,
                 use_shell=uses_shell,
                 cwd=chdir,
                 stdin=stdin,

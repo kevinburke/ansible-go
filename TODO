@@ -1,0 +1,54 @@
+Follow-ups from the perf-debugging session that established the
+collections+role-meta routing requirement.
+
+Routing / docs
+- Document that `collections: [kevinburke.fastagent]` must be set on each
+  play AND each role's `meta/main.yml` for action overrides to fire on
+  unqualified module names. Without role-meta, only apt routes (mechanism
+  for that one is still unexplained).
+- Decide on legacy-paths fallback as the documented "easy mode": add
+  `library = .../plugins/modules` and `action_plugins = .../plugins/action`
+  to `ansible.cfg`, which routes everything via `ansible.legacy` and
+  bypasses the per-role meta requirement.
+- Update the README's speedup claim. Real measured on a converged plex
+  deploy: ~15-25% (57-69s -> 48s) with all overrides firing and
+  pipelining on. The earlier 37s number was an incomplete run (a
+  command-action bug killed it ~70% through). Honest framing: speedup
+  grows with task count, network latency, and number of changed tasks;
+  on a fast LAN with mostly-ok tasks it is bounded by ~15s of ansible
+  Python overhead between RPCs.
+
+Robustness
+- `_try_local_socket` connects to the local SSH-forwarded socket without
+  probing the remote daemon. If the daemon idle-timed out (1h default)
+  the local socket file still exists, connect succeeds, and the first
+  RPC fails with EPIPE mid-deploy. Fix: send a Hello probe after
+  connect, and if it fails, tear down the forwarding and re-bootstrap.
+  Reproduced twice in this session — once from network drop, once from
+  daemon idle timeout.
+
+Agent
+- `handleExec` uses `strings.Fields(p.CmdString)` to split commands when
+  argv is not provided. This breaks any quoted argument (e.g. `su - u
+  -c 'cmd with spaces'`). Action plugin now compensates by always
+  sending shlex-parsed argv, but the agent still has the footgun. Fix:
+  use a real shell-style splitter, or reject cmd_string with quotes
+  when use_shell=False.
+
+Action plugin discipline
+- Every fallback path (`if self._connection.transport != "fastagent": ...`)
+  must call _execute_module with `module_name="ansible.builtin.X"`,
+  never `ansible.legacy.X`. Once users wire up `library = .../fastagent/
+  modules` in ansible.cfg, our shim modules sit in the legacy namespace
+  and silently shadow the real builtin — so any `ansible.legacy.command`
+  fallback ends up invoking our shim, which fails loudly. Add a test or
+  lint that scans plugins/action/*.py for `ansible.legacy.` references.
+
+Coverage
+- Add action overrides for the highest-frequency non-overridden modules.
+  In the plex deploy these were template (~7), lineinfile (~3), sysctl
+  (~2). Each call still goes through ansible's pipelined python path.
+- Verify systemd override actually fires. Trace from the 37s run
+  showed 0 Service RPCs despite systemd tasks being present — the
+  module shim exists and the action plugin is wired up, so something
+  else is preventing it.

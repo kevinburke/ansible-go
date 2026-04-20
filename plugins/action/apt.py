@@ -24,7 +24,9 @@ class ActionModule(ActionBase):
         if self._connection.transport != "fastagent":
             return merge_hash(
                 result,
-                self._execute_module(task_vars=task_vars),
+                self._execute_module(
+                    module_name="ansible.builtin.apt", task_vars=task_vars
+                ),
             )
 
         self._connection._connect()
@@ -44,7 +46,9 @@ class ActionModule(ActionBase):
         if deb or upgrade:
             return merge_hash(
                 result,
-                self._execute_module(task_vars=task_vars),
+                self._execute_module(
+                    module_name="ansible.builtin.apt", task_vars=task_vars
+                ),
             )
 
         # Normalize state.
@@ -55,7 +59,9 @@ class ActionModule(ActionBase):
         elif state == "build-dep":
             return merge_hash(
                 result,
-                self._execute_module(task_vars=task_vars),
+                self._execute_module(
+                    module_name="ansible.builtin.apt", task_vars=task_vars
+                ),
             )
 
         client = self._connection._agent_client

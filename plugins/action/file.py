@@ -24,11 +24,16 @@ class ActionModule(ActionBase):
         result = super().run(tmp, task_vars)
         del tmp
 
-        # Fall back for non-fastagent connections.
+        # Fall back for non-fastagent connections. Use explicit module_name
+        # so the call hits ansible.builtin.file rather than our shim module
+        # (which only exists to make `collections:` routing select this
+        # action plugin for unqualified `file:` tasks).
         if self._connection.transport != "fastagent":
             return merge_hash(
                 result,
-                self._execute_module(task_vars=task_vars),
+                self._execute_module(
+                    module_name="ansible.builtin.file", task_vars=task_vars
+                ),
             )
 
         self._connection._connect()

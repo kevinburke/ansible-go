@@ -21,10 +21,14 @@ class ActionModule(ActionBase):
         result = super().run(tmp, task_vars)
         del tmp
 
+        # Use explicit module_name so the call hits ansible.builtin.systemd
+        # rather than our shim module.
         if self._connection.transport != "fastagent":
             return merge_hash(
                 result,
-                self._execute_module(task_vars=task_vars),
+                self._execute_module(
+                    module_name="ansible.builtin.systemd", task_vars=task_vars
+                ),
             )
 
         self._connection._connect()
@@ -43,7 +47,9 @@ class ActionModule(ActionBase):
         if masked is not None or scope != "system" or daemon_reexec:
             return merge_hash(
                 result,
-                self._execute_module(task_vars=task_vars),
+                self._execute_module(
+                    module_name="ansible.builtin.systemd", task_vars=task_vars
+                ),
             )
 
         client = self._connection._agent_client

@@ -114,6 +114,29 @@ options:
         vars:
             - name: ansible_ssh_private_key_file
             - name: ansible_private_key_file
+    pipelining:
+        description: >
+            Whether to send module contents to the remote interpreter via
+            stdin instead of writing a temp file first. When enabled,
+            non-overridden modules avoid an extra put_file round trip.
+            Has no effect on action-plugin overrides (apt, copy, file, etc.),
+            which already bypass module execution entirely.
+        type: bool
+        default: false
+        ini:
+            - section: defaults
+              key: pipelining
+            - section: connection
+              key: pipelining
+            - section: ssh_connection
+              key: pipelining
+        env:
+            - name: ANSIBLE_PIPELINING
+            - name: ANSIBLE_SSH_PIPELINING
+            - name: FASTAGENT_PIPELINING
+        vars:
+            - name: ansible_pipelining
+            - name: ansible_ssh_pipelining
 """
 
 import base64
@@ -137,13 +160,15 @@ from ansible_collections.kevinburke.fastagent.plugins.module_utils.fastagent_cli
 display = Display()
 
 # Agent version must match the Go constant.
-AGENT_VERSION = "0.4.0"
+AGENT_VERSION = "0.5.0"
 
 class Connection(ConnectionBase):
     """fastagent connection plugin."""
 
     transport = "fastagent"
-    has_pipelining = False
+    # Capability flag — actual enablement is controlled by the `pipelining`
+    # option (read by Ansible into play_context.pipelining at task time).
+    has_pipelining = True
     supports_persistence = False
 
     def __init__(self, *args: t.Any, **kwargs: t.Any) -> None:
@@ -387,6 +412,11 @@ class Connection(ConnectionBase):
                 cmd_string=actual_cmd,
                 use_shell=True,
                 stdin=stdin_data,
+                # Pass in_data through verbatim. The agent's default of
+                # appending a newline is a convenience for direct RPC callers;
+                # for connection-plugin traffic (especially pipelined module
+                # payloads) we must not mutate the bytes Ansible handed us.
+                stdin_add_newline=False,
             )
         except IOError as e:
             return (1, b"", to_bytes(f"fastagent exec_command failed: {e}"))

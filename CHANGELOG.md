@@ -2,6 +2,74 @@
 
 All notable changes to fastagent are documented in this file.
 
+## 0.5.0
+
+### New features
+
+- **`pipelining` connection option.** The connection plugin now declares
+  `has_pipelining = True` and a `pipelining` option matching SSH's
+  surfaces (env `ANSIBLE_PIPELINING` / `ANSIBLE_SSH_PIPELINING` /
+  `FASTAGENT_PIPELINING`, ini `[ssh_connection] pipelining`, vars
+  `ansible_pipelining` / `ansible_ssh_pipelining`). With pipelining on,
+  non-overridden modules skip the `put_file` round-trip and have their
+  bytes piped via stdin — measured savings of ~10s/run on a converged
+  plex deploy at home and ~25s/run from a higher-latency link.
+
+- **Module shims for `copy`, `file`, `stat`, `command`.** Routing-only
+  stubs added to `plugins/modules/`. They exist so the
+  `collections: [kevinburke.fastagent]` play keyword resolves
+  unqualified `copy:` / `file:` / `stat:` / `command:` to our collection
+  and selects our action plugin override. Without these, the keyword
+  only routed `apt` / `systemd` (the two existing module shims).
+
+- **`FASTAGENT_TRACE=<file>` env var.** When set, every JSON-RPC call
+  records `timestamp_ns\tmethod\tduration_ms\thint` to the named file
+  (TSV). Useful for finding hot RPCs and overhead between RPCs without
+  patching code.
+
+### Bug fixes
+
+- **`command:` action override sent unparsed cmd_string.** Tasks like
+  `command: su - user -c 'cmd with spaces'` were forwarded to the
+  agent as a single string and then split with `strings.Fields` on the
+  Go side, which doesn't respect quotes — `su` received `--user` as a
+  flag instead of as part of the quoted command body. The action
+  plugin now sends `shlex.split(cmd_string)` as argv. The agent's
+  `strings.Fields` cmd_string handling remains a footgun and is tracked
+  in TODO.
+
+- **Action plugin fallbacks used `ansible.legacy.X` instead of
+  `ansible.builtin.X`.** Once a user wires up `library = .../fastagent/
+  modules` in `ansible.cfg` (the documented setup that makes overrides
+  fire fleet-wide), the shim modules sit in the `ansible.legacy`
+  namespace and silently shadow the real builtins. Any
+  `_execute_module(module_name="ansible.legacy.command", ...)` call
+  then invoked the shim, which fails loudly. All fallback paths in
+  `apt`, `command`, `file`, `stat`, `systemd` now use
+  `ansible.builtin.X`.
+
+- **`stdin_add_newline` mutated pipelined module bytes.** The agent's
+  default of appending `\n` to stdin would corrupt module wrappers when
+  pipelining is on. The connection plugin now passes
+  `stdin_add_newline=False` so bytes go through verbatim.
+
+### Documentation
+
+- **README rewritten with measured numbers.** Updated the speedup
+  claim to reflect what was actually measured on a converged plex
+  deploy: 30s vs 57-69s baseline (~50% faster), not the previous
+  "22s / 60% faster" memory. Added an honest framing about when the
+  speedup grows (cold deploys, high-latency links, many small tasks)
+  and where it bottoms out (Ansible's own per-task Python overhead).
+
+- **Documented the routing-setup requirement.** Replaced the old
+  "use unqualified module names" section with a concrete two-option
+  setup story: legacy paths in `ansible.cfg` (recommended, one-line,
+  fleet-wide) or per-play + per-role `collections:` keywords
+  (collection-pure, more invasive). The previous version implicitly
+  assumed the legacy resolution path that the collection migration
+  had broken.
+
 ## 0.4.0
 
 ### Bug fixes

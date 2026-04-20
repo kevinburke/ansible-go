@@ -7,7 +7,46 @@ The client speaks newline-delimited JSON over stdin/stdout of a subprocess
 from __future__ import annotations
 
 import json
+import os
 import threading
+import time as _time
+
+# When FASTAGENT_TRACE is set, each RPC is appended to this file as TSV:
+#   timestamp_ns \t method \t duration_ms \t hint
+# Set to an empty string to disable.
+_TRACE_PATH = os.environ.get("FASTAGENT_TRACE") or ""
+_TRACE_LOCK = threading.Lock()
+
+
+def _trace_hint(method: str, params: dict | None) -> str:
+    """Extract a short identifying string from params for trace logs."""
+    if not params:
+        return ""
+    if method == "Exec":
+        cmd = params.get("cmd_string") or " ".join(params.get("argv") or [])
+        return cmd[:160].replace("\t", " ").replace("\n", " ")
+    if method in ("Stat", "ReadFile", "File"):
+        return str(params.get("path", ""))[:160]
+    if method == "WriteFile":
+        return str(params.get("dest", ""))[:160]
+    if method == "Package":
+        names = params.get("names") or []
+        return (",".join(names) if isinstance(names, list) else str(names))[:160]
+    if method == "Service":
+        return str(params.get("name", ""))[:160]
+    return ""
+
+
+def _trace(method: str, duration_ns: int, hint: str) -> None:
+    if not _TRACE_PATH:
+        return
+    line = f"{_time.time_ns()}\t{method}\t{duration_ns / 1_000_000:.3f}\t{hint}\n"
+    try:
+        with _TRACE_LOCK, open(_TRACE_PATH, "a", encoding="utf-8") as f:
+            f.write(line)
+    except OSError:
+        # Never let tracing break the deploy.
+        pass
 
 
 class FastAgentError(Exception):
@@ -63,6 +102,7 @@ class FastAgentClient:
             }
 
             line = json.dumps(request, separators=(",", ":")) + "\n"
+            start_ns = _time.monotonic_ns() if _TRACE_PATH else 0
             self._stdin.write(line.encode("utf-8"))
             self._stdin.flush()
 
@@ -71,6 +111,9 @@ class FastAgentClient:
                 raise IOError(
                     "fastagent: no response (agent process may have exited)"
                 )
+
+            if _TRACE_PATH:
+                _trace(method, _time.monotonic_ns() - start_ns, _trace_hint(method, params))
 
             response = json.loads(response_line)
 

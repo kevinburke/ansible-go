@@ -21,11 +21,14 @@ class ActionModule(ActionBase):
         result = super().run(tmp, task_vars)
         del tmp
 
-        # Fall back for non-fastagent connections.
+        # Fall back for non-fastagent connections. Use explicit module_name
+        # so the call hits ansible.builtin.stat rather than our shim module.
         if self._connection.transport != "fastagent":
             return merge_hash(
                 result,
-                self._execute_module(task_vars=task_vars),
+                self._execute_module(
+                    module_name="ansible.builtin.stat", task_vars=task_vars
+                ),
             )
 
         self._connection._connect()
@@ -42,11 +45,13 @@ class ActionModule(ActionBase):
             return result
 
         # We only support sha256 checksums (what the Go agent computes).
-        # For other algorithms, fall back to the module.
+        # For other algorithms, fall back to the builtin module.
         if get_checksum and checksum_algorithm not in ("sha256", "sha-256"):
             return merge_hash(
                 result,
-                self._execute_module(task_vars=task_vars),
+                self._execute_module(
+                    module_name="ansible.builtin.stat", task_vars=task_vars
+                ),
             )
 
         client = self._connection._agent_client
