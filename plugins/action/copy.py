@@ -44,6 +44,14 @@ class ActionModule(ActionBase):
         if self._connection.transport != "fastagent":
             return self._run_builtin_copy(None, task_vars)
 
+        # Fall back when become is active. The fast path uses Stat and
+        # ReadFile RPCs that the agent refuses to serve with a
+        # become_user (to avoid silently reading as root), and would
+        # write files owned by root instead of by the become_user
+        # without an explicit owner/group.
+        if getattr(self._connection, "_become_user", None) is not None:
+            return self._run_builtin_copy(None, task_vars)
+
         args = self._task.args
         remote_src = boolean(args.get("remote_src", False), strict=False)
 

@@ -33,6 +33,20 @@ class ActionModule(ActionBase):
 
         self._connection._connect()
 
+        # The Stat RPC runs as the agent's uid (root when become is in
+        # effect). Running stat as root would see files the become_user
+        # couldn't — a permission leak — so the agent rejects Stat with
+        # a become target. Fall back to the builtin module, which goes
+        # through Ansible's normal become path and runs stat as the
+        # target user.
+        if getattr(self._connection, "_become_user", None) is not None:
+            return merge_hash(
+                result,
+                self._execute_module(
+                    module_name="ansible.builtin.stat", task_vars=task_vars
+                ),
+            )
+
         args = self._task.args
         path = args.get("path")
         follow = boolean(args.get("follow", False), strict=False)

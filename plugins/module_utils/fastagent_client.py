@@ -146,8 +146,15 @@ class FastAgentClient:
         removes: str | None = None,
         stdin_add_newline: bool = True,
         strip_empty_ends: bool = True,
+        become_user: str | None = None,
     ) -> dict:
-        """Execute a command on the remote host."""
+        """Execute a command on the remote host.
+
+        If become_user is set, the agent wraps the invocation with
+        `sudo -H -n -u <become_user> --` so it runs as that user. This
+        requires the agent to be running as root, which is the case
+        whenever Ansible's `become: true` is in effect.
+        """
         params = {"use_shell": use_shell}
         if argv is not None:
             params["argv"] = argv
@@ -167,6 +174,8 @@ class FastAgentClient:
             params["removes"] = removes
         params["stdin_add_newline"] = stdin_add_newline
         params["strip_empty_ends"] = strip_empty_ends
+        if become_user is not None:
+            params["become_user"] = become_user
         return self.call("Exec", params)
 
     def stat(
@@ -175,7 +184,13 @@ class FastAgentClient:
         follow: bool = False,
         checksum: bool = False,
     ) -> dict:
-        """Stat a file on the remote host."""
+        """Stat a file on the remote host.
+
+        Does NOT support `become_user`: stat runs as the agent's uid
+        (typically root), which could leak metadata the become_user
+        couldn't otherwise see. Callers that need become-user stat
+        semantics must fall back to the builtin stat module.
+        """
         return self.call("Stat", {
             "path": path,
             "follow": follow,
@@ -183,7 +198,10 @@ class FastAgentClient:
         })
 
     def read_file(self, path: str) -> dict:
-        """Read a file from the remote host (content is base64-encoded)."""
+        """Read a file from the remote host (content is base64-encoded).
+
+        Does NOT support become_user; same rationale as `stat`.
+        """
         return self.call("ReadFile", {"path": path})
 
     def write_file(

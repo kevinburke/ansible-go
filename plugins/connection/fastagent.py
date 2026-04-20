@@ -164,7 +164,7 @@ from ansible_collections.kevinburke.fastagent.plugins.module_utils.fastagent_cli
 display = Display()
 
 # Agent version must match the Go constant.
-AGENT_VERSION = "0.5.4"
+AGENT_VERSION = "0.5.5"
 
 class Connection(ConnectionBase):
     """fastagent connection plugin."""
@@ -179,8 +179,62 @@ class Connection(ConnectionBase):
         super().__init__(*args, **kwargs)
         self._socket: socket_mod.socket | None = None
         self._agent_client: FastAgentClient | None = None
+        # Set per-task in _refresh_become(): the target user for Ansible's
+        # become, or None if become is not active for this task. The
+        # connection passes this through to each RPC so the agent can run
+        # the command as that user. We take over become handling from
+        # Ansible (by flipping play_context.become to False after
+        # recording the user here) so the command isn't wrapped twice.
+        self._become_user: str | None = None
+
+    def _refresh_become(self) -> tuple[bool, str]:
+        """Read become settings from the current task's play_context.
+
+        Ansible rebuilds PlayContext per task, so this runs on every
+        _connect() — even when the underlying agent connection is
+        already up and we'd otherwise short-circuit.
+
+        Returns (use_become, become_user_for_socket) where
+        become_user_for_socket is 'root' when become is active (the
+        daemon runs as root to sudo into arbitrary target users) and
+        unused otherwise.
+
+        Side effect: records the target become_user on self for RPCs
+        to pick up, and flips self._play_context.become to False so
+        Ansible's ActionBase doesn't wrap commands with
+        `sudo -u <user>` on top of what we're already asking the
+        agent to do.
+        """
+        become = self._play_context.become
+        become_method = self._play_context.become_method
+        if not become:
+            self._become_user = None
+            return False, "root"
+        if become_method not in (None, "sudo"):
+            display.warning(
+                f"fastagent: unsupported become_method {become_method!r}, "
+                f"falling back to direct execution"
+            )
+            self._become_user = None
+            return False, "root"
+
+        become_user = self._play_context.become_user or "root"
+        # The daemon runs as root when become is in effect, so there's
+        # no need to sudo-wrap when the target *is* root — that would
+        # be a wasteful no-op fork+exec per RPC.
+        self._become_user = become_user if become_user != "root" else None
+        # Tell Ansible not to wrap the command — the agent will sudo on
+        # our behalf using the become_user we stored above (or just run
+        # as root directly, if become_user is root).
+        self._play_context.become = False
+        return True, "root"
 
     def _connect(self) -> Connection:
+        # Read become settings for every task, not just the first one
+        # (play_context is rebuilt per task, so become_user can change
+        # between tasks on the same reused connection).
+        use_become, _ = self._refresh_become()
+
         if self._connected:
             return self
 
@@ -188,20 +242,6 @@ class Connection(ConnectionBase):
         user = self.get_option("remote_user")
         port = self.get_option("port")
 
-        # Determine become settings.
-        become = self._play_context.become
-        become_method = self._play_context.become_method
-        become_user = "root"
-        use_become = False
-        if become:
-            if become_method == "sudo" or become_method is None:
-                become_user = self._play_context.become_user or "root"
-                use_become = True
-            else:
-                display.warning(
-                    f"fastagent: unsupported become_method {become_method!r}, "
-                    f"falling back to direct execution"
-                )
 
         # Socket paths. When become is enabled the daemon always runs as
         # root (it re-executes commands via ansible's own `sudo -u X`
@@ -225,7 +265,7 @@ class Connection(ConnectionBase):
         display.vvv(f"FASTAGENT: local socket not available, setting up", host=host)
 
         # Ensure the remote daemon is running.
-        self._ensure_remote_daemon(host, user, port, remote_socket, use_become, become_user)
+        self._ensure_remote_daemon(host, user, port, remote_socket, use_become)
 
         # Start SSH socket forwarding if not already running.
         self._ensure_ssh_forwarding(host, user, port, local_socket, remote_socket)
@@ -283,7 +323,6 @@ class Connection(ConnectionBase):
         port: int | None,
         remote_socket: str,
         use_become: bool,
-        become_user: str,
     ) -> None:
         """Ensure the remote daemon is running, bootstrapping if needed."""
         # Check if daemon is already running by testing the remote socket.
@@ -429,23 +468,20 @@ class Connection(ConnectionBase):
     ) -> tuple[int, bytes, bytes]:
         super().exec_command(cmd, in_data=in_data, sudoable=sudoable)
 
-        # When become is enabled, the daemon runs as root, and ansible's
-        # own become layer wraps sudoable commands with `sudo -u X …` —
-        # which root can execute for any target user (including non-
-        # sudoers like `returns`). For commands that should NOT run as
-        # root (sudoable=False, typically connection-layer housekeeping
-        # like temp dir creation), drop to the connecting user via
-        # runuser so those files don't end up root-owned in the user's
-        # home.
+        # Become is handled by the agent: if self._become_user is set
+        # (recorded in _refresh_become), we ask the agent to run the
+        # command as that user via an RPC field. Ansible's own become-
+        # wrapping has been disabled by flipping play_context.become
+        # in _refresh_become, so `cmd` here is the raw module invocation
+        # with no `sudo -u X` prefix.
         #
-        # When become is NOT enabled, the daemon already runs as the
-        # connecting user, so runuser is neither needed nor possible (it
-        # requires root).
-        actual_cmd = cmd
-        become = self._play_context.become
-        remote_user = self.get_option("remote_user")
-        if become and remote_user and not sudoable:
-            actual_cmd = f"runuser -u {shlex.quote(remote_user)} -- sh -c {shlex.quote(cmd)}"
+        # sudoable=False is Ansible's hint that a particular command is
+        # connection-layer plumbing (e.g. making an ~/.ansible/tmp dir)
+        # and should run as the ssh user rather than the become target,
+        # so files in the ssh user's home don't end up root-owned.
+        become_user = self._become_user
+        if become_user is not None and not sudoable:
+            become_user = self.get_option("remote_user") or None
 
         stdin_data = None
         if in_data is not None:
@@ -453,7 +489,7 @@ class Connection(ConnectionBase):
 
         try:
             result = self._agent_client.exec(
-                cmd_string=actual_cmd,
+                cmd_string=cmd,
                 use_shell=True,
                 stdin=stdin_data,
                 # Pass in_data through verbatim. The agent's default of
@@ -461,6 +497,7 @@ class Connection(ConnectionBase):
                 # for connection-plugin traffic (especially pipelined module
                 # payloads) we must not mutate the bytes Ansible handed us.
                 stdin_add_newline=False,
+                become_user=become_user,
             )
         except IOError as e:
             return (1, b"", to_bytes(f"fastagent exec_command failed: {e}"))

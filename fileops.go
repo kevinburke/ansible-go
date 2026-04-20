@@ -21,6 +21,16 @@ func (s *Server) handleStat(params json.RawMessage) (any, error) {
 	if err := json.Unmarshal(params, &p); err != nil {
 		return nil, fmt.Errorf("unmarshal StatParams: %w", err)
 	}
+	// Stat running as the agent's uid (typically root) could leak the
+	// existence or metadata of files the BecomeUser couldn't see. We
+	// should support this at some point — probably by stat'ing from a
+	// helper subprocess that has dropped to BecomeUser — but we
+	// haven't built that yet. Until then, refuse rather than silently
+	// upgrade permissions. Callers fall back to `stat` via the Exec
+	// RPC, which does support BecomeUser.
+	if p.BecomeUser != "" {
+		return nil, fmt.Errorf("stat: BecomeUser is not yet implemented (use Exec with `stat`/`test` to run as a specific user)")
+	}
 
 	statFn := os.Lstat
 	if p.Follow {
@@ -76,6 +86,13 @@ func (s *Server) handleReadFile(params json.RawMessage) (any, error) {
 	var p ReadFileParams
 	if err := json.Unmarshal(params, &p); err != nil {
 		return nil, fmt.Errorf("unmarshal ReadFileParams: %w", err)
+	}
+	// Same rationale as Stat: reading as the agent's uid could expose
+	// file contents BecomeUser wouldn't have read access to. We should
+	// support this eventually (likely via a helper subprocess that
+	// drops to BecomeUser), but haven't built it yet.
+	if p.BecomeUser != "" {
+		return nil, fmt.Errorf("read_file: BecomeUser is not yet implemented (use Exec with `cat` to read as a specific user)")
 	}
 
 	data, err := os.ReadFile(p.Path)

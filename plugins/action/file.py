@@ -43,6 +43,20 @@ class ActionModule(ActionBase):
 
         self._connection._connect()
 
+        # The file override uses Stat RPCs internally, which the agent
+        # rejects when running as root on behalf of a become_user
+        # (see plugins/action/stat.py for the rationale). Additionally,
+        # running the File RPC as root would create files owned by
+        # root, not by the become_user, diverging from the builtin
+        # module's semantics. Fall back for become tasks.
+        if getattr(self._connection, "_become_user", None) is not None:
+            return merge_hash(
+                result,
+                self._execute_module(
+                    module_name="ansible.builtin.file", task_vars=task_vars
+                ),
+            )
+
         args = self._task.args
         path = args.get("path") or args.get("dest") or args.get("name")
         state = args.get("state")

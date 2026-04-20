@@ -43,24 +43,60 @@ func (s *Server) handleExec(params json.RawMessage) (any, error) {
 		defer cancel()
 	}
 
-	var cmd *exec.Cmd
-	if p.UseShell {
+	// Build the final argv. This mirrors roughly what ansible's classic
+	// SSH path does: resolve the command (either as an argv or via
+	// `/bin/sh -c` when use_shell is set), then wrap it with
+	// `sudo --user <user>` when a become_user is requested. The
+	// difference is that ansible builds the wrapped command on the
+	// controller and ships it over SSH, whereas we build it here on the
+	// target after receiving the Exec RPC.
+	//
+	// Resolve UseShell/Argv/CmdString first, then (if BecomeUser is
+	// set) wrap the result with sudo so the invocation runs as that
+	// user. The flags are:
+	//   --set-home        set HOME to the target user's home directory,
+	//                     matching ansible's classic become path.
+	//   --non-interactive fail rather than prompt for a password. A
+	//                     prompt would deadlock the RPC; the caller is
+	//                     expected to ensure the agent has passwordless
+	//                     root-level sudo (true whenever ansible
+	//                     invoked us with `become: true`).
+	//   --user <user>     run as <user>.
+	//   --                end of sudo options; everything after is the
+	//                     command argv, so a command that starts with
+	//                     `-` isn't mis-parsed as a sudo flag.
+	var finalArgv []string
+	switch {
+	case p.UseShell:
 		shellCmd := p.CmdString
 		if shellCmd == "" && len(p.Argv) > 0 {
 			shellCmd = strings.Join(p.Argv, " ")
 		}
-		cmd = exec.CommandContext(ctx, "/bin/sh", "-c", shellCmd)
-	} else if len(p.Argv) > 0 {
-		cmd = exec.CommandContext(ctx, p.Argv[0], p.Argv[1:]...)
-	} else if p.CmdString != "" {
+		finalArgv = []string{"/bin/sh", "-c", shellCmd}
+	case len(p.Argv) > 0:
+		finalArgv = p.Argv
+	case p.CmdString != "":
 		parts := strings.Fields(p.CmdString)
 		if len(parts) == 0 {
 			return nil, fmt.Errorf("empty command string")
 		}
-		cmd = exec.CommandContext(ctx, parts[0], parts[1:]...)
-	} else {
+		finalArgv = parts
+	default:
 		return nil, fmt.Errorf("no command specified: set argv or cmd_string")
 	}
+	if p.BecomeUser != "" {
+		finalArgv = append(
+			[]string{
+				"sudo",
+				"--set-home",
+				"--non-interactive",
+				"--user", p.BecomeUser,
+				"--",
+			},
+			finalArgv...,
+		)
+	}
+	cmd := exec.CommandContext(ctx, finalArgv[0], finalArgv[1:]...)
 
 	if p.Cwd != "" {
 		cmd.Dir = p.Cwd

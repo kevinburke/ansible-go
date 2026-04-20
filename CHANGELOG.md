@@ -2,6 +2,37 @@
 
 All notable changes to fastagent are documented in this file.
 
+## 0.5.5 — April 20, 2026
+
+### Bug fixes
+
+- **Become now runs inside the agent.** 0.5.4 fixed the "user not in
+  sudoers" regression by running the daemon as root, but that caused
+  a new one: `command`/`shell` tasks with `become_user: X` ran as
+  root on the remote side, which tripped git's CVE-2022-24765
+  "dubious ownership" check against any repo owned by `X`, and in
+  general diverged from ansible's semantics (files created owned by
+  root, commands seeing root's environment). The controller now
+  flips `play_context.become = False` to suppress ansible's own
+  `sudo -u X sh -c …` wrapper and passes `become_user` through the
+  `Exec` RPC instead. The agent wraps the command with
+  `sudo -H -n -u X --` at dispatch time, so the target command runs
+  as `X` with `X`'s HOME and environment — matching what SSH +
+  ansible's classic become path would do.
+
+  When `become_user` is `root` (the default), the daemon is already
+  root, so the sudo wrap is skipped entirely.
+
+### Security
+
+- **Stat and ReadFile RPCs reject `become_user`.** Running these as
+  root on behalf of a non-root `become_user` would be a permission
+  leak (root can see files the target user can't). The agent now
+  returns `unimplemented` if either RPC carries a `become_user`, and
+  the corresponding `stat`/`file`/`copy` action overrides fall back
+  to the builtin module (which goes through ansible's normal become
+  path and runs as the target user) whenever `become_user` is set.
+
 ## 0.5.4 — April 20, 2026
 
 ### Bug fixes

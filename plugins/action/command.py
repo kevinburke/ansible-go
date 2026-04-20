@@ -139,6 +139,12 @@ class ActionModule(ActionBase):
 
         start = datetime.datetime.now()
 
+        # The action override bypasses Ansible's usual module pipeline,
+        # so the connection's become-wrap in exec_command doesn't apply.
+        # Pass become_user through the RPC instead, and the agent will
+        # sudo to that user for us.
+        become_user = getattr(self._connection, "_become_user", None)
+
         try:
             exec_result = self._connection._agent_client.exec(
                 argv=exec_argv,
@@ -148,6 +154,7 @@ class ActionModule(ActionBase):
                 stdin=stdin,
                 stdin_add_newline=stdin_add_newline,
                 strip_empty_ends=strip_empty_ends,
+                become_user=become_user,
             )
         except Exception as e:
             r["rc"] = 1

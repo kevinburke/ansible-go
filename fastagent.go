@@ -5,7 +5,7 @@ package fastagent
 import "encoding/json"
 
 // Version is the agent version. Bump this when the protocol or behavior changes.
-const Version = "0.5.4"
+const Version = "0.5.5"
 
 // Request is a JSON-RPC request from the controller.
 type Request struct {
@@ -39,6 +39,11 @@ type HelloResult struct {
 }
 
 // ExecParams describes a command to execute.
+//
+// BecomeUser, if set, asks the agent to run the command as that user.
+// The agent wraps the invocation with `sudo -H -n -u <BecomeUser> --`;
+// this only works when the agent itself runs as root, which is the
+// case whenever Ansible's `become: true` is in effect.
 type ExecParams struct {
 	Argv            []string          `json:"argv,omitempty"`
 	CmdString       string            `json:"cmd_string,omitempty"`
@@ -51,6 +56,7 @@ type ExecParams struct {
 	Removes         string            `json:"removes,omitempty"`
 	StdinAddNewline *bool             `json:"stdin_add_newline,omitempty"`
 	StripEmptyEnds  *bool             `json:"strip_empty_ends,omitempty"`
+	BecomeUser      string            `json:"become_user,omitempty"`
 }
 
 // ExecResult is the result of command execution.
@@ -64,10 +70,20 @@ type ExecResult struct {
 }
 
 // StatParams requests file status information.
+//
+// BecomeUser is accepted on the wire but not yet implemented: stat
+// runs as the agent's uid, which could leak file existence or
+// metadata that BecomeUser wouldn't otherwise be able to see. We
+// should add it at some point (likely by dropping privileges in a
+// helper subprocess), but for now if BecomeUser is set the agent
+// returns an error rather than silently running as root, and
+// callers fall back to running `stat` through the Exec RPC (which
+// does support BecomeUser).
 type StatParams struct {
-	Path     string `json:"path"`
-	Follow   bool   `json:"follow,omitempty"`
-	Checksum bool   `json:"checksum,omitempty"`
+	Path       string `json:"path"`
+	Follow     bool   `json:"follow,omitempty"`
+	Checksum   bool   `json:"checksum,omitempty"`
+	BecomeUser string `json:"become_user,omitempty"`
 }
 
 // StatResult contains file status information.
@@ -87,8 +103,12 @@ type StatResult struct {
 }
 
 // ReadFileParams requests file content.
+//
+// BecomeUser is accepted but not yet implemented; see StatParams
+// for the rationale and the path to supporting it later.
 type ReadFileParams struct {
-	Path string `json:"path"`
+	Path       string `json:"path"`
+	BecomeUser string `json:"become_user,omitempty"`
 }
 
 // ReadFileResult contains the file content, base64-encoded.
