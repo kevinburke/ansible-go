@@ -2,7 +2,24 @@
 
 All notable changes to fastagent are documented in this file.
 
-## 0.5.0
+## 0.5.1 — April 20, 2026
+
+### Bug fixes
+
+- **`file` action: infer `state=directory` for existing directories.** When
+  a task omits `state` and the target path already exists as a directory,
+  fastagent now matches `ansible.builtin.file`'s documented default and
+  treats it as `state=directory`. Previously, fastagent defaulted to
+  `state=file`, causing tasks that only set `mode`, `owner`, or `group` on
+  an existing directory to fail. The inference logic was extracted into
+  `plugins/module_utils/file_state.py` and covered by a new unit test suite
+  in `tests/test_file_action.py`.
+
+### Documentation
+
+- **README: added one-shot install snippet for fastagent setup.**
+
+## 0.5.0 — April 19, 2026
 
 ### New features
 
@@ -70,7 +87,7 @@ All notable changes to fastagent are documented in this file.
   assumed the legacy resolution path that the collection migration
   had broken.
 
-## 0.4.0
+## 0.4.0 — April 16, 2026
 
 ### Bug fixes
 
