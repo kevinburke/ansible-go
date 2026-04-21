@@ -210,7 +210,6 @@ def _bare_connection() -> fastagent_plugin.Connection:
     conn._connected = False
     conn.become = None
     conn._use_become = False
-    conn._become_user = None
     return conn
 
 
@@ -305,6 +304,10 @@ class TestSetBecomePlugin(unittest.TestCase):
     self.become as None to suppress the redundant wrap. Without this,
     non-sudoer become_users hit "<user> is not in the sudoers file"
     because the inner sudo runs as the target user.
+
+    The actual become_user is *not* captured off the plugin here —
+    see set_become_plugin for the explanation. These tests only
+    verify the `_use_become` flag and `self.become` state.
     """
 
     def test_sudo_plugin_is_swallowed(self) -> None:
@@ -316,25 +319,24 @@ class TestSetBecomePlugin(unittest.TestCase):
             "self.become must stay None so ActionBase doesn't wrap the command",
         )
         self.assertTrue(conn._use_become)
-        self.assertEqual(conn._become_user, "returns")
 
-    def test_sudo_to_root_records_no_wrap_needed(self) -> None:
+    def test_sudo_to_root_is_still_use_become(self) -> None:
+        # Even when the target is root, _use_become must flip so the
+        # connection picks the root-daemon socket path. The "skip the
+        # sudo wrap" optimization for become_user=root is decided at
+        # exec_command time from play_context.become_user, not here.
         conn = _bare_connection()
         plugin = _FakeBecomePlugin("sudo", {"become_user": "root"})
         conn.set_become_plugin(plugin)
         self.assertIsNone(conn.become)
         self.assertTrue(conn._use_become)
-        # become_user=root → no agent-side sudo wrap needed (daemon is root).
-        self.assertIsNone(conn._become_user)
 
     def test_none_plugin_clears_state(self) -> None:
         conn = _bare_connection()
         conn._use_become = True
-        conn._become_user = "returns"
         conn.set_become_plugin(None)
         self.assertIsNone(conn.become)
         self.assertFalse(conn._use_become)
-        self.assertIsNone(conn._become_user)
 
     def test_unsupported_method_falls_back_to_ansible(self) -> None:
         conn = _bare_connection()
@@ -343,7 +345,77 @@ class TestSetBecomePlugin(unittest.TestCase):
         # Ansible's own wrap handles non-sudo methods.
         self.assertIs(conn.become, plugin)
         self.assertFalse(conn._use_become)
-        self.assertIsNone(conn._become_user)
+
+
+class _RecordingAgentClient:
+    """Captures the kwargs passed to exec() for assertion in tests."""
+
+    def __init__(self):
+        self.last_kwargs: dict | None = None
+
+    def exec(self, **kwargs):
+        self.last_kwargs = kwargs
+        return {"rc": 0, "stdout": "", "stderr": ""}
+
+
+class _FakePlayContext:
+    def __init__(self, become_user: str | None):
+        self.become_user = become_user
+
+
+@unittest.skipIf(
+    _FASTAGENT_IMPORT_ERROR is not None,
+    "ansible is required to run connection plugin tests",
+)
+class TestExecCommandBecomeUser(unittest.TestCase):
+    """Regression tests for where become_user is sourced at exec time.
+
+    A previous iteration read it off `plugin.get_option("become_user")`
+    during set_become_plugin, which returned the default "root" because
+    ansible only populates plugin options when `connection.become is
+    not None` — and we deliberately keep it None to suppress the
+    ActionBase wrap. The resulting command ran as root on the remote,
+    which git rejected with `dubious ownership` on app-user-owned
+    repos. exec_command must instead read the templated value from
+    `self._play_context.become_user`.
+    """
+
+    def _prepare(self, become_user, *, use_become=True):
+        conn = _bare_connection()
+        conn._use_become = use_become
+        conn._play_context = _FakePlayContext(become_user)
+        client = _RecordingAgentClient()
+        conn._agent_client = client
+        # super().exec_command() checks self._connected.
+        conn._connected = True
+        # The connection base class's exec_command reads _play_context
+        # for logging; give it a get_option that returns a sensible
+        # remote_user for the sudoable=False branch.
+        conn.get_option = lambda key, *a, **kw: "kevin" if key == "remote_user" else None
+        return conn, client
+
+    def test_templated_become_user_reaches_agent(self) -> None:
+        conn, client = self._prepare("returns")
+        conn.exec_command("echo hi")
+        self.assertEqual(client.last_kwargs["become_user"], "returns")
+
+    def test_root_become_user_skips_wrap(self) -> None:
+        # Daemon already runs as root; no point sudo-wrapping to root.
+        conn, client = self._prepare("root")
+        conn.exec_command("echo hi")
+        self.assertIsNone(client.last_kwargs["become_user"])
+
+    def test_not_using_become_sends_none(self) -> None:
+        conn, client = self._prepare("returns", use_become=False)
+        conn.exec_command("echo hi")
+        self.assertIsNone(client.last_kwargs["become_user"])
+
+    def test_sudoable_false_drops_to_remote_user(self) -> None:
+        # Connection plumbing (e.g. mkdir ~/.ansible/tmp) runs as the
+        # ssh user so files don't end up root-owned.
+        conn, client = self._prepare("returns")
+        conn.exec_command("mkdir -p /tmp/foo", sudoable=False)
+        self.assertEqual(client.last_kwargs["become_user"], "kevin")
 
 
 if __name__ == "__main__":

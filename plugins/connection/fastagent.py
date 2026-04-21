@@ -164,7 +164,7 @@ from ansible_collections.kevinburke.fastagent.plugins.module_utils.fastagent_cli
 display = Display()
 
 # Agent version must match the Go constant.
-AGENT_VERSION = "0.5.7"
+AGENT_VERSION = "0.5.8"
 
 class Connection(ConnectionBase):
     """fastagent connection plugin."""
@@ -179,17 +179,11 @@ class Connection(ConnectionBase):
         super().__init__(*args, **kwargs)
         self._socket: socket_mod.socket | None = None
         self._agent_client: FastAgentClient | None = None
-        # Set per-task in set_become_plugin(): the target user for
-        # Ansible's become, or None if become is not active for this
-        # task. The connection passes this through to each RPC so the
-        # agent can run the command as that user.
-        self._become_user: str | None = None
         # Set per-task in set_become_plugin(): True if the task is run
-        # with become. Used to pick the versioned root socket path.
-        # _become_user alone isn't enough because we map
-        # become_user=root to None (the daemon is already root, no
-        # sudo-wrap needed), but those tasks still need the root
-        # socket since the daemon runs as root.
+        # with become. The actual target user is read from
+        # self._play_context.become_user at exec_command time — see
+        # the comment on set_become_plugin for why the plugin itself
+        # isn't a reliable source here.
         self._use_become: bool = False
 
     def set_become_plugin(self, plugin) -> None:
@@ -208,16 +202,25 @@ class Connection(ConnectionBase):
         `become_user` to the Exec RPC, and the agent wraps with sudo at
         dispatch (running as root, so sudoers policy never applies).
         To suppress Ansible's redundant wrap, we leave `self.become` as
-        None regardless of what Ansible hands us, and capture the
-        target user directly from the plugin for our own use.
+        None regardless of what Ansible hands us, and read the target
+        user from `self._play_context.become_user` at exec_command time.
+
+        Why not read `become_user` off the plugin here? TaskExecutor
+        only populates `plugin.get_option('become_user')` via
+        `_set_plugin_options('become', ...)` when `connection.become is
+        not None` (task_executor.py:1085). Leaving `self.become = None`
+        is exactly what suppresses the ActionBase wrap — but it also
+        skips that populate step, so the plugin returns the *default*
+        become_user ("root") rather than the task's templated value.
+        Reading from play_context sidesteps this: ansible templates
+        `play_context.become_user` from the task (play_context.py:189)
+        before handing the play_context to the connection.
 
         Called once per task by ansible-core's TaskExecutor before the
-        action plugin runs, so `self._become_user` / `self._use_become`
-        are current by the time `exec_command` fires.
+        action plugin runs.
         """
         if plugin is None:
             self._use_become = False
-            self._become_user = None
             return
         if plugin.name != "sudo":
             # Unrecognized become method — let ansible handle it the
@@ -228,14 +231,8 @@ class Connection(ConnectionBase):
             )
             self.become = plugin
             self._use_become = False
-            self._become_user = None
             return
-        become_user = plugin.get_option("become_user") or "root"
         self._use_become = True
-        # The daemon runs as root when become is in effect, so there's
-        # no need to sudo-wrap when the target *is* root — that would
-        # be a wasteful no-op fork+exec per RPC.
-        self._become_user = become_user if become_user != "root" else None
         # Deliberately do NOT set self.become — that's what suppresses
         # the ActionBase wrap.
 
@@ -485,19 +482,34 @@ class Connection(ConnectionBase):
     ) -> tuple[int, bytes, bytes]:
         super().exec_command(cmd, in_data=in_data, sudoable=sudoable)
 
-        # Become is handled by the agent: if self._become_user is set
-        # (recorded in set_become_plugin), we ask the agent to run the
-        # command as that user via the Exec RPC's become_user field.
-        # Ansible's own ActionBase wrap is suppressed by our
-        # set_become_plugin override (which leaves self.become as
-        # None), so `cmd` here is the raw module invocation with no
-        # `sudo -u X` prefix.
+        # Become is handled by the agent: when set_become_plugin
+        # recorded that the task is using become, we ask the agent to
+        # run the command as the task's become_user via the Exec RPC's
+        # become_user field. Ansible's own ActionBase wrap is
+        # suppressed by our set_become_plugin override (which leaves
+        # self.become as None), so `cmd` here is the raw module
+        # invocation with no `sudo -u X` prefix.
+        #
+        # become_user is read from self._play_context.become_user,
+        # which ansible templates from the task before handing the
+        # play_context to the connection; the become plugin itself
+        # is not a reliable source here (see set_become_plugin for
+        # the full explanation).
+        #
+        # become_user=root is treated as "no wrap needed" because the
+        # daemon already runs as root when become is in effect;
+        # wrapping with `sudo -u root` would be a no-op fork+exec per
+        # RPC.
         #
         # sudoable=False is Ansible's hint that a particular command is
         # connection-layer plumbing (e.g. making an ~/.ansible/tmp dir)
         # and should run as the ssh user rather than the become target,
         # so files in the ssh user's home don't end up root-owned.
-        become_user = self._become_user
+        become_user: str | None = None
+        if self._use_become:
+            task_become_user = self._play_context.become_user or "root"
+            if task_become_user != "root":
+                become_user = task_become_user
         if become_user is not None and not sudoable:
             become_user = self.get_option("remote_user") or None
 

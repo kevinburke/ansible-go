@@ -2,6 +2,32 @@
 
 All notable changes to fastagent are documented in this file.
 
+## 0.5.8 — April 21, 2026
+
+### Bug fixes
+
+- **Read `become_user` from play_context, not the swallowed plugin.**
+  0.5.7's `set_become_plugin` override captured the target user via
+  `plugin.get_option("become_user")` and stored it on the connection.
+  But ansible-core only populates those plugin options via
+  `_set_plugin_options('become', ...)` when `connection.become is not
+  None` (`task_executor.py:1085`) — and leaving `connection.become =
+  None` is exactly what suppresses the `ActionBase` wrap that 0.5.7
+  set out to avoid. So `get_option("become_user")` always returned
+  the sudo plugin's default (`"root"`), which our code then mapped
+  to "no wrap needed." Every become task ran as root.
+
+  That was visible as git's `detected dubious ownership in repository
+  at /opt/returns/data` when a root-run `git -C …` touched a
+  `returns`-owned repo — the same CVE-2022-24765 protection that
+  originally forced the 0.5.5 become rework.
+
+  Fixed by reading `become_user` from `self._play_context.become_user`
+  at `exec_command` time instead. Ansible templates that value from
+  the task (`play_context.py:189`) before handing the play_context to
+  the connection, so it reflects the task's actual `become_user`
+  regardless of what the swallowed plugin's options look like.
+
 ## 0.5.7 — April 20, 2026
 
 ### Bug fixes
