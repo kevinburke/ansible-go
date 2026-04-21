@@ -208,7 +208,24 @@ def _bare_connection() -> fastagent_plugin.Connection:
     conn._socket = None
     conn._agent_client = None
     conn._connected = False
+    conn.become = None
+    conn._use_become = False
+    conn._become_user = None
     return conn
+
+
+class _FakeBecomePlugin:
+    """Minimal stand-in for ansible-core's BecomeBase for testing.
+
+    `set_become_plugin` only touches `.name` and `.get_option(...)`.
+    """
+
+    def __init__(self, name: str, options: dict | None = None):
+        self.name = name
+        self._options = options or {}
+
+    def get_option(self, key, default=None):
+        return self._options.get(key, default)
 
 
 @unittest.skipIf(
@@ -272,6 +289,61 @@ class TestTryLocalSocket(unittest.TestCase):
             self.assertFalse(conn._try_local_socket("/fake/socket.sock", "test-host"))
         self.assertFalse(conn._connected)
         self.assertIsNone(conn._socket)
+
+
+@unittest.skipIf(
+    _FASTAGENT_IMPORT_ERROR is not None,
+    "ansible is required to run connection plugin tests",
+)
+class TestSetBecomePlugin(unittest.TestCase):
+    """Regression tests for the `self.become` swallowing behavior.
+
+    ActionBase._low_level_execute_command wraps module invocations
+    with `sudo -u <user> sh -c …` whenever `self._connection.become`
+    is truthy. The fastagent connection handles become itself via the
+    Exec RPC's become_user field, so set_become_plugin must leave
+    self.become as None to suppress the redundant wrap. Without this,
+    non-sudoer become_users hit "<user> is not in the sudoers file"
+    because the inner sudo runs as the target user.
+    """
+
+    def test_sudo_plugin_is_swallowed(self) -> None:
+        conn = _bare_connection()
+        plugin = _FakeBecomePlugin("sudo", {"become_user": "returns"})
+        conn.set_become_plugin(plugin)
+        self.assertIsNone(
+            conn.become,
+            "self.become must stay None so ActionBase doesn't wrap the command",
+        )
+        self.assertTrue(conn._use_become)
+        self.assertEqual(conn._become_user, "returns")
+
+    def test_sudo_to_root_records_no_wrap_needed(self) -> None:
+        conn = _bare_connection()
+        plugin = _FakeBecomePlugin("sudo", {"become_user": "root"})
+        conn.set_become_plugin(plugin)
+        self.assertIsNone(conn.become)
+        self.assertTrue(conn._use_become)
+        # become_user=root → no agent-side sudo wrap needed (daemon is root).
+        self.assertIsNone(conn._become_user)
+
+    def test_none_plugin_clears_state(self) -> None:
+        conn = _bare_connection()
+        conn._use_become = True
+        conn._become_user = "returns"
+        conn.set_become_plugin(None)
+        self.assertIsNone(conn.become)
+        self.assertFalse(conn._use_become)
+        self.assertIsNone(conn._become_user)
+
+    def test_unsupported_method_falls_back_to_ansible(self) -> None:
+        conn = _bare_connection()
+        plugin = _FakeBecomePlugin("su", {"become_user": "returns"})
+        conn.set_become_plugin(plugin)
+        # Ansible's own wrap handles non-sudo methods.
+        self.assertIs(conn.become, plugin)
+        self.assertFalse(conn._use_become)
+        self.assertIsNone(conn._become_user)
 
 
 if __name__ == "__main__":

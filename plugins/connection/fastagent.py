@@ -164,7 +164,7 @@ from ansible_collections.kevinburke.fastagent.plugins.module_utils.fastagent_cli
 display = Display()
 
 # Agent version must match the Go constant.
-AGENT_VERSION = "0.5.6"
+AGENT_VERSION = "0.5.7"
 
 class Connection(ConnectionBase):
     """fastagent connection plugin."""
@@ -179,64 +179,71 @@ class Connection(ConnectionBase):
         super().__init__(*args, **kwargs)
         self._socket: socket_mod.socket | None = None
         self._agent_client: FastAgentClient | None = None
-        # Set per-task in _refresh_become(): the target user for Ansible's
-        # become, or None if become is not active for this task. The
-        # connection passes this through to each RPC so the agent can run
-        # the command as that user. We take over become handling from
-        # Ansible (by flipping play_context.become to False after
-        # recording the user here) so the command isn't wrapped twice.
+        # Set per-task in set_become_plugin(): the target user for
+        # Ansible's become, or None if become is not active for this
+        # task. The connection passes this through to each RPC so the
+        # agent can run the command as that user.
         self._become_user: str | None = None
+        # Set per-task in set_become_plugin(): True if the task is run
+        # with become. Used to pick the versioned root socket path.
+        # _become_user alone isn't enough because we map
+        # become_user=root to None (the daemon is already root, no
+        # sudo-wrap needed), but those tasks still need the root
+        # socket since the daemon runs as root.
+        self._use_become: bool = False
 
-    def _refresh_become(self) -> tuple[bool, str]:
-        """Read become settings from the current task's play_context.
+    def set_become_plugin(self, plugin) -> None:
+        """Swallow Ansible's become plugin so it doesn't wrap commands.
 
-        Ansible rebuilds PlayContext per task, so this runs on every
-        _connect() — even when the underlying agent connection is
-        already up and we'd otherwise short-circuit.
+        Ansible's default `set_become_plugin` attaches the become plugin
+        to `self.become`, and `ActionBase._low_level_execute_command`
+        wraps every module invocation with `sudo -u <user> sh -c …`
+        whenever `self._connection.become` is truthy. That wrap runs
+        inside our agent's exec context — which is already root — and
+        tries to drop to the target user. Fine for sudoers, but for a
+        dedicated app user that isn't in `/etc/sudoers` (e.g. `returns`)
+        it fails with `<user> is not in the sudoers file`.
 
-        Returns (use_become, become_user_for_socket) where
-        become_user_for_socket is 'root' when become is active (the
-        daemon runs as root to sudo into arbitrary target users) and
-        unused otherwise.
+        Fastagent handles become itself: the connection passes
+        `become_user` to the Exec RPC, and the agent wraps with sudo at
+        dispatch (running as root, so sudoers policy never applies).
+        To suppress Ansible's redundant wrap, we leave `self.become` as
+        None regardless of what Ansible hands us, and capture the
+        target user directly from the plugin for our own use.
 
-        Side effect: records the target become_user on self for RPCs
-        to pick up, and flips self._play_context.become to False so
-        Ansible's ActionBase doesn't wrap commands with
-        `sudo -u <user>` on top of what we're already asking the
-        agent to do.
+        Called once per task by ansible-core's TaskExecutor before the
+        action plugin runs, so `self._become_user` / `self._use_become`
+        are current by the time `exec_command` fires.
         """
-        become = self._play_context.become
-        become_method = self._play_context.become_method
-        if not become:
+        if plugin is None:
+            self._use_become = False
             self._become_user = None
-            return False, "root"
-        if become_method not in (None, "sudo"):
+            return
+        if plugin.name != "sudo":
+            # Unrecognized become method — let ansible handle it the
+            # normal way. Agent-side sudo wrap only covers `sudo`.
             display.warning(
-                f"fastagent: unsupported become_method {become_method!r}, "
-                f"falling back to direct execution"
+                f"fastagent: unsupported become_method {plugin.name!r}, "
+                f"falling back to ansible's own become wrap"
             )
+            self.become = plugin
+            self._use_become = False
             self._become_user = None
-            return False, "root"
-
-        become_user = self._play_context.become_user or "root"
+            return
+        become_user = plugin.get_option("become_user") or "root"
+        self._use_become = True
         # The daemon runs as root when become is in effect, so there's
         # no need to sudo-wrap when the target *is* root — that would
         # be a wasteful no-op fork+exec per RPC.
         self._become_user = become_user if become_user != "root" else None
-        # Tell Ansible not to wrap the command — the agent will sudo on
-        # our behalf using the become_user we stored above (or just run
-        # as root directly, if become_user is root).
-        self._play_context.become = False
-        return True, "root"
+        # Deliberately do NOT set self.become — that's what suppresses
+        # the ActionBase wrap.
 
     def _connect(self) -> Connection:
-        # Read become settings for every task, not just the first one
-        # (play_context is rebuilt per task, so become_user can change
-        # between tasks on the same reused connection).
-        use_become, _ = self._refresh_become()
-
         if self._connected:
             return self
+
+        use_become = self._use_become
 
         host = self.get_option("host")
         user = self.get_option("remote_user")
@@ -479,11 +486,12 @@ class Connection(ConnectionBase):
         super().exec_command(cmd, in_data=in_data, sudoable=sudoable)
 
         # Become is handled by the agent: if self._become_user is set
-        # (recorded in _refresh_become), we ask the agent to run the
-        # command as that user via an RPC field. Ansible's own become-
-        # wrapping has been disabled by flipping play_context.become
-        # in _refresh_become, so `cmd` here is the raw module invocation
-        # with no `sudo -u X` prefix.
+        # (recorded in set_become_plugin), we ask the agent to run the
+        # command as that user via the Exec RPC's become_user field.
+        # Ansible's own ActionBase wrap is suppressed by our
+        # set_become_plugin override (which leaves self.become as
+        # None), so `cmd` here is the raw module invocation with no
+        # `sudo -u X` prefix.
         #
         # sudoable=False is Ansible's hint that a particular command is
         # connection-layer plumbing (e.g. making an ~/.ansible/tmp dir)

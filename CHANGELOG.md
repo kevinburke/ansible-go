@@ -2,6 +2,35 @@
 
 All notable changes to fastagent are documented in this file.
 
+## 0.5.7 — April 20, 2026
+
+### Bug fixes
+
+- **Suppress Ansible's redundant become wrap for every task, not just
+  action overrides.** 0.5.5 made the agent handle become itself, and
+  flipped `play_context.become = False` to stop Ansible from also
+  wrapping commands. That worked for our action-plugin overrides
+  (`file`, `copy`, `template`, ...) because those bypass
+  `ActionBase._low_level_execute_command`, but modules without an
+  override (e.g. `community.general.git_config`) still went through
+  `_low_level_execute_command`, which checks `self._connection.become`
+  — the *plugin object*, not the play_context flag. The ansible-side
+  wrap was therefore still firing for those tasks, producing a
+  `sudo -u returns sh -c …` outside our agent's own `sudo` wrap. On
+  hosts where the target user isn't in `/etc/sudoers` (e.g. the
+  dedicated `returns` app user) this failed with `returns is not in
+  the sudoers file`.
+
+  Fixed by overriding `Connection.set_become_plugin(plugin)` so we
+  never attach the plugin to `self.become`. We capture the target
+  user from `plugin.get_option("become_user")` for our own Exec RPC
+  and leave `self.become = None`, which suppresses the
+  `ActionBase._low_level_execute_command` wrap for every task
+  regardless of whether there's an action override. The non-sudo
+  become methods (`su`, `runas`, ...) still fall through to
+  Ansible's built-in wrap, since the agent only knows how to drive
+  `sudo`.
+
 ## 0.5.6 — April 20, 2026
 
 ### Bug fixes
