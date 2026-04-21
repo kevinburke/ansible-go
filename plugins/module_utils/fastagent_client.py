@@ -58,6 +58,24 @@ class FastAgentError(Exception):
         super().__init__(f"fastagent error {code}: {message}")
 
 
+class FastAgentVersionMismatch(Exception):
+    """Raised when the daemon's reported version differs from the controller's.
+
+    Go's JSON decoder silently drops unknown fields, so an older daemon
+    would accept RPCs that include new fields (e.g. BecomeUser added in
+    0.5.5) and just ignore them — leading to silent wrong behavior on
+    the remote side. Treat any version skew as a hard error so the
+    caller tears down and re-bootstraps with the matching daemon.
+    """
+
+    def __init__(self, expected: str, actual: str):
+        self.expected = expected
+        self.actual = actual
+        super().__init__(
+            f"fastagent daemon version mismatch: expected {expected}, got {actual}"
+        )
+
+
 class FastAgentClient:
     """JSON-RPC client for fastagent.
 
@@ -130,8 +148,17 @@ class FastAgentClient:
             return response.get("result", {})
 
     def hello(self, version: str = "0.1.0") -> dict:
-        """Send Hello handshake."""
-        return self.call("Hello", {"version": version})
+        """Send Hello handshake and verify the daemon's version matches.
+
+        Raises FastAgentVersionMismatch if the daemon reports a different
+        version. The caller is expected to tear down the connection and
+        bootstrap a fresh daemon at the matching version.
+        """
+        result = self.call("Hello", {"version": version})
+        daemon_version = result.get("version", "")
+        if daemon_version != version:
+            raise FastAgentVersionMismatch(version, daemon_version)
+        return result
 
     def exec(
         self,

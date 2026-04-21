@@ -10,7 +10,11 @@ import subprocess
 import tempfile
 import unittest
 
-from fastagent_client import FastAgentClient, FastAgentError
+from fastagent_client import (
+    FastAgentClient,
+    FastAgentError,
+    FastAgentVersionMismatch,
+)
 
 
 # Build once for all tests.
@@ -72,14 +76,34 @@ class AgentSession:
         return False
 
 
+def _get_agent_version():
+    """Read the agent version by running the binary with --version."""
+    result = subprocess.run(
+        [_get_agent_binary(), "--version"],
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    # Output is "fastagent <version>\n".
+    return result.stdout.strip().split()[-1]
+
+
 class TestHello(unittest.TestCase):
     def test_hello(self):
+        version = _get_agent_version()
         with AgentSession() as client:
-            result = client.hello("test")
-            self.assertIn("version", result)
+            result = client.hello(version)
+            self.assertEqual(result["version"], version)
             self.assertIn("capabilities", result)
             self.assertIsInstance(result["capabilities"], list)
             self.assertGreater(len(result["capabilities"]), 0)
+
+    def test_hello_version_mismatch(self):
+        with AgentSession() as client:
+            with self.assertRaises(FastAgentVersionMismatch) as cm:
+                client.hello("0.0.0-not-a-real-version")
+            self.assertEqual(cm.exception.expected, "0.0.0-not-a-real-version")
+            self.assertEqual(cm.exception.actual, _get_agent_version())
 
 
 class TestExec(unittest.TestCase):

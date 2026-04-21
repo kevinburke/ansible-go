@@ -2,6 +2,34 @@
 
 All notable changes to fastagent are documented in this file.
 
+## 0.5.6 — April 20, 2026
+
+### Bug fixes
+
+- **Detect controller/daemon version skew.** Go's JSON decoder
+  silently ignores unknown fields, so an older daemon that was still
+  running on a host would accept RPCs that include new fields (the
+  `become_user` field added in 0.5.5, for instance) and just drop
+  them — running the command as root instead of as the requested
+  user. Two defenses now make this impossible:
+
+  1. The version is baked into the socket path
+     (`/tmp/fastagent-root-{version}.sock` when become is in effect,
+     `/tmp/fastagent-{version}.sock` otherwise). A 0.5.6 controller
+     cannot reach a 0.5.5 daemon's socket, so `test -S <sock>` is an
+     accurate proxy for "a daemon of the right version is running."
+     The bootstrap path kills any fastagent daemon (any version) on
+     the host before starting a fresh one, so the old daemon doesn't
+     hang around consuming resources.
+
+  2. `FastAgentClient.hello()` now compares the daemon's returned
+     version against the expected version and raises
+     `FastAgentVersionMismatch` on skew. `_try_local_socket` treats
+     this like any other probe failure — the local socket is torn
+     down and the caller falls through to the bootstrap path. This
+     is belt-and-braces for cases where someone's hand-edited the
+     socket path or the paths otherwise collide.
+
 ## 0.5.5 — April 20, 2026
 
 ### Bug fixes

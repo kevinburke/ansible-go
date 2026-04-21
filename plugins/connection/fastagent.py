@@ -164,7 +164,7 @@ from ansible_collections.kevinburke.fastagent.plugins.module_utils.fastagent_cli
 display = Display()
 
 # Agent version must match the Go constant.
-AGENT_VERSION = "0.5.5"
+AGENT_VERSION = "0.5.6"
 
 class Connection(ConnectionBase):
     """fastagent connection plugin."""
@@ -250,12 +250,20 @@ class Connection(ConnectionBase):
         # non-become cases so a stale forwarding session from one mode
         # cannot be reused by the other (they point at different remote
         # sockets owned by different uids).
+        #
+        # The version is embedded in the socket path so a controller on
+        # version X never connects to a daemon on version Y. Without
+        # this, Go's JSON decoder silently drops unknown fields, so an
+        # older daemon would accept RPCs for new features (e.g. become
+        # handling added in 0.5.5) and run them as if the new fields
+        # hadn't been set. A per-version path makes `test -S <sock>`
+        # an accurate proxy for "correct-version daemon is running".
         if use_become:
-            remote_socket = "/tmp/fastagent-root.sock"
-            local_socket = f"/tmp/fastagent-local-{host}-root.sock"
+            remote_socket = f"/tmp/fastagent-root-{AGENT_VERSION}.sock"
+            local_socket = f"/tmp/fastagent-local-{host}-root-{AGENT_VERSION}.sock"
         else:
-            remote_socket = "/tmp/fastagent.sock"
-            local_socket = f"/tmp/fastagent-local-{host}.sock"
+            remote_socket = f"/tmp/fastagent-{AGENT_VERSION}.sock"
+            local_socket = f"/tmp/fastagent-local-{host}-{AGENT_VERSION}.sock"
 
         # Fast path: try connecting to the local forwarding socket directly.
         # This is a local Unix socket connect (~1ms), no SSH involved.
@@ -284,8 +292,10 @@ class Connection(ConnectionBase):
         A stale SSH -L forwarder pointing at a dead remote socket will accept
         local connects but the first RPC read will see EOF. So in addition to
         connecting, we send a Hello and only declare success once we get a
-        valid response back. If any step fails we tear down the socket so the
-        caller falls through to the bootstrap path.
+        valid response back with a matching version. If any step fails
+        (including version mismatch) we tear down the socket so the caller
+        falls through to the bootstrap path, which kills any stale daemon
+        and starts a fresh one at the right version.
         """
         if not os.path.exists(local_socket):
             return False

@@ -117,11 +117,21 @@ class _PipeEchoServer:
                 req_line = self._server_r.readline()
                 if not req_line:
                     return
-                req_id = json.loads(req_line).get("id", 0)
+                req = json.loads(req_line)
+                req_id = req.get("id", 0)
                 count += 1
                 if count > 1:
                     time.sleep(self._delay_s)
-                resp = json.dumps({"id": req_id, "result": {"ok": True}}) + "\n"
+                # Hello expects the daemon to echo the controller's version
+                # back. Any other method just gets the canned {"ok": True}
+                # the tests assert against.
+                if req.get("method") == "Hello":
+                    params = req.get("params") or {}
+                    result = {"version": params.get("version", ""),
+                              "capabilities": []}
+                else:
+                    result = {"ok": True}
+                resp = json.dumps({"id": req_id, "result": result}) + "\n"
                 self._server_w.write(resp.encode("utf-8"))
                 self._server_w.flush()
         except Exception:
