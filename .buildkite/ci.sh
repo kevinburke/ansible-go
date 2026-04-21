@@ -78,11 +78,11 @@ run_python_test() {
   (cd "${REPO_ROOT}/plugins/connection" && \
     python3 -m unittest fastagent_test -v)
 
-  # 3. Collection layout tests: build the tarball, install it to a temp
-  #    ANSIBLE_COLLECTIONS_PATH, and verify ansible-doc + module_utils
-  #    imports resolve through the installed collection.
+  # 3. Everything under tests/ (collection layout, action-plugin helpers,
+  #    etc.). Discover picks up any new tests/test_*.py automatically so a
+  #    future test file can't be silently skipped by CI.
   (cd "${REPO_ROOT}" && \
-    python3 -m unittest tests.test_collection_layout -v)
+    python3 -m unittest discover -v -s tests -t . -p 'test_*.py')
 }
 
 run_check_versions() {
