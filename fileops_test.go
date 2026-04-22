@@ -262,6 +262,87 @@ func TestFileDirectory(t *testing.T) {
 	}
 }
 
+// TestFileDirectoryAppliesModeToNewIntermediates mirrors stock ansible's
+// ensure_directory: every intermediate the task creates receives the task's
+// owner/group/mode (via set_fs_attributes_if_different). Without this, a task
+// like `file: path=/home/svc/etc/foo/env owner=svc mode=0750` would leave
+// /home/svc/etc/foo owned by the agent's uid (typically root), breaking
+// access by the svc user.
+func TestFileDirectoryAppliesModeToNewIntermediates(t *testing.T) {
+	s := newTestServer()
+
+	tmp := t.TempDir()
+	a := filepath.Join(tmp, "a")
+	b := filepath.Join(a, "b")
+	c := filepath.Join(b, "c")
+
+	resp := rpcCall(t, s, "File", FileParams{
+		Path:  c,
+		State: "directory",
+		Mode:  "0700",
+	})
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+
+	for _, path := range []string{a, b, c} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat %s: %v", path, err)
+		}
+		if got := info.Mode().Perm(); got != 0o700 {
+			t.Errorf("%s: got mode %#o, want %#o", path, got, 0o700)
+		}
+	}
+}
+
+// TestFileDirectoryLeavesExistingAncestorsAlone mirrors ansible's behavior:
+// set_fs_attributes_if_different is only called inside the `if not
+// os.path.exists(b_curpath):` branch, so ancestors that already exist keep
+// their current mode/owner even if the task has a different mode set.
+func TestFileDirectoryLeavesExistingAncestorsAlone(t *testing.T) {
+	s := newTestServer()
+
+	tmp := t.TempDir()
+	a := filepath.Join(tmp, "a")
+	b := filepath.Join(a, "b")
+	c := filepath.Join(b, "c")
+
+	if err := os.Mkdir(a, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(a, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := rpcCall(t, s, "File", FileParams{
+		Path:  c,
+		State: "directory",
+		Mode:  "0700",
+	})
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+
+	cases := []struct {
+		path string
+		want os.FileMode
+	}{
+		{a, 0o755}, // pre-existing, untouched
+		{b, 0o700}, // newly created, task mode applied
+		{c, 0o700}, // leaf, task mode applied
+	}
+	for _, tc := range cases {
+		info, err := os.Stat(tc.path)
+		if err != nil {
+			t.Fatalf("stat %s: %v", tc.path, err)
+		}
+		if got := info.Mode().Perm(); got != tc.want {
+			t.Errorf("%s: got mode %#o, want %#o", tc.path, got, tc.want)
+		}
+	}
+}
+
 func TestFileAbsent(t *testing.T) {
 	s := newTestServer()
 

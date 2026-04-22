@@ -12,6 +12,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -218,32 +219,65 @@ func (s *Server) handleFile(params json.RawMessage) (any, error) {
 }
 
 func (s *Server) handleFileDirectory(p FileParams) (any, error) {
-	changed := false
-	info, err := os.Stat(p.Path)
-	if os.IsNotExist(err) {
-		perm := fs.FileMode(0o755)
-		if p.Mode != "" {
-			if m, err := strconv.ParseUint(p.Mode, 8, 32); err == nil {
-				perm = fs.FileMode(m)
-			}
-		}
-		if err := os.MkdirAll(p.Path, perm); err != nil {
-			return nil, fmt.Errorf("mkdir %s: %w", p.Path, err)
-		}
-		changed = true
-	} else if err != nil {
-		return nil, fmt.Errorf("stat %s: %w", p.Path, err)
-	} else if !info.IsDir() {
-		return nil, fmt.Errorf("%s exists but is not a directory", p.Path)
-	}
-
-	ch, err := applyOwnershipAndMode(p.Path, p.Owner, p.Group, p.Mode)
+	changed, err := ensureDirectoryAnsible(p.Path, p.Owner, p.Group, p.Mode)
 	if err != nil {
 		return nil, err
 	}
-	changed = changed || ch
-
 	return FileResult{Changed: changed, Path: p.Path, State: "directory"}, nil
+}
+
+// ensureDirectoryAnsible creates path and any missing ancestors, applying
+// owner/group/mode to each ancestor it actually creates plus the leaf.
+// Ancestors that already exist are left untouched. This matches stock
+// ansible's file module; see ensure_directory() in
+// https://github.com/ansible/ansible/blob/devel/lib/ansible/modules/file.py
+// (the per-segment `if not os.path.exists(b_curpath):` block that calls
+// os.mkdir followed by set_fs_attributes_if_different).
+//
+// The earlier implementation used os.MkdirAll with a fixed 0755, which left
+// intermediates owned by the agent's uid (typically root) instead of the
+// task's owner. Tasks like `file: path=/home/homeauto/etc/foo/env
+// owner=homeauto mode=0750` would silently create /home/homeauto/etc/foo as
+// root:root 0755, breaking any subsequent access by the homeauto user.
+func ensureDirectoryAnsible(path, owner, group, mode string) (bool, error) {
+	info, err := os.Stat(path)
+	if err == nil {
+		if !info.IsDir() {
+			return false, fmt.Errorf("%s exists but is not a directory", path)
+		}
+		// Path already exists: ansible only touches the leaf's attrs,
+		// not any ancestor's.
+		return applyOwnershipAndMode(path, owner, group, mode)
+	}
+	if !os.IsNotExist(err) {
+		return false, fmt.Errorf("stat %s: %w", path, err)
+	}
+
+	segments := strings.Split(strings.Trim(path, "/"), "/")
+	curpath := ""
+	if filepath.IsAbs(path) {
+		curpath = "/"
+	}
+	changed := false
+	for _, seg := range segments {
+		if seg == "" {
+			continue
+		}
+		curpath = filepath.Join(curpath, seg)
+		if _, err := os.Stat(curpath); err == nil {
+			continue
+		} else if !os.IsNotExist(err) {
+			return changed, fmt.Errorf("stat %s: %w", curpath, err)
+		}
+		if err := os.Mkdir(curpath, 0o755); err != nil {
+			return changed, fmt.Errorf("mkdir %s: %w", curpath, err)
+		}
+		changed = true
+		if _, err := applyOwnershipAndMode(curpath, owner, group, mode); err != nil {
+			return changed, err
+		}
+	}
+	return changed, nil
 }
 
 func (s *Server) handleFileFile(p FileParams) (any, error) {
