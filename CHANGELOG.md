@@ -2,6 +2,29 @@
 
 All notable changes to fastagent are documented in this file.
 
+## 0.6.0 — April 22, 2026
+
+### Bug fixes
+
+- **Apply task attrs to newly-created intermediate directories,
+  matching ansible.** A `file:` task that created a deep directory
+  tree with `owner`, `group`, or a restrictive `mode` only applied
+  those attributes to the leaf directory. Any missing parents were
+  still created by `os.MkdirAll` as `0755 root:root`, which diverged
+  from ansible's `ensure_directory()` behavior and could break
+  workloads that needed to traverse those intermediates as the target
+  user. One concrete failure mode was rootless podman bind mounts
+  under a freshly-created app-owned tree returning `statfs ...
+  permission denied` because the parent directories stayed root-owned.
+
+  Fixed by replacing the `MkdirAll` path with an
+  ansible-matching directory walk that creates each missing segment
+  individually and applies the task's owner/group/mode to every new
+  intermediate. Existing ancestors are left untouched, again matching
+  ansible's semantics. Regression coverage now checks both sides of
+  that behavior: new intermediates receive the requested attributes,
+  while pre-existing ancestors keep their current permissions.
+
 ## 0.5.9 — April 21, 2026
 
 ### Bug fixes

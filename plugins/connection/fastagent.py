@@ -164,7 +164,7 @@ from ansible_collections.kevinburke.fastagent.plugins.module_utils.fastagent_cli
 display = Display()
 
 # Agent version must match the Go constant.
-AGENT_VERSION = "0.5.9"
+AGENT_VERSION = "0.6.0"
 
 class Connection(ConnectionBase):
     """fastagent connection plugin."""
