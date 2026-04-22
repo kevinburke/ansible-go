@@ -96,8 +96,18 @@ class ActionModule(ActionBase):
         if stat.S_ISDIR(source_stat.st_mode):
             return self._run_builtin_copy(None, task_vars)
 
-        # Simple file copy fast path.
-        with open(source, "rb") as f:
+        # Resolve the source through DataLoader.get_real_file so that
+        # vault-encrypted files are decrypted into a temp file before we
+        # read them. Reading `source` directly would land raw vault
+        # ciphertext on the remote, silently corrupting any secret the
+        # playbook was trying to deploy.  See get_real_file() in
+        # https://github.com/ansible/ansible/blob/devel/lib/ansible/parsing/dataloader.py
+        try:
+            real_source = self._loader.get_real_file(source, decrypt=True)
+        except Exception:
+            return self._run_builtin_copy(None, task_vars)
+
+        with open(real_source, "rb") as f:
             data = f.read()
 
         return self._fastagent_copy_data(data, dest, args, task_vars)

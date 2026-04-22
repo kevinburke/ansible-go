@@ -2,6 +2,30 @@
 
 All notable changes to fastagent are documented in this file.
 
+## 0.6.1 — April 22, 2026
+
+### Bug fixes
+
+- **Decrypt vault-encrypted source files in the copy fast path.** The
+  fastagent copy action override read `src:` files directly with
+  `open(source, "rb")`, bypassing ansible's normal vault handling. A
+  task like `copy: src=garage-control/RATGDO_KEY dest=...` whose source
+  was an `$ANSIBLE_VAULT;1.1;AES256` file therefore landed raw vault
+  ciphertext on the remote host instead of the decrypted secret. Any
+  consumer of the file (systemd `EnvironmentFile=`, an app reading the
+  token, etc.) saw the ciphertext and malfunctioned; the secret was also
+  left in plaintext ciphertext-form on disk, which is not what the
+  playbook author asked for.
+
+  Fixed by routing the source path through
+  `self._loader.get_real_file(source, decrypt=True)`, matching how
+  ansible's builtin copy action resolves the source. Unencrypted files
+  are unaffected (the loader returns their original path); encrypted
+  files are decrypted into a managed temp file before we read. If any
+  host was deployed with 0.6.0 or earlier, check any file produced by a
+  `copy:` task whose source was a vault file, and re-run the playbook
+  with 0.6.1 to overwrite it.
+
 ## 0.6.0 — April 22, 2026
 
 ### Bug fixes
