@@ -49,7 +49,7 @@ class ActionModule(ActionBase):
         # running the File RPC as root would create files owned by
         # root, not by the become_user, diverging from the builtin
         # module's semantics. Fall back for become tasks.
-        if getattr(self._connection, "_become_user", None) is not None:
+        if self._connection.get_become_user() is not None:
             return merge_hash(
                 result,
                 self._execute_module(

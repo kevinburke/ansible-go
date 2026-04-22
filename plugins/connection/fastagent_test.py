@@ -418,5 +418,45 @@ class TestExecCommandBecomeUser(unittest.TestCase):
         self.assertEqual(client.last_kwargs["become_user"], "kevin")
 
 
+@unittest.skipIf(
+    _FASTAGENT_IMPORT_ERROR is not None,
+    "ansible is required to run connection plugin tests",
+)
+class TestGetBecomeUser(unittest.TestCase):
+    """Direct coverage for the helper that action-plugin overrides call.
+
+    The command/copy/file/stat action overrides bypass exec_command and
+    hit the agent client directly, so they need the same resolution as
+    exec_command but can't share its body. They funnel through
+    get_become_user() instead. A previous iteration read a removed
+    private attribute (`_become_user`) via getattr-with-default and
+    silently returned None — commands then ran as root on the remote.
+    """
+
+    def _conn(self, become_user, *, use_become=True):
+        conn = _bare_connection()
+        conn._use_become = use_become
+        conn._play_context = _FakePlayContext(become_user)
+        return conn
+
+    def test_returns_templated_user(self) -> None:
+        self.assertEqual(self._conn("returns").get_become_user(), "returns")
+
+    def test_root_becomes_none(self) -> None:
+        # Daemon already runs as root under become; sudo -u root is a
+        # needless fork per RPC.
+        self.assertIsNone(self._conn("root").get_become_user())
+
+    def test_unset_defaults_to_root_and_returns_none(self) -> None:
+        # play_context.become_user can be None when the task didn't
+        # specify one; ansible-core treats that as "root".
+        self.assertIsNone(self._conn(None).get_become_user())
+
+    def test_not_using_become_returns_none(self) -> None:
+        self.assertIsNone(
+            self._conn("returns", use_become=False).get_become_user()
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

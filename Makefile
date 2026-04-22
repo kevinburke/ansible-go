@@ -50,6 +50,7 @@ test:
 		plugins.connection.fastagent_test \
 		plugins.module_utils.fastagent_client_test \
 		tests.test_collection_layout \
+		tests.test_command_action \
 		tests.test_file_action
 
 clean:

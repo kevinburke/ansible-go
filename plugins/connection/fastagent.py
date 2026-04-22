@@ -164,7 +164,7 @@ from ansible_collections.kevinburke.fastagent.plugins.module_utils.fastagent_cli
 display = Display()
 
 # Agent version must match the Go constant.
-AGENT_VERSION = "0.5.8"
+AGENT_VERSION = "0.5.9"
 
 class Connection(ConnectionBase):
     """fastagent connection plugin."""
@@ -235,6 +235,25 @@ class Connection(ConnectionBase):
         self._use_become = True
         # Deliberately do NOT set self.become — that's what suppresses
         # the ActionBase wrap.
+
+    def get_become_user(self) -> str | None:
+        """Return the task's effective non-root become_user, or None.
+
+        Single source of truth for "which user should the agent's Exec
+        RPC run this task as?" Used by exec_command and by action plugin
+        overrides (command, copy, file, stat) that talk to the agent
+        directly and so can't rely on the exec_command code path.
+
+        Returns None when become is off, or when become_user is root
+        (the daemon already runs as root under become, so sudo -u root
+        would be a no-op fork+exec per RPC).
+        """
+        if not self._use_become:
+            return None
+        become_user = self._play_context.become_user or "root"
+        if become_user == "root":
+            return None
+        return become_user
 
     def _connect(self) -> Connection:
         if self._connected:
@@ -505,11 +524,7 @@ class Connection(ConnectionBase):
         # connection-layer plumbing (e.g. making an ~/.ansible/tmp dir)
         # and should run as the ssh user rather than the become target,
         # so files in the ssh user's home don't end up root-owned.
-        become_user: str | None = None
-        if self._use_become:
-            task_become_user = self._play_context.become_user or "root"
-            if task_become_user != "root":
-                become_user = task_become_user
+        become_user = self.get_become_user()
         if become_user is not None and not sudoable:
             become_user = self.get_option("remote_user") or None
 
