@@ -39,7 +39,7 @@ class ActionModule(ActionBase):
         # a become target. Fall back to the builtin module, which goes
         # through Ansible's normal become path and runs stat as the
         # target user.
-        if getattr(self._connection, "_become_user", None) is not None:
+        if self._connection.get_become_user() is not None:
             return merge_hash(
                 result,
                 self._execute_module(

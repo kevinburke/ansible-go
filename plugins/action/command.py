@@ -143,7 +143,7 @@ class ActionModule(ActionBase):
         # so the connection's become-wrap in exec_command doesn't apply.
         # Pass become_user through the RPC instead, and the agent will
         # sudo to that user for us.
-        become_user = getattr(self._connection, "_become_user", None)
+        become_user = self._connection.get_become_user()
 
         try:
             exec_result = self._connection._agent_client.exec(

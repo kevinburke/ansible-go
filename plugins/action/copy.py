@@ -49,7 +49,7 @@ class ActionModule(ActionBase):
         # become_user (to avoid silently reading as root), and would
         # write files owned by root instead of by the become_user
         # without an explicit owner/group.
-        if getattr(self._connection, "_become_user", None) is not None:
+        if self._connection.get_become_user() is not None:
             return self._run_builtin_copy(None, task_vars)
 
         args = self._task.args

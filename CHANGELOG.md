@@ -2,6 +2,28 @@
 
 All notable changes to fastagent are documented in this file.
 
+## 0.5.9 — April 21, 2026
+
+### Bug fixes
+
+- **Route the command/copy/file/stat action overrides through a
+  shared become-user helper.** 0.5.8 fixed `exec_command` to read
+  `become_user` from `self._play_context` rather than the swallowed
+  plugin, but the four action overrides still read
+  `getattr(self._connection, "_become_user", None)` — an attribute
+  0.5.8 deleted. `getattr` silently fell back to `None`, so command
+  tasks with `become_user: "{{ app_user }}"` still hit the agent's
+  Exec RPC with `become_user=None` and ran as root, tripping git's
+  `dubious ownership` check on app-user-owned repos all over again.
+  Same symptom as 0.5.7/0.5.8, different (and older) code path.
+
+  Fixed by introducing `Connection.get_become_user()` as the single
+  source of truth for "which user should the agent run this task
+  as?". `exec_command` and all four action overrides now call it,
+  and the copy/file/stat fallback guards (skip the fast path when
+  becoming a non-root user) go through the same helper so they
+  can't silently drift out of sync again.
+
 ## 0.5.8 — April 21, 2026
 
 ### Bug fixes
