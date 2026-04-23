@@ -27,11 +27,30 @@ from ansible.utils.hashing import checksum
 class ActionModule(ActionBase):
 
     def _run_builtin_copy(self, tmp, task_vars):
-        """Delegate to the builtin copy action via _execute_module."""
-        return self._execute_module(
-            module_name="ansible.builtin.copy",
-            task_vars=task_vars,
+        """Delegate to the builtin copy action plugin.
+
+        We must dispatch to the *action plugin*, not the module. The copy
+        module expects `src:` to be readable on the remote host; it's the
+        action plugin that walks a local directory, pushes each file into a
+        remote tempdir, and invokes the module with the remote path. Calling
+        `_execute_module("ansible.builtin.copy")` here ships our controller
+        path (e.g. `/Users/kevin/src/foo/migrations/`) to the remote and
+        fails with "Source ... not found".
+
+        `ansible.legacy.copy` resolves to `ansible.builtin.copy`: this
+        override lives under `kevinburke.fastagent.copy`, so the legacy
+        path doesn't loop back into us.
+        """
+        action = self._shared_loader_obj.action_loader.get(
+            "ansible.legacy.copy",
+            task=self._task,
+            connection=self._connection,
+            play_context=self._play_context,
+            loader=self._loader,
+            templar=self._templar,
+            shared_loader_obj=self._shared_loader_obj,
         )
+        return action.run(task_vars=task_vars)
 
     def run(self, tmp=None, task_vars=None):
         if task_vars is None:

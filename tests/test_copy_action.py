@@ -145,6 +145,74 @@ class TestCopyActionVaultDecrypt(unittest.TestCase):
             self.assertEqual(shipped, plaintext_bytes)
             self.assertNotIn(b"ANSIBLE_VAULT", shipped)
 
+    def test_directory_src_delegates_to_builtin_action_plugin(self) -> None:
+        # Regression: before the fix, a directory `src:` fell back to
+        # `_execute_module("ansible.builtin.copy")`, which runs the module
+        # on the remote with the controller-side directory path. The
+        # remote doesn't have that path, so it failed with
+        # "Source <local path> not found". The fallback must instead
+        # dispatch to the builtin copy *action plugin*, which walks the
+        # local tree and uploads each file.
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = os.path.join(tmp, "migrations")
+            os.mkdir(src_dir)
+            with open(os.path.join(src_dir, "0001_init.sql"), "wb") as f:
+                f.write(b"-- init\n")
+
+            delegated_calls: list[dict] = []
+
+            class _FakeBuiltinAction:
+                def run(self, task_vars):
+                    delegated_calls.append({"task_vars": task_vars})
+                    return {"changed": True, "dest": "/remote/migrations/"}
+
+            loader_get_calls: list[tuple[str, dict]] = []
+
+            class _FakeActionLoader:
+                def get(self, name, **kwargs):
+                    loader_get_calls.append((name, kwargs))
+                    return _FakeBuiltinAction()
+
+            class _FakeSharedLoaderObj:
+                action_loader = _FakeActionLoader()
+
+            loader = _RecordingLoader(resolved_path=src_dir)
+            action = _make_action(
+                task_args={"src": src_dir, "dest": "/remote/migrations/"},
+                loader=loader,
+            )
+            action._shared_loader_obj = _FakeSharedLoaderObj()
+            action._templar = object()
+            # Asserting negatively: if the bug is back, the code will
+            # call _execute_module; blow up loudly if it does.
+            action._execute_module = lambda **kwargs: self.fail(
+                f"fallback called _execute_module instead of the action plugin: {kwargs}"
+            )
+
+            with patch.object(ActionBase, "run", return_value={}):
+                result = action.run(task_vars={"inventory_hostname": "h"})
+
+            self.assertEqual(len(loader_get_calls), 1)
+            name, kwargs = loader_get_calls[0]
+            # Must resolve through ansible.legacy.copy (= the builtin action
+            # after our override sits on the unqualified `copy` name).
+            self.assertEqual(name, "ansible.legacy.copy")
+            # The delegated action needs these to share state with us.
+            for required in (
+                "task",
+                "connection",
+                "play_context",
+                "loader",
+                "templar",
+                "shared_loader_obj",
+            ):
+                self.assertIn(required, kwargs)
+            self.assertEqual(len(delegated_calls), 1)
+            self.assertEqual(
+                delegated_calls[0]["task_vars"], {"inventory_hostname": "h"}
+            )
+            self.assertEqual(result.get("dest"), "/remote/migrations/")
+
     def test_unencrypted_source_uses_loader_path_unchanged(self) -> None:
         # For unencrypted files, get_real_file returns the original
         # path — this asserts the action still reads & ships their

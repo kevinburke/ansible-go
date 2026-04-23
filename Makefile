@@ -46,12 +46,9 @@ release: build collection
 
 test:
 	go test -trimpath -count=1 ./...
-	python3 -m unittest -v \
-		plugins.connection.fastagent_test \
-		plugins.module_utils.fastagent_client_test \
-		tests.test_collection_layout \
-		tests.test_command_action \
-		tests.test_file_action
+	cd plugins/module_utils && python3 -m unittest -v fastagent_client_test
+	cd plugins/connection && python3 -m unittest -v fastagent_test
+	python3 -m unittest discover -v -s tests -t . -p 'test_*.py'
 
 clean:
 	rm -rf tmp/
