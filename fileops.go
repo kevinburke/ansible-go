@@ -154,9 +154,18 @@ func (s *Server) handleWriteFile(params json.RawMessage) (any, error) {
 	}
 
 	// Write atomically: temp file + rename.
+	//
+	// Create any missing parent dirs with the target file's owner/group, not
+	// the daemon's uid. When become is in effect the daemon runs as root, so a
+	// plain os.MkdirAll(dir, 0o755) leaves every intermediate it creates
+	// owned by root:root. That breaks the very next stock-ssh Ansible run:
+	// ( umask 77 && mkdir -p ~/.ansible/tmp && mkdir ~/.ansible/tmp/ansible-tmp-<ts> )
+	// fails with EACCES because kevin no longer has write on his own
+	// ~/.ansible/tmp/. We only chown segments we actually create; existing
+	// ancestors are left untouched (matching ansible's file module).
 	dir := filepath.Dir(p.Dest)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, fmt.Errorf("mkdir %s: %w", dir, err)
+	if err := mkdirAllOwned(dir, p.Owner, p.Group); err != nil {
+		return nil, err
 	}
 
 	if p.UnsafeWrites {
@@ -278,6 +287,47 @@ func ensureDirectoryAnsible(path, owner, group, mode string) (bool, error) {
 		}
 	}
 	return changed, nil
+}
+
+// mkdirAllOwned creates dir and any missing ancestors, applying owner/group
+// (mode 0o755) to each segment it actually creates. Existing ancestors are
+// left untouched, matching os.MkdirAll's behavior for the "already exists"
+// case. Unlike os.MkdirAll this does not silently leave newly-created
+// intermediates owned by the agent's uid; that matters when the daemon is
+// running as root and dir lives under a non-root user's home.
+func mkdirAllOwned(dir, owner, group string) error {
+	if info, err := os.Stat(dir); err == nil {
+		if !info.IsDir() {
+			return fmt.Errorf("%s exists but is not a directory", dir)
+		}
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat %s: %w", dir, err)
+	}
+
+	segments := strings.Split(strings.Trim(dir, "/"), "/")
+	curpath := ""
+	if filepath.IsAbs(dir) {
+		curpath = "/"
+	}
+	for _, seg := range segments {
+		if seg == "" {
+			continue
+		}
+		curpath = filepath.Join(curpath, seg)
+		if _, err := os.Stat(curpath); err == nil {
+			continue
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("stat %s: %w", curpath, err)
+		}
+		if err := os.Mkdir(curpath, 0o755); err != nil {
+			return fmt.Errorf("mkdir %s: %w", curpath, err)
+		}
+		if _, err := applyOwnershipAndMode(curpath, owner, group, ""); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Server) handleFileFile(p FileParams) (any, error) {

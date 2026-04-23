@@ -229,6 +229,63 @@ func TestWriteFileBackup(t *testing.T) {
 	}
 }
 
+// TestWriteFileCreatesMissingIntermediates guards against a regression where
+// WriteFile called os.MkdirAll with a fixed 0o755 and no ownership. When the
+// daemon runs as root (become is in effect), any intermediate it creates
+// under a non-root user's home ends up owned by root:root, which breaks the
+// next stock-ssh ansible run with "mkdir ~/.ansible/tmp/ansible-tmp-*:
+// Permission denied". Pre-existing ancestors must be left untouched so we
+// don't retroactively change the mode on a user-managed directory.
+func TestWriteFileCreatesMissingIntermediates(t *testing.T) {
+	s := newTestServer()
+
+	tmp := t.TempDir()
+	preexisting := filepath.Join(tmp, "pre")
+	if err := os.Mkdir(preexisting, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	dest := filepath.Join(preexisting, "a", "b", "c", "file.txt")
+	b64 := base64.StdEncoding.EncodeToString([]byte("hello"))
+	resp := rpcCall(t, s, "WriteFile", WriteFileParams{
+		Dest:    dest,
+		Content: b64,
+	})
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+
+	data, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("read %s: %v", dest, err)
+	}
+	if string(data) != "hello" {
+		t.Errorf("got %q, want %q", string(data), "hello")
+	}
+
+	// Pre-existing ancestor keeps its original mode.
+	info, err := os.Stat(preexisting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Errorf("%s: mode changed to %#o, want %#o (pre-existing ancestor must be left alone)",
+			preexisting, got, 0o700)
+	}
+
+	// Every newly-created intermediate exists and is a directory.
+	for _, seg := range []string{"a", "a/b", "a/b/c"} {
+		path := filepath.Join(preexisting, seg)
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat %s: %v", path, err)
+		}
+		if !info.IsDir() {
+			t.Errorf("%s: not a directory", path)
+		}
+	}
+}
+
 func TestFileDirectory(t *testing.T) {
 	s := newTestServer()
 
