@@ -2,6 +2,34 @@
 
 All notable changes to fastagent are documented in this file.
 
+## 0.6.3 — April 23, 2026
+
+### Bug fixes
+
+- **Fall back to the copy action plugin, not the copy module.** The
+  fastagent copy override's `_run_builtin_copy` helper called
+  `_execute_module("ansible.builtin.copy")`, which ships the copy
+  *module* to the remote and runs it there. The module expects `src:`
+  to be readable on the remote host — the *action plugin* is what
+  walks local directories, uploads each file into a remote tempdir,
+  and only then invokes the module with a remote path. Every case the
+  fast path punted back to the builtin (directory `src:`,
+  `_find_needle` misses, vault `get_real_file` failures, non-fastagent
+  transport, and become) therefore failed with `Source <controller
+  path> not found`. The simplest reproducer is a `copy: src=somedir/
+  dest=...` with a directory source.
+
+  Fixed by resolving `ansible.legacy.copy` through the action loader
+  and calling its `run()`. `ansible.legacy.copy` maps to the builtin
+  copy action; our override sits under `kevinburke.fastagent.copy`, so
+  the legacy name can't loop back into us.
+
+  Also aligned the Makefile `test` target with CI so
+  `tests/test_copy_action.py` is actually executed — it was added in
+  0.6.1 for the vault-decrypt fix but was never listed in the
+  Makefile's named-module invocation, and the new directory-fallback
+  regression test would have been skipped the same way.
+
 ## 0.6.2 — April 23, 2026
 
 ### Bug fixes
