@@ -2,6 +2,30 @@
 
 All notable changes to fastagent are documented in this file.
 
+## 0.6.2 — April 23, 2026
+
+### Bug fixes
+
+- **Chown `WriteFile` intermediate directories to the target user, not
+  the daemon uid.** When a play used `become: true`, the fastagent
+  daemon ran as root on the remote host. Its `WriteFile` RPC handler
+  called `os.MkdirAll(dir, 0o755)` to create any missing parents of
+  the destination and only applied the caller's `owner`/`group` to
+  the final file. Intermediate directories created under the ssh
+  user's home were therefore left `root:root 0o755`. That was latent
+  until a later ansible run used stock ssh (or fastagent without
+  become): the first task's `mkdir ~/.ansible/tmp/ansible-tmp-<ts>`
+  then failed with `Permission denied` because the ssh user no longer
+  had write access to its own `~/.ansible/tmp/`.
+
+  Fixed by creating each missing intermediate segment individually and
+  applying the `WriteFile` `owner`/`group` parameters (set to
+  `remote_user` by the connection plugin's `put_file`) to each new
+  segment. Pre-existing ancestors are left untouched, matching
+  ansible's file module. If a host is already broken from an earlier
+  release, fix it with `sudo chown -R <user>:<user> ~<user>/.ansible/`
+  before re-running.
+
 ## 0.6.1 — April 22, 2026
 
 ### Bug fixes
