@@ -178,25 +178,49 @@ names like `command:` to `ansible.builtin.command` — *not* to our
 `kevinburke.fastagent.command`. So the action plugin override never gets
 selected. You need to point Ansible at our plugin directories explicitly.
 
-### Recommended: legacy paths in `ansible.cfg` (one-line, fleet-wide)
+### Recommended: legacy action_plugins path in `ansible.cfg` (one line, fleet-wide)
 
 ```ini
 [defaults]
-library        = ~/.ansible/collections/ansible_collections/kevinburke/fastagent/plugins/modules
 action_plugins = ~/.ansible/collections/ansible_collections/kevinburke/fastagent/plugins/action
 
 [ssh_connection]
 pipelining = True
 ```
 
-This places fastagent's modules and action plugins into Ansible's
-`ansible.legacy` namespace, which is searched **before** `ansible.builtin`
-for unqualified names. Every task — including tasks inside roles — picks up
-the override automatically. No per-play or per-role changes needed.
+This places fastagent's action plugins into Ansible's `ansible.legacy`
+namespace, which is searched **before** `ansible.builtin` for unqualified
+names. Every task — including tasks inside roles — picks up the override
+automatically. No per-play or per-role changes needed.
 
 `pipelining = True` is independently important: without it, every
 non-overridden module pays an extra `put_file` round-trip per task. The
 fastagent connection plugin honors this setting just like the SSH plugin.
+
+#### Do NOT also set `library = .../fastagent/plugins/modules`
+
+Earlier versions of this guide recommended pairing `action_plugins = …`
+with `library = …/fastagent/plugins/modules` to put fastagent's module
+shims on the legacy module search path too. **Do not do this.** The
+files under `plugins/modules/` are refusal shims whose only job is to
+error out if someone dispatches them directly instead of through the
+action plugin. Ansible-core's action plugins internally call
+`_execute_module(module_name="ansible.legacy.stat" / "copy" / "file", …)`
+(for example: `unarchive` stats `dest/` that way before extracting;
+`template` renders and then dispatches through `ansible.legacy.copy`).
+Those calls resolve through the legacy `library` path before falling
+back to `ansible.builtin`. If fastagent's shims are on that path, every
+affected core action plugin fails with:
+
+```
+kevinburke.fastagent.<name> shim was invoked directly. The action
+plugin override should have handled this task. Fallbacks must pass
+module_name='ansible.builtin.<name>' to _execute_module().
+```
+
+Leaving `library` unset lets `ansible.legacy.*` fall through to
+`ansible.builtin.*` while the `action_plugins` path above still gives
+you the unqualified-name shadowing fastagent depends on.
 
 #### One-shot install snippet
 
@@ -207,11 +231,10 @@ the stanza so re-running the snippet is a no-op:
 ```bash
 ansible-galaxy collection install kevinburke.fastagent
 
-grep -q 'kevinburke/fastagent/plugins/modules' ansible.cfg 2>/dev/null || \
+grep -q 'kevinburke/fastagent/plugins/action' ansible.cfg 2>/dev/null || \
 cat >> ansible.cfg <<'EOF'
 
 [defaults]
-library        = ~/.ansible/collections/ansible_collections/kevinburke/fastagent/plugins/modules
 action_plugins = ~/.ansible/collections/ansible_collections/kevinburke/fastagent/plugins/action
 
 [ssh_connection]
@@ -219,11 +242,11 @@ pipelining = True
 EOF
 ```
 
-The paths assume the default `ansible-galaxy` install location
+The path assumes the default `ansible-galaxy` install location
 (`~/.ansible/collections/`). If you set `ANSIBLE_COLLECTIONS_PATH` or use
 `ansible-galaxy collection install -p <dir>` to install somewhere else,
-adjust the paths accordingly — they need to point at
-`<install-root>/ansible_collections/kevinburke/fastagent/plugins/{modules,action}`.
+adjust the path accordingly — it needs to point at
+`<install-root>/ansible_collections/kevinburke/fastagent/plugins/action`.
 
 ### Alternative: per-play and per-role `collections:` keyword
 

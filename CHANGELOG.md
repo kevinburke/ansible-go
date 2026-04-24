@@ -2,6 +2,39 @@
 
 All notable changes to fastagent are documented in this file.
 
+## 0.6.5 — April 24, 2026
+
+### Documentation
+
+- **Stop recommending `library = .../fastagent/plugins/modules`.** The
+  README's "Recommended: legacy paths in `ansible.cfg`" section and its
+  one-shot install snippet both told users to set
+  `library = …/fastagent/plugins/modules` alongside
+  `action_plugins = …/fastagent/plugins/action`. Only the
+  `action_plugins` entry is needed to shadow unqualified `copy:`,
+  `stat:`, `file:`, `apt:`, `command:`, and `systemd:` with the
+  fastagent overrides.
+
+  Adding `library` to the legacy search path puts fastagent's module
+  shims — whose only job is to refuse direct invocation — in front of
+  every ansible-core action plugin's internal
+  `_execute_module(module_name="ansible.legacy.<stat|copy|file>", …)`
+  call. Core action plugins like `unarchive` (calls
+  `_execute_remote_stat` on `dest/` before extracting), `template`
+  (dispatches through `ansible.legacy.copy` after rendering),
+  `get_url`, `archive`, and `patch` all hit the shim and die with
+  "kevinburke.fastagent.<name> shim was invoked directly".
+
+  0.6.4's `_shield_builtin_from_legacy_shims` wrapped
+  `_execute_module` on the one builtin-copy instance fastagent's copy
+  fallback creates, but that shield only covers that specific instance
+  — every other core action plugin runs outside fastagent's call
+  stack, so the only reliable fix is to keep the shims off the legacy
+  module search path in the first place.
+
+  The README now documents "do NOT also set `library = …`" inline and
+  the one-shot install snippet emits `action_plugins` only.
+
 ## 0.6.4 — April 23, 2026
 
 ### Bug fixes
