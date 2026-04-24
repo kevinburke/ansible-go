@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib.util
 import json
 import os
 import stat
 
+import ansible.plugins.action as _ansible_action_pkg
 from ansible.errors import AnsibleActionFail, AnsibleFileNotFound
 from ansible.module_utils.common.text.converters import to_bytes, to_text
 from ansible.module_utils.parsing.convert_bool import boolean
@@ -24,25 +26,107 @@ from ansible.plugins.action import ActionBase
 from ansible.utils.hashing import checksum
 
 
+def _load_builtin_copy_action_class():
+    """Return ansible-core's builtin `copy` ActionModule class.
+
+    We can't use `from ansible.plugins.action.copy import ActionModule`:
+    callers that put this plugin on the legacy `action_plugins` search
+    path (e.g. caracal-server's `ansible.cfg`, to shadow unqualified
+    `copy:`) cause ansible's PluginLoader to register *this file* under
+    `sys.modules["ansible.plugins.action.copy"]`, aliasing over the
+    real builtin. The import then resolves back into this partially-
+    loaded module and fails with `ImportError: cannot import name
+    'ActionModule' from 'ansible.plugins.action.copy' (…/kevinburke/…/copy.py)`.
+
+    We can't use `action_loader.get("ansible.legacy.copy")` either: under
+    the same legacy-path shadowing, `ansible.legacy.copy` resolves to
+    this class, so the fallback recurses until CPython raises
+    `RecursionError: maximum recursion depth exceeded`.
+
+    Instead, find the real file on disk via the parent package's
+    `__path__` (which is not mutated by legacy-plugin registration) and
+    load it with `importlib.util.spec_from_file_location` under a name
+    that can't clash with anything in `sys.modules`.
+    """
+    for base in _ansible_action_pkg.__path__:
+        candidate = os.path.join(base, "copy.py")
+        if os.path.isfile(candidate):
+            spec = importlib.util.spec_from_file_location(
+                "kevinburke.fastagent._builtin_copy_action", candidate
+            )
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod.ActionModule
+    raise AnsibleActionFail(
+        "fastagent: could not locate ansible-core's builtin copy "
+        f"action plugin under {list(_ansible_action_pkg.__path__)}"
+    )
+
+
+_BUILTIN_COPY_ACTION_CLASS: type | None = None
+
+
+def _shield_builtin_from_legacy_shims(builtin):
+    """Rewrite `_execute_module` on a builtin action instance so any
+    `ansible.legacy.<name>` call becomes `ansible.builtin.<name>`.
+
+    Callers register this plugin on ansible.cfg's `library` / `action_plugins`
+    search paths to shadow unqualified `copy:` / `stat:` / `file:` tasks.
+    A side effect is that every `ansible.legacy.*` module resolution also
+    picks up our files first — including the refusal shims in
+    `plugins/modules/{stat,copy,file}.py`, which exist to say "you should
+    have gone through the action plugin". When the builtin copy action
+    we fell back to calls `_execute_module("ansible.legacy.stat")` inside
+    `_execute_remote_stat`, it hits those shims and dies.
+
+    `ansible.builtin.*` resolves through the collection loader (not the
+    legacy library search path), so it always finds ansible-core's real
+    modules regardless of our legacy shadowing.
+    """
+    original = builtin._execute_module
+    legacy_prefix = "ansible.legacy."
+    builtin_prefix = "ansible.builtin."
+
+    def _execute_module_rewrite(*args, **kwargs):
+        name = kwargs.get("module_name")
+        if isinstance(name, str) and name.startswith(legacy_prefix):
+            kwargs["module_name"] = builtin_prefix + name[len(legacy_prefix):]
+        return original(*args, **kwargs)
+
+    builtin._execute_module = _execute_module_rewrite
+
+
 class ActionModule(ActionBase):
 
     def _run_builtin_copy(self, tmp, task_vars):
         """Delegate to the builtin copy action plugin.
 
-        We must dispatch to the *action plugin*, not the module. The copy
-        module expects `src:` to be readable on the remote host; it's the
-        action plugin that walks a local directory, pushes each file into a
-        remote tempdir, and invokes the module with the remote path. Calling
-        `_execute_module("ansible.builtin.copy")` here ships our controller
-        path (e.g. `/Users/kevin/src/foo/migrations/`) to the remote and
-        fails with "Source ... not found".
+        We must dispatch to the *action plugin*, not the copy module. The
+        copy module expects `src:` to be readable on the remote host; it's
+        the action plugin that walks a local directory, pushes each file
+        into a remote tempdir, and only then invokes the module with a
+        remote path. Calling `_execute_module("ansible.builtin.copy")`
+        ships our controller path (e.g. `/Users/.../migrations/`) to the
+        remote and fails with `Source ... not found`.
 
-        `ansible.legacy.copy` resolves to `ansible.builtin.copy`: this
-        override lives under `kevinburke.fastagent.copy`, so the legacy
-        path doesn't loop back into us.
+        See `_load_builtin_copy_action_class` for why we can't reach the
+        builtin via `ansible.legacy.copy` or a plain import when callers
+        expose this plugin on the legacy action_plugins search path.
+
+        Once we have the builtin action instance, we also need to keep it
+        from re-entering our legacy-path shims. The ansible-core copy
+        action internally calls `_execute_module("ansible.legacy.stat")`,
+        `ansible.legacy.copy`, and `ansible.legacy.file` — each of which,
+        under caracal-server's `library = .../fastagent/modules` config,
+        resolves to the kevinburke.fastagent shim that refuses direct
+        invocation ("shim was invoked directly"). We rewrite those calls
+        to `ansible.builtin.*` on this one instance so the real core
+        modules run on the remote without disturbing global state.
         """
-        action = self._shared_loader_obj.action_loader.get(
-            "ansible.legacy.copy",
+        global _BUILTIN_COPY_ACTION_CLASS
+        if _BUILTIN_COPY_ACTION_CLASS is None:
+            _BUILTIN_COPY_ACTION_CLASS = _load_builtin_copy_action_class()
+        builtin = _BUILTIN_COPY_ACTION_CLASS(
             task=self._task,
             connection=self._connection,
             play_context=self._play_context,
@@ -50,7 +134,8 @@ class ActionModule(ActionBase):
             templar=self._templar,
             shared_loader_obj=self._shared_loader_obj,
         )
-        return action.run(task_vars=task_vars)
+        _shield_builtin_from_legacy_shims(builtin)
+        return builtin.run(task_vars=task_vars)
 
     def run(self, tmp=None, task_vars=None):
         if task_vars is None:

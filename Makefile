@@ -32,7 +32,16 @@ deploy: build
 # `ansible-galaxy collection install ./kevinburke-fastagent-X.Y.Z.tar.gz`.
 collection: $(COLLECTION_TARBALL)
 
-$(COLLECTION_TARBALL): galaxy.yml plugins
+# List every file shipped inside the collection tarball so editing any
+# plugin source triggers a rebuild. A bare `plugins/` dependency matches
+# only the directory's mtime (which changes on add/remove, not on content
+# edits), so `make collection` would falsely report "nothing to be done"
+# after an in-place edit and you'd install stale bytes.
+COLLECTION_SOURCES := galaxy.yml meta/runtime.yml README.md \
+	$(shell find plugins -type f \
+		! -name '*_test.py' ! -name '*.pyc' ! -path '*/__pycache__/*')
+
+$(COLLECTION_TARBALL): $(COLLECTION_SOURCES)
 	mkdir -p tmp
 	ansible-galaxy collection build --force --output-path tmp .
 	@echo "Built collection: $(COLLECTION_TARBALL)"

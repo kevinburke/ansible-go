@@ -146,13 +146,24 @@ class TestCopyActionVaultDecrypt(unittest.TestCase):
             self.assertNotIn(b"ANSIBLE_VAULT", shipped)
 
     def test_directory_src_delegates_to_builtin_action_plugin(self) -> None:
-        # Regression: before the fix, a directory `src:` fell back to
-        # `_execute_module("ansible.builtin.copy")`, which runs the module
-        # on the remote with the controller-side directory path. The
-        # remote doesn't have that path, so it failed with
-        # "Source <local path> not found". The fallback must instead
-        # dispatch to the builtin copy *action plugin*, which walks the
-        # local tree and uploads each file.
+        # Regression for two layered bugs:
+        #
+        #   * 0.6.2 and earlier: a directory `src:` fell through to
+        #     `_execute_module("ansible.builtin.copy")`, which runs the
+        #     *module* on the remote with our controller-side path —
+        #     "Source /Users/.../migrations/ not found".
+        #
+        #   * 0.6.3: we switched the fallback to
+        #     `action_loader.get("ansible.legacy.copy")`. That works in
+        #     stock ansible (legacy → builtin), but caracal-server's
+        #     `ansible.cfg` puts this plugin on the legacy `action_plugins`
+        #     path to shadow unqualified `copy:`. Under that config,
+        #     "ansible.legacy.copy" resolves *back into us* and the
+        #     fallback recurses forever — "maximum recursion depth exceeded".
+        #
+        # The fix imports the builtin copy action by module path and
+        # instantiates it directly, so neither shadowing nor loader
+        # aliasing can redirect the fallback back at ourselves.
         with tempfile.TemporaryDirectory() as tmp:
             src_dir = os.path.join(tmp, "migrations")
             os.mkdir(src_dir)
@@ -161,20 +172,31 @@ class TestCopyActionVaultDecrypt(unittest.TestCase):
 
             delegated_calls: list[dict] = []
 
-            class _FakeBuiltinAction:
+            class _FakeBuiltin:
+                def __init__(self, **kwargs):
+                    self.init_kwargs = kwargs
+
+                def _execute_module(self, **_kwargs):
+                    return {"changed": False}
+
                 def run(self, task_vars):
-                    delegated_calls.append({"task_vars": task_vars})
+                    delegated_calls.append(
+                        {"task_vars": task_vars, "init_kwargs": self.init_kwargs}
+                    )
                     return {"changed": True, "dest": "/remote/migrations/"}
 
-            loader_get_calls: list[tuple[str, dict]] = []
-
-            class _FakeActionLoader:
+            # Any action_loader access in the fallback is by definition
+            # the 0.6.3 bug: legacy-path shadowing can alias it to us.
+            class _PoisonedActionLoader:
                 def get(self, name, **kwargs):
-                    loader_get_calls.append((name, kwargs))
-                    return _FakeBuiltinAction()
+                    raise AssertionError(
+                        f"fallback touched action_loader.get({name!r}); "
+                        "this path recurses when fastagent is on the legacy "
+                        "action_plugins list (see 0.6.3 regression)."
+                    )
 
             class _FakeSharedLoaderObj:
-                action_loader = _FakeActionLoader()
+                action_loader = _PoisonedActionLoader()
 
             loader = _RecordingLoader(resolved_path=src_dir)
             action = _make_action(
@@ -183,21 +205,19 @@ class TestCopyActionVaultDecrypt(unittest.TestCase):
             )
             action._shared_loader_obj = _FakeSharedLoaderObj()
             action._templar = object()
-            # Asserting negatively: if the bug is back, the code will
-            # call _execute_module; blow up loudly if it does.
             action._execute_module = lambda **kwargs: self.fail(
-                f"fallback called _execute_module instead of the action plugin: {kwargs}"
+                "fallback called _execute_module instead of the action "
+                f"plugin: {kwargs}"
             )
 
-            with patch.object(ActionBase, "run", return_value={}):
+            with patch(
+                "plugins.action.copy._BUILTIN_COPY_ACTION_CLASS",
+                _FakeBuiltin,
+            ), patch.object(ActionBase, "run", return_value={}):
                 result = action.run(task_vars={"inventory_hostname": "h"})
 
-            self.assertEqual(len(loader_get_calls), 1)
-            name, kwargs = loader_get_calls[0]
-            # Must resolve through ansible.legacy.copy (= the builtin action
-            # after our override sits on the unqualified `copy` name).
-            self.assertEqual(name, "ansible.legacy.copy")
-            # The delegated action needs these to share state with us.
+            self.assertEqual(len(delegated_calls), 1)
+            init_kwargs = delegated_calls[0]["init_kwargs"]
             for required in (
                 "task",
                 "connection",
@@ -206,12 +226,149 @@ class TestCopyActionVaultDecrypt(unittest.TestCase):
                 "templar",
                 "shared_loader_obj",
             ):
-                self.assertIn(required, kwargs)
-            self.assertEqual(len(delegated_calls), 1)
+                self.assertIn(required, init_kwargs)
             self.assertEqual(
                 delegated_calls[0]["task_vars"], {"inventory_hostname": "h"}
             )
             self.assertEqual(result.get("dest"), "/remote/migrations/")
+
+    def test_fallback_survives_legacy_path_shadowing(self) -> None:
+        # Hard recursion guard: simulate caracal-server's config by making
+        # action_loader.get("ansible.legacy.copy") resolve back to *this*
+        # ActionModule. Before 0.6.4 that meant the fallback called us again,
+        # hit the same `remote_src` branch, and recursed until CPython raised
+        # RecursionError. After the fix the fallback ignores the loader
+        # entirely.
+        action = _make_action(
+            task_args={"src": "/whatever", "dest": "/remote", "remote_src": True},
+            loader=_RecordingLoader(resolved_path="/whatever"),
+        )
+
+        class _ShadowedActionLoader:
+            """Simulates legacy-path shadowing: unqualified and legacy both
+            route back to the fastagent override."""
+
+            def __init__(self, cls):
+                self._cls = cls
+
+            def get(self, name, **kwargs):
+                return self._cls(**kwargs)
+
+        class _FakeSharedLoaderObj:
+            def __init__(self, cls):
+                self.action_loader = _ShadowedActionLoader(cls)
+
+        action._shared_loader_obj = _FakeSharedLoaderObj(ActionModule)
+        action._templar = object()
+
+        delegated_calls: list[int] = []
+
+        class _FakeBuiltin:
+            def __init__(self, **_kwargs):
+                pass
+
+            def _execute_module(self, **_kwargs):
+                return {"changed": False}
+
+            def run(self, task_vars):
+                delegated_calls.append(1)
+                return {"changed": False, "dest": "/remote"}
+
+        with patch(
+            "plugins.action.copy._BUILTIN_COPY_ACTION_CLASS", _FakeBuiltin
+        ), patch.object(ActionBase, "run", return_value={}):
+            result = action.run(task_vars={})
+
+        # If the fallback still went through action_loader, it would have
+        # re-entered `ActionModule.run` and recursed until RecursionError.
+        self.assertEqual(len(delegated_calls), 1)
+        self.assertEqual(result.get("dest"), "/remote")
+
+    def test_builtin_copy_action_class_loads_on_this_ansible(self) -> None:
+        # Integration guard: the fallback's whole premise is that we can
+        # load ansible-core's real builtin copy action by file path,
+        # bypassing any sys.modules aliasing. If that function silently
+        # breaks against a future ansible-core (module moved, renamed,
+        # etc.) the whole fallback path crashes on first use — as it did
+        # in 0.6.4-pre when `from ansible.plugins.action.copy import
+        # ActionModule` resolved back into our own partially-loaded
+        # module. Exercise the loader directly here so CI catches it
+        # before any real play does.
+        from plugins.action.copy import _load_builtin_copy_action_class
+
+        cls = _load_builtin_copy_action_class()
+        self.assertTrue(
+            issubclass(cls, ActionBase),
+            msg=f"loaded class {cls!r} is not an ActionBase",
+        )
+        # And it must not be *this* class — if sys.modules shadowing had
+        # fooled the loader, we'd have picked up ourselves again. Read
+        # the loaded module's file via a method's __code__ (inspect
+        # utilities mis-classify dynamically-loaded modules on some
+        # CPython versions).
+        self.assertIsNot(cls, ActionModule)
+        path = cls.run.__code__.co_filename
+        self.assertNotIn("kevinburke", path, msg=path)
+        self.assertTrue(
+            path.endswith(os.path.join("plugins", "action", "copy.py")),
+            msg=path,
+        )
+
+    def test_builtin_internal_legacy_calls_are_rewritten_to_builtin(self) -> None:
+        # The builtin copy action plugin calls `_execute_module(
+        # module_name="ansible.legacy.stat"/"copy"/"file", ...)` internally.
+        # Under caracal-server's ansible.cfg (which puts fastagent's
+        # modules on the legacy `library` path to shadow unqualified
+        # `copy:`), those names resolve to our shim modules that refuse
+        # direct invocation. We shield the builtin instance by rewriting
+        # its `_execute_module` so legacy namespace calls target
+        # `ansible.builtin.*` instead, which bypasses the legacy path.
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = os.path.join(tmp, "migrations")
+            os.mkdir(src_dir)
+
+            recorded_module_names: list[str] = []
+
+            class _FakeBuiltin:
+                def __init__(self, **_kwargs):
+                    pass
+
+                def _execute_module(self, **kwargs):
+                    recorded_module_names.append(kwargs.get("module_name"))
+                    return {"changed": False}
+
+                def run(self, task_vars):
+                    # Simulate the three internal calls ansible-core's
+                    # copy action makes.
+                    self._execute_module(module_name="ansible.legacy.stat")
+                    self._execute_module(module_name="ansible.legacy.copy")
+                    self._execute_module(module_name="ansible.legacy.file")
+                    # And one unrelated call that must pass through.
+                    self._execute_module(module_name="ansible.builtin.setup")
+                    return {"changed": True, "dest": "/remote/migrations/"}
+
+            loader = _RecordingLoader(resolved_path=src_dir)
+            action = _make_action(
+                task_args={"src": src_dir, "dest": "/remote/migrations/"},
+                loader=loader,
+            )
+            action._shared_loader_obj = object()
+            action._templar = object()
+
+            with patch(
+                "plugins.action.copy._BUILTIN_COPY_ACTION_CLASS", _FakeBuiltin
+            ), patch.object(ActionBase, "run", return_value={}):
+                action.run(task_vars={})
+
+            self.assertEqual(
+                recorded_module_names,
+                [
+                    "ansible.builtin.stat",
+                    "ansible.builtin.copy",
+                    "ansible.builtin.file",
+                    "ansible.builtin.setup",
+                ],
+            )
 
     def test_unencrypted_source_uses_loader_path_unchanged(self) -> None:
         # For unencrypted files, get_real_file returns the original

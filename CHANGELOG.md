@@ -2,6 +2,51 @@
 
 All notable changes to fastagent are documented in this file.
 
+## 0.6.4 — April 23, 2026
+
+### Bug fixes
+
+- **Break fallback recursion when fastagent is on the legacy
+  `action_plugins` search path.** 0.6.3's copy fallback resolved the
+  builtin via `action_loader.get("ansible.legacy.copy")`. That works in
+  stock ansible, but any caller that puts the fastagent plugins on the
+  legacy path to shadow unqualified `copy:` (the recommended
+  caracal-server `ansible.cfg` layout) causes `ansible.legacy.copy` to
+  resolve *back into this override*. The fallback then re-entered our
+  `run()`, hit the same branch, and recursed until CPython raised
+  `RecursionError: maximum recursion depth exceeded`. The visible
+  failure in ansible was "Unhandled exception when retrieving
+  'DISPLAY_TRACEBACK': maximum recursion depth exceeded" on any task
+  the fast path punts (directory `src:`, `remote_src: true`, etc.).
+
+  Fixed by importing `ansible.plugins.action.copy.ActionModule` by
+  module path and instantiating it directly. Neither legacy-path
+  shadowing nor any future loader override can alias the fallback
+  target back to this class.
+
+  Added a test that simulates the shadowed configuration
+  (`action_loader.get` returns this ActionModule) and asserts the
+  fallback still completes in one call.
+
+- **Shield the builtin copy action from our own legacy shims.** Once
+  the copy fallback instantiated ansible-core's builtin copy action
+  directly, a second failure surfaced under the same legacy-path
+  shadowing: the builtin internally calls `_execute_module(
+  module_name="ansible.legacy.stat")`, `ansible.legacy.copy`, and
+  `ansible.legacy.file` (via `_execute_remote_stat` and the main
+  transfer paths). Those names resolve through the legacy module
+  library search path, which caracal-server points at fastagent's
+  module shims — files whose only job is to refuse direct invocation
+  with "kevinburke.fastagent.X shim was invoked directly". The
+  fallback therefore aborted mid-copy on the first stat call.
+
+  Fixed by wrapping `_execute_module` on the fallback instance so any
+  `ansible.legacy.<name>` call is rewritten to `ansible.builtin.<name>`
+  before dispatch. The rewrite is scoped to the single builtin-copy
+  instance the fallback creates, so global module resolution is
+  untouched. Added a regression test that simulates the three internal
+  legacy calls and asserts they all reach `ansible.builtin.*`.
+
 ## 0.6.3 — April 23, 2026
 
 ### Bug fixes
