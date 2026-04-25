@@ -483,18 +483,26 @@ func applyOwnershipAndMode(path, owner, group, mode string) (bool, error) {
 		uid := -1
 		gid := -1
 		if owner != "" {
-			u, err := user.Lookup(owner)
-			if err != nil {
-				return changed, fmt.Errorf("lookup user %q: %w", owner, err)
+			if n, err := strconv.Atoi(owner); err == nil {
+				uid = n
+			} else {
+				u, err := user.Lookup(owner)
+				if err != nil {
+					return changed, fmt.Errorf("lookup user %q: %w", owner, err)
+				}
+				uid, _ = strconv.Atoi(u.Uid)
 			}
-			uid, _ = strconv.Atoi(u.Uid)
 		}
 		if group != "" {
-			g, err := user.LookupGroup(group)
-			if err != nil {
-				return changed, fmt.Errorf("lookup group %q: %w", group, err)
+			if n, err := strconv.Atoi(group); err == nil {
+				gid = n
+			} else {
+				g, err := user.LookupGroup(group)
+				if err != nil {
+					return changed, fmt.Errorf("lookup group %q: %w", group, err)
+				}
+				gid, _ = strconv.Atoi(g.Gid)
 			}
-			gid, _ = strconv.Atoi(g.Gid)
 		}
 
 		// Check current ownership before changing.

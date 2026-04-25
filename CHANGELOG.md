@@ -2,6 +2,18 @@
 
 All notable changes to fastagent are documented in this file.
 
+## 0.6.6 — April 23, 2026
+
+### Bug fixes
+
+- **Accept numeric UID/GID strings for `owner` and `group`.** Tasks like
+  `file: path=/var/data state=directory owner='1001' group='1001'` failed
+  with `lookup user "1001": user: unknown user 1001` whenever the UID had
+  no `/etc/passwd` entry (typical for podman/container UID ranges or
+  pre-creating ownership for a service user that hasn't been added yet).
+  ansible-core's file module treats numeric strings as literal IDs and
+  passes them straight to `chown(2)`; fastagent now does the same.
+
 ## 0.6.5 — April 24, 2026
 
 ### Documentation

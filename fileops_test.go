@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -494,4 +496,46 @@ func TestFileSymlink(t *testing.T) {
 	if dest != src {
 		t.Errorf("link dest %q, want %q", dest, src)
 	}
+}
+
+// TestApplyOwnershipNumericIDs mirrors ansible's file module: numeric strings
+// passed as `owner`/`group` are treated as literal UIDs/GIDs and not looked
+// up in /etc/passwd. Without this, tasks like
+// `file: path=/var/data state=directory owner='1001' group='1001'` fail with
+// `lookup user "1001": user: unknown user 1001` whenever the UID has no
+// passwd entry (common for container/podman ranges).
+func TestApplyOwnershipNumericIDs(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "f")
+	if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	uid := strconv.Itoa(os.Getuid())
+	gid := strconv.Itoa(os.Getgid())
+
+	if _, err := applyOwnershipAndMode(path, uid, gid, ""); err != nil {
+		t.Fatalf("numeric uid/gid (matching current): %v", err)
+	}
+
+	// A numeric UID with no passwd entry must also parse cleanly. The chown
+	// itself is skipped because the file already matches the current uid, so
+	// this exercises the resolution path without requiring root.
+	bogus := "4000000001"
+	if err := os.Chown(path, os.Getuid(), os.Getgid()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := applyOwnershipAndMode(path, bogus, bogus, ""); err == nil {
+		// Non-root: chown will fail with EPERM, which is expected and not the
+		// bug we're guarding against. The bug we're guarding against is
+		// `lookup user "4000000001"` — a name-resolution failure.
+		t.Logf("ran as root or chown unexpectedly succeeded; that's fine")
+	} else if isLookupError(err) {
+		t.Fatalf("numeric uid/gid should not be name-resolved: %v", err)
+	}
+}
+
+func isLookupError(err error) bool {
+	s := err.Error()
+	return strings.Contains(s, "lookup user") || strings.Contains(s, "lookup group")
 }
