@@ -2,6 +2,34 @@
 
 All notable changes to fastagent are documented in this file.
 
+## 0.6.7 — April 26, 2026
+
+### Bug fixes
+
+- **Pick a traversable cwd for `become_user` execs.** Tasks that ran
+  with `become_user:` and no `chdir:` inherited the daemon's own cwd
+  into the child process. If the daemon was started in a directory
+  the become user couldn't traverse — typically another user's
+  `$HOME` at mode `0700` — any subprocess that fork/execed or walked
+  the filesystem failed with `permission denied`, even though the
+  binary itself was readable. Symptoms included `go install` failing
+  inside the toolchain (`fork/exec /usr/local/go/pkg/tool/.../compile:
+  permission denied`) and `git`/`gh` operations that walked toward
+  `.git` from the inherited cwd. fastagent now defaults `cmd.Dir` to
+  the target user's home directory, falling back to `/`, whenever
+  `become_user` is set with no explicit `chdir`.
+
+- **Propagate the task `environment:` block through the command/shell
+  override.** The fastagent `command` action plugin called the Exec
+  RPC without `env=`, so any environment declared on the task was
+  silently dropped on the floor. Tasks that depended on
+  `environment:` for variables like `GO111MODULE`, `GOBIN`, or
+  `PATH` ran with none of them set, often surfacing as a follow-on
+  error from the program rather than a missing-env error. The action
+  plugin now templates and merges `self._task.environment` into a
+  dict and passes it through the RPC, mirroring
+  `ActionBase._compute_environment_string`.
+
 ## 0.6.6 — April 23, 2026
 
 ### Bug fixes
