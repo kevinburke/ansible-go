@@ -6,9 +6,26 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"strings"
 	"time"
 )
+
+// becomeUserCwd picks a working directory for an Exec when the caller
+// requested BecomeUser but no explicit Cwd. The daemon's own cwd is
+// often a directory the become user can't traverse (e.g. the deploy
+// user's home at mode 0700) — inheriting it surfaces as EACCES in any
+// child that fork/execs or walks the filesystem, even though the
+// binary being run is itself readable. Prefer the target user's home
+// directory; fall back to "/" which is always traversable.
+func becomeUserCwd(username string) string {
+	if u, err := user.Lookup(username); err == nil && u.HomeDir != "" {
+		if fi, statErr := os.Stat(u.HomeDir); statErr == nil && fi.IsDir() {
+			return u.HomeDir
+		}
+	}
+	return "/"
+}
 
 func (s *Server) handleExec(params json.RawMessage) (any, error) {
 	var p ExecParams
@@ -100,6 +117,8 @@ func (s *Server) handleExec(params json.RawMessage) (any, error) {
 
 	if p.Cwd != "" {
 		cmd.Dir = p.Cwd
+	} else if p.BecomeUser != "" {
+		cmd.Dir = becomeUserCwd(p.BecomeUser)
 	}
 	if len(p.Env) > 0 {
 		cmd.Env = os.Environ()

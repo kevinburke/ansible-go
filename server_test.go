@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"log/slog"
+	"os/user"
 	"strings"
 	"testing"
 )
@@ -150,6 +151,30 @@ func TestExecRemovesSkip(t *testing.T) {
 	}
 	if !result.Skipped {
 		t.Error("expected skipped=true when removes path does not exist")
+	}
+}
+
+func TestBecomeUserCwdResolvesHome(t *testing.T) {
+	cur, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur.HomeDir == "" {
+		t.Skip("current user has no home directory")
+	}
+	got := becomeUserCwd(cur.Username)
+	if got != cur.HomeDir {
+		t.Errorf("becomeUserCwd(%q) = %q, want %q", cur.Username, got, cur.HomeDir)
+	}
+}
+
+func TestBecomeUserCwdFallsBackToRoot(t *testing.T) {
+	// A username that user.Lookup will not find. The intent is to
+	// guarantee a deterministic cwd ("/") rather than leaving cmd.Dir
+	// empty and inheriting whatever the daemon happened to be in.
+	got := becomeUserCwd("definitely-not-a-real-user-fastagent-test")
+	if got != "/" {
+		t.Errorf("becomeUserCwd(missing) = %q, want %q", got, "/")
 	}
 }
 
