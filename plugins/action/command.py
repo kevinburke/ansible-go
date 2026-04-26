@@ -15,12 +15,40 @@ import datetime
 import glob
 import shlex
 
+from ansible.errors import AnsibleError
 from ansible.plugins.action import ActionBase
 from ansible.module_utils.common.text.converters import to_text
 from ansible.utils.vars import merge_hash
 
 
 class ActionModule(ActionBase):
+
+    def _compute_environment_dict(self):
+        """Template + merge ``self._task.environment`` into a flat dict.
+
+        Mirrors ``ActionBase._compute_environment_string`` but returns a
+        dict suitable for the Exec RPC's ``env`` field rather than a
+        shell prefix string. The action plugin bypasses Ansible's
+        usual module pipeline, so the controller-side env-prefix path
+        never runs — without this, ``environment:`` blocks declared on
+        the task were silently dropped.
+        """
+        final: dict[str, str] = {}
+        envs = self._task.environment
+        if envs is None:
+            return final
+        if not isinstance(envs, list):
+            envs = [envs]
+        for entry in envs:
+            if not entry:
+                continue
+            templated = self._templar.template(entry)
+            if not isinstance(templated, dict):
+                raise AnsibleError(
+                    "environment must template to a dict, got %r" % (templated,)
+                )
+            final.update({str(k): str(v) for k, v in templated.items()})
+        return final
 
     def run(self, tmp=None, task_vars=None):
         self._supports_async = True
@@ -145,12 +173,19 @@ class ActionModule(ActionBase):
         # sudo to that user for us.
         become_user = self._connection.get_become_user()
 
+        # The action override bypasses Ansible's usual module pipeline,
+        # which is also what would otherwise wire the task's
+        # `environment:` block into the executed command. Compute the
+        # env dict ourselves and pass it through the RPC.
+        task_env = self._compute_environment_dict()
+
         try:
             exec_result = self._connection._agent_client.exec(
                 argv=exec_argv,
                 cmd_string=exec_cmd_string,
                 use_shell=uses_shell,
                 cwd=chdir,
+                env=task_env or None,
                 stdin=stdin,
                 stdin_add_newline=stdin_add_newline,
                 strip_empty_ends=strip_empty_ends,

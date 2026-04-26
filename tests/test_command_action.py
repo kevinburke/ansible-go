@@ -39,6 +39,18 @@ class _RecordingAgentClient:
         return {"rc": 0, "stdout": "", "stderr": ""}
 
 
+class _IdentityTemplar:
+    """Stand-in for ansible's templar that returns the input unchanged.
+
+    The action plugin only calls ``self._templar.template(value)`` on
+    each entry of ``self._task.environment``. Tests pass already-
+    materialized dicts, so identity templating is sufficient.
+    """
+
+    def template(self, value):
+        return value
+
+
 class _FakeConnection:
     """Minimal duck-typed stand-in for the fastagent Connection.
 
@@ -62,24 +74,26 @@ class _FakeConnection:
 
 
 class _FakeTask:
-    def __init__(self, args):
+    def __init__(self, args, environment=None):
         self.args = args
         self.async_val = 0
+        self.environment = environment
 
 
 class _FakePlayContext:
     check_mode = False
 
 
-def _make_action(connection, *, task_args):
+def _make_action(connection, *, task_args, environment=None):
     # Instantiating the real ActionModule drags in ActionBase.__init__,
     # which expects loader/templar/shared_loader. Constructing a bare
     # object and injecting just the attributes command.ActionModule.run
     # touches keeps the test focused on the become-user wiring.
     action = ActionModule.__new__(ActionModule)
-    action._task = _FakeTask(task_args)
+    action._task = _FakeTask(task_args, environment=environment)
     action._connection = connection
     action._play_context = _FakePlayContext()
+    action._templar = _IdentityTemplar()
     action._supports_async = False
     action._supports_check_mode = True
     return action
@@ -113,6 +127,71 @@ class TestCommandActionBecomeUser(unittest.TestCase):
         conn = _FakeConnection(become_user=None)
         self._run_with_mocked_base(conn)
         self.assertIsNone(conn._agent_client.last_kwargs["become_user"])
+
+
+@unittest.skipIf(
+    _ANSIBLE_IMPORT_ERROR is not None,
+    "ansible is required to run action plugin tests",
+)
+class TestCommandActionTaskEnvironment(unittest.TestCase):
+    """The action plugin bypasses Ansible's module pipeline, so it has
+    to template ``self._task.environment`` and pass it into the Exec
+    RPC explicitly. Earlier versions dropped the env block on the
+    floor, which silently broke tasks like
+    ``go install`` that rely on ``GO111MODULE`` / ``GOBIN``.
+    """
+
+    def _run(self, environment):
+        conn = _FakeConnection(become_user=None)
+        action = _make_action(
+            conn,
+            task_args={"_raw_params": "true", "_uses_shell": False},
+            environment=environment,
+        )
+        with patch.object(ActionBase, "run", return_value={}):
+            action.run(task_vars={})
+        return conn._agent_client.last_kwargs
+
+    def test_dict_environment_propagates(self) -> None:
+        kwargs = self._run({"GO111MODULE": "on", "GOBIN": "/opt/burkebot/bin"})
+        self.assertEqual(
+            kwargs["env"],
+            {"GO111MODULE": "on", "GOBIN": "/opt/burkebot/bin"},
+        )
+
+    def test_list_environment_merges_in_order(self) -> None:
+        kwargs = self._run([
+            {"GO111MODULE": "on", "GOBIN": "/old"},
+            {"GOBIN": "/new", "PATH": "/usr/local/bin"},
+        ])
+        self.assertEqual(
+            kwargs["env"],
+            {"GO111MODULE": "on", "GOBIN": "/new", "PATH": "/usr/local/bin"},
+        )
+
+    def test_empty_entries_are_skipped(self) -> None:
+        kwargs = self._run([None, {}, {"FOO": "bar"}])
+        self.assertEqual(kwargs["env"], {"FOO": "bar"})
+
+    def test_no_environment_passes_none(self) -> None:
+        # Distinct from {}: omitting env entirely lets the agent
+        # inherit the daemon's env, which matches the historical
+        # behavior. Sending an empty dict would be equivalent here, but
+        # None keeps the wire payload minimal.
+        kwargs = self._run(None)
+        self.assertIsNone(kwargs.get("env"))
+
+    def test_non_dict_environment_raises(self) -> None:
+        from ansible.errors import AnsibleError
+        conn = _FakeConnection(become_user=None)
+        action = _make_action(
+            conn,
+            task_args={"_raw_params": "true", "_uses_shell": False},
+            environment=["not-a-dict"],
+        )
+        with patch.object(ActionBase, "run", return_value={}):
+            with self.assertRaises(AnsibleError):
+                action.run(task_vars={})
 
 
 if __name__ == "__main__":
