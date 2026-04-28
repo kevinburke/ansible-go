@@ -12,8 +12,9 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // DefaultIdleTimeout is how long the daemon waits with no active connections
@@ -75,7 +76,7 @@ func RunDaemon(socketPath string, allowUser string, idleTimeout time.Duration, l
 
 	// Handle shutdown signals.
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigCh, unix.SIGINT, unix.SIGTERM)
 	go func() {
 		sig := <-sigCh
 		logger.Info("received signal, shutting down", "signal", sig)

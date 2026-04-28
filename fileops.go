@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -564,26 +563,22 @@ func applyOwnershipAndMode(path, owner, group, mode string) (bool, error) {
 		}
 
 		// Check current ownership before changing.
-		info, err := os.Stat(path)
-		if err != nil {
+		var st unix.Stat_t
+		if err := unix.Stat(path, &st); err != nil {
 			return changed, fmt.Errorf("stat %s: %w", path, err)
 		}
-		if sys, ok := info.Sys().(*syscall.Stat_t); ok {
-			currentUID := int(sys.Uid)
-			currentGID := int(sys.Gid)
-			needChange := false
-			if uid >= 0 && currentUID != uid {
-				needChange = true
+		needChange := false
+		if uid >= 0 && int(st.Uid) != uid {
+			needChange = true
+		}
+		if gid >= 0 && int(st.Gid) != gid {
+			needChange = true
+		}
+		if needChange {
+			if err := os.Chown(path, uid, gid); err != nil {
+				return changed, fmt.Errorf("chown %s: %w", path, err)
 			}
-			if gid >= 0 && currentGID != gid {
-				needChange = true
-			}
-			if needChange {
-				if err := os.Chown(path, uid, gid); err != nil {
-					return changed, fmt.Errorf("chown %s: %w", path, err)
-				}
-				changed = true
-			}
+			changed = true
 		}
 	}
 
