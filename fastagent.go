@@ -5,7 +5,7 @@ package fastagent
 import "encoding/json"
 
 // Version is the agent version. Bump this when the protocol or behavior changes.
-const Version = "0.6.7"
+const Version = "0.7.0"
 
 // Request is a JSON-RPC request from the controller.
 type Request struct {

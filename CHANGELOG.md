@@ -2,6 +2,48 @@
 
 All notable changes to fastagent are documented in this file.
 
+## 0.7.0 — April 28, 2026
+
+### Bug fixes
+
+- **Return the full `ansible.builtin.stat` field set from the `Stat`
+  RPC.** Playbooks that consumed synthesized fields like
+  `q.stat.executable`, `q.stat.readable`, `q.stat.uid`,
+  `q.stat.nlink`, or any of the per-bit booleans
+  (`xusr`/`wusr`/`rusr`/...) crashed mid-conditional under fastagent
+  with `object of type 'dict' has no attribute 'executable'` rather
+  than evaluating to false: the Go agent populated only a fraction of
+  the keys ansible.builtin.stat would have set, so `assert: { that:
+  q.stat.executable }` raised instead of skipping. The Stat RPC now
+  returns `uid`, `gid`, `inode`, `dev`, `nlink`, `ctime`, the type
+  flags (`isreg`/`isblk`/`ischr`/`isfifo`/`issock`), the suid/sgid
+  bits, every per-bit permission boolean, and the three
+  `access(2)`-derived booleans `readable`/`writeable`/`executable`
+  (queried from the kernel so `noexec` and `ro` mount flags are
+  honored, matching `os.access` in stock stat). The action plugin
+  copies these through, defaults missing keys to `False`/`0`/`""` so
+  playbooks see the key rather than a missing attribute, and
+  populates `pw_name`/`gr_name` only when the uid/gid resolved.
+
+- **Symlink fields now follow the `ansible.builtin.stat` convention.**
+  When the path is a symlink, `stat.lnk_target` is the raw
+  `os.readlink` result (possibly relative) and `stat.lnk_source` is
+  the resolved real path (`filepath.EvalSymlinks` /
+  `os.path.realpath`). Previously the agent sent the readlink output
+  as `lnk_source` and shipped no `lnk_target` at all; the action
+  plugin masked the divergence by aliasing `lnk_target` to
+  `lnk_source`, so playbooks that compared `lnk_target` against the
+  raw symlink string saw the resolved absolute path instead.
+
+### Internal
+
+- **Switch the agent from `syscall` to `golang.org/x/sys/unix`.** The
+  Stat RPC now reads raw `Stat_t` fields directly via `unix.Lstat` /
+  `unix.Stat` instead of going through `os.Lstat` and an
+  `info.Sys().(*syscall.Stat_t)` assertion, and `applyOwnershipAndMode`
+  reads ownership in one syscall instead of two. No user-visible
+  protocol change.
+
 ## 0.6.7 — April 26, 2026
 
 ### Bug fixes
