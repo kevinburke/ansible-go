@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -15,6 +16,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func (s *Server) handleStat(params json.RawMessage) (any, error) {
@@ -33,46 +36,101 @@ func (s *Server) handleStat(params json.RawMessage) (any, error) {
 		return nil, fmt.Errorf("stat: BecomeUser is not yet implemented (use Exec with `stat`/`test` to run as a specific user)")
 	}
 
-	statFn := os.Lstat
+	var st unix.Stat_t
+	statFn := unix.Lstat
 	if p.Follow {
-		statFn = os.Stat
+		statFn = unix.Stat
 	}
-
-	info, err := statFn(p.Path)
-	if err != nil {
-		if os.IsNotExist(err) {
+	if err := statFn(p.Path, &st); err != nil {
+		if errors.Is(err, unix.ENOENT) {
 			return StatResult{Exists: false, Path: p.Path}, nil
 		}
 		return nil, fmt.Errorf("stat %s: %w", p.Path, err)
 	}
 
+	mode := fs.FileMode(st.Mode & 0o7777)
+	// Translate the type bits from the raw st_mode into Go's
+	// fs.FileMode convention so we can reuse IsDir/IsRegular/etc.
+	switch st.Mode & unix.S_IFMT {
+	case unix.S_IFDIR:
+		mode |= fs.ModeDir
+	case unix.S_IFLNK:
+		mode |= fs.ModeSymlink
+	case unix.S_IFIFO:
+		mode |= fs.ModeNamedPipe
+	case unix.S_IFSOCK:
+		mode |= fs.ModeSocket
+	case unix.S_IFBLK:
+		mode |= fs.ModeDevice
+	case unix.S_IFCHR:
+		mode |= fs.ModeDevice | fs.ModeCharDevice
+	}
+	if st.Mode&unix.S_ISUID != 0 {
+		mode |= fs.ModeSetuid
+	}
+	if st.Mode&unix.S_ISGID != 0 {
+		mode |= fs.ModeSetgid
+	}
+
+	perm := mode.Perm()
 	result := StatResult{
-		Exists: true,
-		Path:   p.Path,
-		IsDir:  info.IsDir(),
-		IsLink: info.Mode()&fs.ModeSymlink != 0,
-		Mode:   fmt.Sprintf("0%o", info.Mode().Perm()),
-		Size:   info.Size(),
-		Mtime:  info.ModTime().Unix(),
+		Exists:   true,
+		Path:     p.Path,
+		IsDir:    mode.IsDir(),
+		IsLink:   mode&fs.ModeSymlink != 0,
+		IsReg:    mode.IsRegular(),
+		IsBlock:  mode&fs.ModeDevice != 0 && mode&fs.ModeCharDevice == 0,
+		IsChar:   mode&fs.ModeCharDevice != 0,
+		IsFIFO:   mode&fs.ModeNamedPipe != 0,
+		IsSocket: mode&fs.ModeSocket != 0,
+		Mode:     fmt.Sprintf("0%o", perm),
+		Size:     st.Size,
+		UID:      int(st.Uid),
+		GID:      int(st.Gid),
+		Inode:    uint64(st.Ino),
+		Dev:      uint64(st.Dev),
+		Nlink:    uint64(st.Nlink),
+		Atime:    statAtime(&st),
+		Mtime:    statMtime(&st),
+		Ctime:    statCtime(&st),
+
+		IsUID: mode&fs.ModeSetuid != 0,
+		IsGID: mode&fs.ModeSetgid != 0,
+		RUsr:  perm&0o400 != 0,
+		WUsr:  perm&0o200 != 0,
+		XUsr:  perm&0o100 != 0,
+		RGrp:  perm&0o040 != 0,
+		WGrp:  perm&0o020 != 0,
+		XGrp:  perm&0o010 != 0,
+		ROth:  perm&0o004 != 0,
+		WOth:  perm&0o002 != 0,
+		XOth:  perm&0o001 != 0,
+	}
+	if u, err := user.LookupId(strconv.Itoa(result.UID)); err == nil {
+		result.Owner = u.Username
+	}
+	if g, err := user.LookupGroupId(strconv.Itoa(result.GID)); err == nil {
+		result.Group = g.Name
 	}
 
-	if sys, ok := info.Sys().(*syscall.Stat_t); ok {
-		result.Atime = statAtime(sys)
-		if u, err := user.LookupId(strconv.Itoa(int(sys.Uid))); err == nil {
-			result.Owner = u.Username
+	// access(2) honors mount-time flags like noexec/ro that the mode
+	// bits can't reveal, so we ask the kernel rather than computing
+	// from `perm` directly. This matches ansible.builtin.stat, which
+	// uses os.access for these three fields.
+	result.Readable = unix.Access(p.Path, unix.R_OK) == nil
+	result.Writeable = unix.Access(p.Path, unix.W_OK) == nil
+	result.Executable = unix.Access(p.Path, unix.X_OK) == nil
+
+	if mode&fs.ModeSymlink != 0 {
+		if target, err := os.Readlink(p.Path); err == nil {
+			result.LnkTarget = target
 		}
-		if g, err := user.LookupGroupId(strconv.Itoa(int(sys.Gid))); err == nil {
-			result.Group = g.Name
+		if src, err := filepath.EvalSymlinks(p.Path); err == nil {
+			result.LnkSource = src
 		}
 	}
 
-	if info.Mode()&fs.ModeSymlink != 0 {
-		if dest, err := os.Readlink(p.Path); err == nil {
-			result.LinkDest = dest
-		}
-	}
-
-	if p.Checksum && !info.IsDir() && info.Mode().IsRegular() {
+	if p.Checksum && mode.IsRegular() {
 		checksum, err := sha256File(p.Path)
 		if err != nil {
 			return nil, fmt.Errorf("checksum %s: %w", p.Path, err)

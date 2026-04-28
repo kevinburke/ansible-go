@@ -87,19 +87,65 @@ type StatParams struct {
 }
 
 // StatResult contains file status information.
+//
+// The field set mirrors what ansible.builtin.stat returns so that
+// playbooks consuming synthesized fields like `stat.executable` or
+// `stat.xusr` work transparently when fastagent shadows the builtin
+// stat module.
 type StatResult struct {
 	Exists   bool   `json:"exists"`
 	Path     string `json:"path"`
 	IsDir    bool   `json:"isdir,omitempty"`
 	IsLink   bool   `json:"islnk,omitempty"`
-	Mode     string `json:"mode,omitempty"`
-	Owner    string `json:"owner,omitempty"`
-	Group    string `json:"group,omitempty"`
-	Size     int64  `json:"size,omitempty"`
+	IsReg    bool   `json:"isreg,omitempty"`
+	IsBlock  bool   `json:"isblk,omitempty"`
+	IsChar   bool   `json:"ischr,omitempty"`
+	IsFIFO   bool   `json:"isfifo,omitempty"`
+	IsSocket bool   `json:"issock,omitempty"`
+
+	Mode  string `json:"mode,omitempty"`
+	Owner string `json:"owner,omitempty"` // resolved username, or "" when uid has no passwd entry
+	Group string `json:"group,omitempty"` // resolved group name, or "" when gid has no group entry
+	UID   int    `json:"uid"`
+	GID   int    `json:"gid"`
+	Size  int64  `json:"size"`
+	Inode uint64 `json:"inode,omitempty"`
+	Dev   uint64 `json:"dev,omitempty"`
+	Nlink uint64 `json:"nlink,omitempty"`
+	Mtime int64  `json:"mtime,omitempty"`
+	Atime int64  `json:"atime,omitempty"`
+	Ctime int64  `json:"ctime,omitempty"`
+
+	IsUID bool `json:"isuid,omitempty"` // setuid bit
+	IsGID bool `json:"isgid,omitempty"` // setgid bit
+	RUsr  bool `json:"rusr,omitempty"`
+	WUsr  bool `json:"wusr,omitempty"`
+	XUsr  bool `json:"xusr,omitempty"`
+	RGrp  bool `json:"rgrp,omitempty"`
+	WGrp  bool `json:"wgrp,omitempty"`
+	XGrp  bool `json:"xgrp,omitempty"`
+	ROth  bool `json:"roth,omitempty"`
+	WOth  bool `json:"woth,omitempty"`
+	XOth  bool `json:"xoth,omitempty"`
+
+	// access(2)-equivalent checks from the agent's perspective.
+	// Populated even when mode bits would let us derive them, because
+	// access(2) (which is what ansible.builtin.stat consults via
+	// os.access) honors filesystem mount options like `noexec` and
+	// `ro` that mode bits don't reveal.
+	Readable   bool `json:"readable,omitempty"`
+	Writeable  bool `json:"writeable,omitempty"`
+	Executable bool `json:"executable,omitempty"`
+
 	Checksum string `json:"checksum,omitempty"`
-	LinkDest string `json:"lnk_source,omitempty"`
-	Mtime    int64  `json:"mtime,omitempty"`
-	Atime    int64  `json:"atime,omitempty"`
+
+	// Symlink target details, set only when the path is a symlink.
+	// LnkTarget is os.Readlink (raw, possibly relative); LnkSource is
+	// the resolved absolute path (filepath.EvalSymlinks). Mirrors
+	// ansible.builtin.stat, which fills `lnk_target` from os.readlink
+	// and `lnk_source` from os.path.realpath.
+	LnkTarget string `json:"lnk_target,omitempty"`
+	LnkSource string `json:"lnk_source,omitempty"`
 }
 
 // ReadFileParams requests file content.

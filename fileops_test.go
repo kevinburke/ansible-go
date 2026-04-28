@@ -38,11 +38,133 @@ func TestStatExistingFile(t *testing.T) {
 	if result.IsDir {
 		t.Error("expected isdir=false")
 	}
+	if !result.IsReg {
+		t.Error("expected isreg=true for a regular file")
+	}
 	if result.Size != 5 {
 		t.Errorf("got size %d, want 5", result.Size)
 	}
 	if result.Checksum == "" {
 		t.Error("expected checksum to be set")
+	}
+}
+
+// TestStatSynthesizedFields guards against a regression where the
+// fastagent stat action plugin crashed playbooks with
+// "object of type 'dict' has no attribute 'executable'" because the
+// Go agent didn't return the per-bit booleans, uid/gid, nlink/inode,
+// or the access(2)-derived readable/writeable/executable that
+// ansible.builtin.stat sets.
+func TestStatSynthesizedFields(t *testing.T) {
+	s := newTestServer()
+
+	tmp := t.TempDir()
+	exe := filepath.Join(tmp, "exec")
+	if err := os.WriteFile(exe, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	plain := filepath.Join(tmp, "plain")
+	if err := os.WriteFile(plain, []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name           string
+		path           string
+		wantExecutable bool
+		wantXUsr       bool
+	}{
+		{name: "0755_executable", path: exe, wantExecutable: true, wantXUsr: true},
+		{name: "0644_not_executable", path: plain, wantExecutable: false, wantXUsr: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := rpcCall(t, s, "Stat", StatParams{Path: tc.path})
+			if resp.Error != nil {
+				t.Fatalf("unexpected error: %v", resp.Error)
+			}
+			resultJSON, _ := json.Marshal(resp.Result)
+			var result StatResult
+			if err := json.Unmarshal(resultJSON, &result); err != nil {
+				t.Fatal(err)
+			}
+
+			if !result.Exists || !result.IsReg {
+				t.Fatalf("expected an existing regular file, got %+v", result)
+			}
+			if result.UID != os.Getuid() {
+				t.Errorf("uid: got %d, want %d", result.UID, os.Getuid())
+			}
+			if result.GID != os.Getgid() {
+				t.Errorf("gid: got %d, want %d", result.GID, os.Getgid())
+			}
+			if result.Nlink == 0 {
+				t.Error("nlink should be at least 1")
+			}
+			if result.Inode == 0 {
+				t.Error("inode should be non-zero")
+			}
+			if result.Ctime == 0 {
+				t.Error("ctime should be non-zero")
+			}
+			if !result.RUsr || !result.WUsr {
+				t.Errorf("rusr/wusr should be true on owner-writable file: rusr=%v wusr=%v", result.RUsr, result.WUsr)
+			}
+			if result.WOth {
+				t.Error("woth should be false on a 0o644/0o755 file")
+			}
+			if !result.Readable {
+				t.Error("readable should be true for an owned regular file")
+			}
+			if result.Executable != tc.wantExecutable {
+				t.Errorf("executable: got %v, want %v", result.Executable, tc.wantExecutable)
+			}
+			if result.XUsr != tc.wantXUsr {
+				t.Errorf("xusr: got %v, want %v", result.XUsr, tc.wantXUsr)
+			}
+		})
+	}
+}
+
+// TestStatSymlinkTargetAndSource exercises both lnk_target (raw
+// readlink result) and lnk_source (resolved realpath). The previous
+// implementation populated lnk_source with the readlink output and
+// shipped no lnk_target at all; the action plugin then aliased
+// lnk_target to lnk_source, masking the divergence.
+func TestStatSymlinkTargetAndSource(t *testing.T) {
+	s := newTestServer()
+
+	tmp := t.TempDir()
+	target := filepath.Join(tmp, "target.txt")
+	if err := os.WriteFile(target, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(tmp, "link")
+	if err := os.Symlink("target.txt", link); err != nil { // relative target
+		t.Fatal(err)
+	}
+
+	resp := rpcCall(t, s, "Stat", StatParams{Path: link})
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+	resultJSON, _ := json.Marshal(resp.Result)
+	var result StatResult
+	if err := json.Unmarshal(resultJSON, &result); err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsLink {
+		t.Fatal("expected islnk=true")
+	}
+	if result.LnkTarget != "target.txt" {
+		t.Errorf("lnk_target: got %q, want %q (raw readlink result)", result.LnkTarget, "target.txt")
+	}
+	wantSource, err := filepath.EvalSymlinks(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.LnkSource != wantSource {
+		t.Errorf("lnk_source: got %q, want %q (resolved realpath)", result.LnkSource, wantSource)
 	}
 }
 

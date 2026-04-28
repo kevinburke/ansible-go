@@ -78,27 +78,63 @@ class ActionModule(ActionBase):
             return result
 
         # Build the stat dict that Ansible expects.
-        stat = {
-            "exists": stat_result.get("exists", False),
-        }
+        #
+        # The Go agent populates the same fields ansible.builtin.stat
+        # would, so we mostly copy them through. Anything missing on
+        # the wire — typically because the field's value is the zero
+        # value and the Go side used `omitempty` — falls back to a
+        # sensible default (False/0/"") so playbooks consuming
+        # `stat.<field>` see a key rather than crash with
+        # `'dict' has no attribute 'X'`.
+        stat = {"exists": stat_result.get("exists", False)}
 
         if stat["exists"]:
             stat["path"] = stat_result.get("path", path)
-            stat["isdir"] = stat_result.get("isdir", False)
-            stat["islnk"] = stat_result.get("islnk", False)
-            stat["isreg"] = not stat.get("isdir", False) and not stat.get("islnk", False)
+
+            # File type flags.
+            for k in ("isdir", "islnk", "isreg", "isblk", "ischr", "isfifo", "issock"):
+                stat[k] = bool(stat_result.get(k, False))
+
             stat["mode"] = stat_result.get("mode", "")
-            stat["owner"] = stat_result.get("owner", "")
-            stat["group"] = stat_result.get("group", "")
             stat["size"] = stat_result.get("size", 0)
+            stat["uid"] = stat_result.get("uid", 0)
+            stat["gid"] = stat_result.get("gid", 0)
+            stat["dev"] = stat_result.get("dev", 0)
+            stat["inode"] = stat_result.get("inode", 0)
+            stat["nlink"] = stat_result.get("nlink", 0)
+
+            # ansible.builtin.stat uses `owner`/`group` as the
+            # human-readable name (or numeric uid/gid when the lookup
+            # fails) and exposes `pw_name`/`gr_name` only when the
+            # lookup succeeded. Mirror that.
+            owner = stat_result.get("owner", "")
+            group = stat_result.get("group", "")
+            stat["owner"] = owner if owner else str(stat["uid"])
+            stat["group"] = group if group else str(stat["gid"])
+            if owner:
+                stat["pw_name"] = owner
+            if group:
+                stat["gr_name"] = group
+
             stat["mtime"] = float(stat_result.get("mtime", 0))
             stat["atime"] = float(stat_result.get("atime", 0))
+            stat["ctime"] = float(stat_result.get("ctime", 0))
 
-            if stat_result.get("islnk"):
+            # Per-bit mode flags and access(2) results.
+            for k in (
+                "isuid", "isgid",
+                "rusr", "wusr", "xusr",
+                "rgrp", "wgrp", "xgrp",
+                "roth", "woth", "xoth",
+                "readable", "writeable", "executable",
+            ):
+                stat[k] = bool(stat_result.get(k, False))
+
+            if stat["islnk"]:
                 stat["lnk_source"] = stat_result.get("lnk_source", "")
-                stat["lnk_target"] = stat_result.get("lnk_source", "")
+                stat["lnk_target"] = stat_result.get("lnk_target", "")
 
-            if get_checksum and not stat["isdir"] and stat.get("isreg", False):
+            if get_checksum and stat["isreg"]:
                 stat["checksum"] = stat_result.get("checksum", "")
 
         result["stat"] = stat
