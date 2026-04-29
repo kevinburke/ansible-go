@@ -2,6 +2,26 @@
 
 All notable changes to fastagent are documented in this file.
 
+## 0.7.1 — April 28, 2026
+
+### Bug fixes
+
+- **Invalidate the apt cache when `/etc/apt/sources.list.d/` changes.**
+  The `apt` action's "skip apt-get update if cache is fresh"
+  optimization tracked only how recently the cache had been refreshed
+  and ignored modifications to the sources directory. A play that
+  wrote a new `.sources` file (typically via `deb822_repository`,
+  which runs in upstream Python and is invisible to fastagent) and
+  then ran `apt: update_cache=true` within the freshness window would
+  silently skip the update, then fail to install packages from the
+  newly added repo with `Unable to locate package`. The skip now
+  also requires that the recorded update time is newer than the
+  latest mtime under `/etc/apt/sources.list` and one level of
+  `/etc/apt/sources.list.d/`; if any source is newer, fastagent falls
+  through to `apt-get update` and invalidates the dpkg cache as
+  before. Both the in-memory and on-disk (`/var/lib/apt/lists/lock`
+  mtime) skip paths share the same predicate.
+
 ## 0.7.0 — April 28, 2026
 
 ### Bug fixes
