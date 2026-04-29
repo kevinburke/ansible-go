@@ -20,6 +20,66 @@ var (
 	aptInstalledValid bool            // whether the map is populated
 )
 
+// Default apt sources locations. Variables (not constants) so tests can
+// override them.
+var (
+	aptSourcesList = "/etc/apt/sources.list"
+	aptSourcesDir  = "/etc/apt/sources.list.d"
+	aptListsLock   = "/var/lib/apt/lists/lock"
+)
+
+// latestAptSourcesMTime returns the most recent mtime across the apt
+// source list file and one level of entries in the sources.list.d
+// directory (plus the directory itself, to catch additions/removals).
+// Missing paths are ignored. Returns the zero time if nothing readable
+// is found.
+func latestAptSourcesMTime(list, dir string) time.Time {
+	var latest time.Time
+	bump := func(t time.Time) {
+		if t.After(latest) {
+			latest = t
+		}
+	}
+
+	if info, err := os.Stat(list); err == nil {
+		bump(info.ModTime())
+	}
+	if info, err := os.Stat(dir); err == nil {
+		bump(info.ModTime())
+	}
+	if entries, err := os.ReadDir(dir); err == nil {
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			bump(info.ModTime())
+		}
+	}
+	return latest
+}
+
+// aptCacheFresh reports whether an apt cache last refreshed at updatedAt
+// can be considered fresh at time now. The cache is fresh only when it
+// is non-zero, within the validity window, and not older than the
+// latest apt sources mtime — a sources change (e.g. a newly written
+// deb822 .sources file) invalidates the cache regardless of age.
+func aptCacheFresh(updatedAt, sourcesMTime, now time.Time, validTime time.Duration) bool {
+	if updatedAt.IsZero() {
+		return false
+	}
+	if now.Sub(updatedAt) >= validTime {
+		return false
+	}
+	if !sourcesMTime.IsZero() && sourcesMTime.After(updatedAt) {
+		return false
+	}
+	return true
+}
+
 // loadInstalledPackages reads dpkg status to build the installed package set.
 // Must be called with aptMu held.
 func loadInstalledPackages(logger interface{ Debug(string, ...any) }) {
@@ -92,22 +152,35 @@ func (s *Server) handlePackageApt(p PackageParams) (any, error) {
 		if validTime <= 0 {
 			validTime = 60
 		}
+		validDur := time.Duration(validTime) * time.Second
+		now := time.Now()
+		sourcesMTime := latestAptSourcesMTime(aptSourcesList, aptSourcesDir)
 
 		aptMu.Lock()
-		if !aptCacheUpdated.IsZero() && time.Since(aptCacheUpdated) < time.Duration(validTime)*time.Second {
-			skip = true
-			s.Logger.Debug("apt cache fresh, skipping update",
-				"age", time.Since(aptCacheUpdated).String(),
-				"valid_time", validTime)
-		}
+		recorded := aptCacheUpdated
 		aptMu.Unlock()
 
+		if aptCacheFresh(recorded, sourcesMTime, now, validDur) {
+			skip = true
+			s.Logger.Debug("apt cache fresh, skipping update",
+				"age", now.Sub(recorded).String(),
+				"valid_time", validTime)
+		} else if !recorded.IsZero() && sourcesMTime.After(recorded) {
+			s.Logger.Debug("apt sources changed since last update, refreshing",
+				"sources_mtime", sourcesMTime,
+				"cache_updated", recorded)
+		}
+
 		if !skip {
-			if info, err := os.Stat("/var/lib/apt/lists/lock"); err == nil {
-				if time.Since(info.ModTime()) < time.Duration(validTime)*time.Second {
+			if info, err := os.Stat(aptListsLock); err == nil {
+				if aptCacheFresh(info.ModTime(), sourcesMTime, now, validDur) {
 					skip = true
 					s.Logger.Debug("apt lists cache fresh on disk, skipping update",
-						"age", time.Since(info.ModTime()).String())
+						"age", now.Sub(info.ModTime()).String())
+				} else if sourcesMTime.After(info.ModTime()) {
+					s.Logger.Debug("apt sources changed since on-disk update, refreshing",
+						"sources_mtime", sourcesMTime,
+						"lock_mtime", info.ModTime())
 				}
 			}
 		}
