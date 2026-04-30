@@ -81,21 +81,15 @@ source comparison.
 
 ### file
 
-- `mode` parsing only accepts octal strings/ints after the action plugin's
-  simple normalization. Symbolic modes like `u=rw,g=r,o=` are not supported.
-- `modification_time` and `access_time` are parsed in the action plugin but not
-  sent to or applied by the Go handler.
-- `follow` is not consistently honored by file attribute operations because
-  Go uses `os.Stat`, `os.Chmod`, and `os.Chown`.
-- Link and hardlink behavior is simplified: `force`, ownership, mode handling,
-  relative links, existing directory/file edge cases, and atomic replacement
-  should be compared against stock.
+- The file fast path now falls back to `ansible.builtin.file` before connecting
+  to the agent for symbolic modes, explicit access/modification time controls,
+  `follow=false` attribute operations, and `state=link`/`state=hard` semantics.
+  Those cases still need parity coverage before they can be accelerated.
 - `state=touch` always changes timestamps for existing files and does not
-  implement Ansible's time formatting knobs.
+  implement Ansible's time formatting knobs unless the user sets explicit time
+  options, in which case it falls back to `ansible.builtin.file`.
 - `state=absent` returns a minimal result and does not expose the same
   `path_contents`/diff behavior stock Ansible can produce.
-- The file action currently sets `uid` and `gid` to `0` after a successful
-  `state=file` operation instead of copying values from stat.
 
 ### apt/package/dnf
 

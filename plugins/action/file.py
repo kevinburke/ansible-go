@@ -14,10 +14,16 @@ from ansible.utils.vars import merge_hash
 
 try:
     from ansible_collections.kevinburke.fastagent.plugins.module_utils.file_state import (
+        format_octal_mode,
         infer_file_state,
+        requires_builtin_file,
     )
 except ImportError:
-    from plugins.module_utils.file_state import infer_file_state
+    from plugins.module_utils.file_state import (
+        format_octal_mode,
+        infer_file_state,
+        requires_builtin_file,
+    )
 
 
 class ActionModule(ActionBase):
@@ -40,8 +46,6 @@ class ActionModule(ActionBase):
                     module_name="ansible.builtin.file", task_vars=task_vars
                 ),
             )
-
-        self._connection._connect()
 
         # The file override uses Stat RPCs internally, which the agent
         # rejects when running as root on behalf of a become_user
@@ -69,11 +73,34 @@ class ActionModule(ActionBase):
         force = boolean(args.get("force", False), strict=False)
         modification_time = args.get("modification_time")
         access_time = args.get("access_time")
+        modification_time_format = args.get("modification_time_format")
+        access_time_format = args.get("access_time_format")
 
         if not path:
             result["failed"] = True
             result["msg"] = "path is required"
             return result
+
+        if requires_builtin_file(
+            {
+                "state": state,
+                "src": src,
+                "mode": mode,
+                "follow": follow,
+                "modification_time": modification_time,
+                "access_time": access_time,
+                "modification_time_format": modification_time_format,
+                "access_time_format": access_time_format,
+            }
+        ):
+            return merge_hash(
+                result,
+                self._execute_module(
+                    module_name="ansible.builtin.file", task_vars=task_vars
+                ),
+            )
+
+        self._connection._connect()
 
         client = self._connection._agent_client
         check_mode = self._play_context.check_mode
@@ -127,7 +154,7 @@ class ActionModule(ActionBase):
                     state="directory",
                     owner=owner,
                     group=group,
-                    mode=self._format_mode(mode),
+                    mode=format_octal_mode(mode),
                     recurse=recurse,
                     follow=follow,
                 )
@@ -153,7 +180,7 @@ class ActionModule(ActionBase):
                     state="touch",
                     owner=owner,
                     group=group,
-                    mode=self._format_mode(mode),
+                    mode=format_octal_mode(mode),
                 )
                 result.update(file_result)
                 result["path"] = path
@@ -182,7 +209,7 @@ class ActionModule(ActionBase):
                     src=src,
                     owner=owner,
                     group=group,
-                    mode=self._format_mode(mode),
+                    mode=format_octal_mode(mode),
                 )
                 result.update(file_result)
                 result["path"] = path
@@ -222,7 +249,7 @@ class ActionModule(ActionBase):
                 state="file",
                 owner=owner,
                 group=group,
-                mode=self._format_mode(mode),
+                mode=format_octal_mode(mode),
             )
             result.update(file_result)
             result["path"] = path
@@ -230,8 +257,8 @@ class ActionModule(ActionBase):
 
             # Add stat-like fields that Ansible expects.
             stat_result = client.stat(path, follow=follow)
-            result["uid"] = 0  # TODO: resolve from owner
-            result["gid"] = 0
+            result["uid"] = stat_result.get("uid", 0)
+            result["gid"] = stat_result.get("gid", 0)
             result["owner"] = stat_result.get("owner", "")
             result["group"] = stat_result.get("group", "")
             result["mode"] = stat_result.get("mode", "")
@@ -240,13 +267,3 @@ class ActionModule(ActionBase):
             result["failed"] = True
             result["msg"] = f"fastagent file failed: {e}"
         return result
-
-    def _format_mode(self, mode):
-        if mode is None:
-            return None
-        if isinstance(mode, int):
-            return f"0{mode:o}"
-        mode_str = str(mode)
-        if not mode_str.startswith("0"):
-            mode_str = "0" + mode_str
-        return mode_str
