@@ -99,23 +99,37 @@ source comparison.
 
 ### apt/package/dnf
 
-- The apt fast path supports a small subset: `name/pkg/package`, `state`,
-  `update_cache`, and `cache_valid_time`. Parameters such as `purge`,
+- The apt action fast path supports only simple package names via
+  `name/pkg/package`, `state=present/absent/latest` plus the older
+  `installed/removed` aliases, `update_cache`, and `cache_valid_time`.
+  Explicit unsupported `ansible.builtin.apt` arguments fall back to
+  `ansible.builtin.apt` before the Package RPC, including `purge`,
   `autoremove`, `allow_downgrade`, `only_upgrade`, `install_recommends`,
-  `policy_rc_d`, `default_release`, `dpkg_options`, lock timeout handling, and
-  deb file installs need either fallback or implementation.
-- `purge` is parsed but ignored.
-- `state=latest` uses `apt-get install --yes --upgrade`, which needs reference
-  comparison with `ansible.builtin.apt`.
+  `policy_rc_d`, `default_release`, non-default `dpkg_options`, lock timeout
+  tuning, deb file installs, `build-dep`, `fixed`, `upgrade`, package version
+  constraints, architecture-qualified package specs, paths, and wildcards.
+- The apt module shim has no safe builtin fallback because it shadows
+  `ansible.legacy.apt` for generic `package` dispatch, so it fails before
+  package operations when those explicit unsupported arguments or package specs
+  are supplied.
+- `state=latest` still uses `apt-get install --yes --upgrade`, which needs
+  reference comparison with `ansible.builtin.apt`.
 - The changed detection from apt output is string-based and likely wrong for
   several no-op/update/remove cases.
-- The dpkg installed cache treats package names literally; version constraints,
-  virtual packages, architecture suffixes, and package specs like
-  `foo=1.2.3` need reference tests.
-- The dnf/yum shim accepts many parameters but ignores most of them when
-  building the command.
+- The dpkg installed cache treats package names literally. Version constraints,
+  architecture suffixes, paths, and wildcard package specs now fall back/fail
+  before using the cache; virtual packages still need reference tests because
+  simple names cannot be distinguished syntactically.
+- The dnf/yum shim supports simple package names with
+  `state=present/absent/latest` plus `installed/removed` aliases. It accepts
+  the stock ansible-core 2.20.4 dnf argument names for parsing, but any
+  explicit unsupported value such as `update_cache`, repo/plugin selection,
+  `autoremove`, `security`, `bugfix`, `download_only`, `allowerasing`, alternate
+  roots, package specs, RPM paths, or `list` fails before running dnf/yum
+  instead of being silently ignored.
 - The Go `Package` RPC does not model check mode; action plugins synthesize
-  rough check-mode results instead.
+  rough check-mode results for package-manager shims. The apt action now falls
+  back to `ansible.builtin.apt` for check mode.
 
 ### systemd/service
 

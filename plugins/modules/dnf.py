@@ -32,6 +32,60 @@ import os
 from ansible.module_utils.basic import AnsibleModule
 
 
+_UNSUPPORTED_DEFAULTS = {
+    "allow_downgrade": False,
+    "allowerasing": False,
+    "autoremove": False,
+    "best": None,
+    "bugfix": False,
+    "cacheonly": False,
+    "conf_file": None,
+    "disable_excludes": None,
+    "disable_gpg_check": False,
+    "disable_plugin": [],
+    "disablerepo": [],
+    "download_dir": None,
+    "download_only": False,
+    "enable_plugin": [],
+    "enablerepo": [],
+    "exclude": [],
+    "installroot": "/",
+    "install_weak_deps": True,
+    "list": None,
+    "lock_timeout": 30,
+    "nobest": None,
+    "releasever": None,
+    "security": False,
+    "skip_broken": False,
+    "sslverify": True,
+    "update_cache": False,
+    "update_only": False,
+    "use_backend": "auto",
+    "validate_certs": True,
+}
+
+
+def _unsupported_value_differs(default, value):
+    if isinstance(default, bool):
+        return bool(value) != default
+    return value != default
+
+
+def _unsupported_params(params):
+    unsupported = []
+    for name, default in _UNSUPPORTED_DEFAULTS.items():
+        if _unsupported_value_differs(default, params.get(name)):
+            unsupported.append(name)
+    for name in params.get("name") or []:
+        if any(
+            token in name
+            for token in (" ", ">", "<", "=", "*", "?", ":", "/", "@")
+        ):
+            unsupported.append("name")
+            break
+    return unsupported
+
+
 def _find_manager():
     """Find the available package manager (dnf or yum)."""
     for mgr in ("dnf", "yum"):
@@ -47,29 +101,43 @@ def main():
             name=dict(type="list", elements="str", aliases=["package", "pkg"]),
             state=dict(
                 type="str",
-                default="present",
+                default=None,
                 choices=["present", "absent", "latest", "installed", "removed"],
             ),
-            # Accept common dnf parameters for compatibility.
+            # Accept common dnf parameters so unsupported values fail before
+            # package operations instead of being silently ignored.
+            allow_downgrade=dict(type="bool", default=False),
+            allowerasing=dict(type="bool", default=False),
+            best=dict(type="bool"),
+            list=dict(type="str"),
+            use_backend=dict(
+                type="str",
+                default="auto",
+                choices=["auto", "dnf", "yum", "yum4", "dnf4", "dnf5"],
+            ),
             enablerepo=dict(type="list", elements="str", default=[]),
             disablerepo=dict(type="list", elements="str", default=[]),
             conf_file=dict(type="str"),
             disable_gpg_check=dict(type="bool", default=False),
+            disable_excludes=dict(type="str", default=None),
+            disable_plugin=dict(type="list", elements="str", default=[]),
+            enable_plugin=dict(type="list", elements="str", default=[]),
             installroot=dict(type="str", default="/"),
             releasever=dict(type="str"),
             autoremove=dict(type="bool", default=False),
             exclude=dict(type="list", elements="str", default=[]),
             skip_broken=dict(type="bool", default=False),
-            update_cache=dict(type="bool", default=False),
+            update_cache=dict(type="bool", default=False, aliases=["expire-cache"]),
             security=dict(type="bool", default=False),
             bugfix=dict(type="bool", default=False),
-            nobest=dict(type="bool", default=False),
+            nobest=dict(type="bool"),
             cacheonly=dict(type="bool", default=False),
             lock_timeout=dict(type="int", default=30),
             install_weak_deps=dict(type="bool", default=True),
             download_only=dict(type="bool", default=False),
-            allowerasing=dict(type="bool", default=False),
             download_dir=dict(type="str"),
+            update_only=dict(type="bool", default=False),
+            validate_certs=dict(type="bool", default=True),
             sslverify=dict(type="bool", default=True),
         ),
         supports_check_mode=True,
@@ -77,6 +145,18 @@ def main():
 
     names = module.params.get("name") or []
     state = module.params["state"]
+    if state is None:
+        state = "absent" if module.params.get("autoremove") else "present"
+
+    unsupported = _unsupported_params(module.params)
+    if unsupported:
+        module.fail_json(
+            msg=(
+                "fastagent dnf shim does not implement these ansible.builtin.dnf "
+                f"parameters: {', '.join(sorted(set(unsupported)))}"
+            ),
+            unsupported_parameters=sorted(set(unsupported)),
+        )
 
     # Normalize state.
     if state == "installed":

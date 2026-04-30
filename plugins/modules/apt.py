@@ -40,6 +40,50 @@ import sys
 from ansible.module_utils.basic import AnsibleModule
 
 
+_UNSUPPORTED_DEFAULTS = {
+    "allow_change_held_packages": False,
+    "allow_downgrade": False,
+    "allow_unauthenticated": False,
+    "auto_install_module_deps": True,
+    "autoclean": False,
+    "autoremove": False,
+    "clean": False,
+    "deb": None,
+    "default_release": None,
+    "dpkg_options": "force-confdef,force-confold",
+    "fail_on_autoremove": False,
+    "force": False,
+    "install_recommends": None,
+    "lock_timeout": 60,
+    "only_upgrade": False,
+    "policy_rc_d": None,
+    "purge": False,
+    "update_cache_retries": 5,
+    "update_cache_retry_max_delay": 12,
+    "upgrade": "no",
+}
+
+
+def _unsupported_value_differs(default, value):
+    if isinstance(default, bool):
+        return bool(value) != default
+    return value != default
+
+
+def _unsupported_params(params):
+    unsupported = []
+    for name, default in _UNSUPPORTED_DEFAULTS.items():
+        if _unsupported_value_differs(default, params.get(name)):
+            unsupported.append(name)
+    if params.get("state") in ("build-dep", "fixed"):
+        unsupported.append("state")
+    for name in params.get("name") or []:
+        if any(token in name for token in ("=", "<", ">", "*", "?", ":", "/")):
+            unsupported.append("name")
+            break
+    return unsupported
+
+
 def main():
     module = AnsibleModule(
         argument_spec=dict(
@@ -47,28 +91,47 @@ def main():
             state=dict(
                 type="str",
                 default="present",
-                choices=["present", "absent", "latest", "installed", "removed"],
+                choices=[
+                    "present",
+                    "absent",
+                    "latest",
+                    "installed",
+                    "removed",
+                    "build-dep",
+                    "fixed",
+                ],
             ),
-            update_cache=dict(type="bool", default=False),
-            # Accept and ignore common apt parameters for compatibility.
+            update_cache=dict(type="bool", default=False, aliases=["update-cache"]),
             cache_valid_time=dict(type="int", default=0),
             force=dict(type="bool", default=False),
             force_apt_get=dict(type="bool", default=False),
-            install_recommends=dict(type="bool"),
+            install_recommends=dict(type="bool", aliases=["install-recommends"]),
             dpkg_options=dict(type="str", default="force-confdef,force-confold"),
             deb=dict(type="path"),
             autoremove=dict(type="bool", default=False),
             autoclean=dict(type="bool", default=False),
             purge=dict(type="bool", default=False),
-            allow_unauthenticated=dict(type="bool", default=False),
-            allow_downgrade=dict(type="bool", default=False),
+            allow_unauthenticated=dict(
+                type="bool",
+                default=False,
+                aliases=["allow-unauthenticated"],
+            ),
+            allow_downgrade=dict(
+                type="bool",
+                default=False,
+                aliases=["allow-downgrade", "allow_downgrades", "allow-downgrades"],
+            ),
             allow_change_held_packages=dict(type="bool", default=False),
             upgrade=dict(type="str", choices=["dist", "full", "safe", "yes", "no"]),
-            default_release=dict(type="str"),
+            default_release=dict(type="str", aliases=["default-release"]),
             only_upgrade=dict(type="bool", default=False),
             lock_timeout=dict(type="int", default=60),
             fail_on_autoremove=dict(type="bool", default=False),
             clean=dict(type="bool", default=False),
+            policy_rc_d=dict(type="int", default=None),
+            update_cache_retries=dict(type="int", default=5),
+            update_cache_retry_max_delay=dict(type="int", default=12),
+            auto_install_module_deps=dict(type="bool", default=True),
         ),
         supports_check_mode=True,
     )
@@ -84,12 +147,26 @@ def main():
     names = module.params.get("name") or []
     state = module.params["state"]
     update_cache = module.params["update_cache"]
+    cache_valid_time = module.params["cache_valid_time"]
+
+    unsupported = _unsupported_params(module.params)
+    if unsupported:
+        module.fail_json(
+            msg=(
+                "fastagent apt shim does not implement these ansible.builtin.apt "
+                f"parameters: {', '.join(sorted(set(unsupported)))}"
+            ),
+            unsupported_parameters=sorted(set(unsupported)),
+        )
 
     # Normalize state.
     if state == "installed":
         state = "present"
     elif state == "removed":
         state = "absent"
+
+    if cache_valid_time and not update_cache:
+        update_cache = True
 
     if not names and not update_cache:
         module.exit_json(changed=False, msg="No packages specified")

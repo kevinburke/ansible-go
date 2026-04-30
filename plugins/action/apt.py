@@ -12,6 +12,123 @@ from ansible.module_utils.parsing.convert_bool import boolean
 from ansible.utils.vars import merge_hash
 
 
+_APT_SUPPORTED_ARGS = {
+    "name",
+    "package",
+    "pkg",
+    "state",
+    "update_cache",
+    "update-cache",
+    "cache_valid_time",
+}
+
+_APT_UNSUPPORTED_ARGS = {
+    "allow_change_held_packages",
+    "allow_downgrade",
+    "allow-downgrade",
+    "allow_downgrades",
+    "allow-downgrades",
+    "allow_unauthenticated",
+    "allow-unauthenticated",
+    "auto_install_module_deps",
+    "autoclean",
+    "autoremove",
+    "clean",
+    "deb",
+    "default_release",
+    "default-release",
+    "dpkg_options",
+    "fail_on_autoremove",
+    "force",
+    "force_apt_get",
+    "install_recommends",
+    "install-recommends",
+    "lock_timeout",
+    "only_upgrade",
+    "policy_rc_d",
+    "purge",
+    "update_cache_retries",
+    "update_cache_retry_max_delay",
+    "upgrade",
+}
+
+_APT_UNSUPPORTED_DEFAULTS = {
+    "allow_change_held_packages": False,
+    "allow_downgrade": False,
+    "allow-downgrade": False,
+    "allow_downgrades": False,
+    "allow-downgrades": False,
+    "allow_unauthenticated": False,
+    "allow-unauthenticated": False,
+    "auto_install_module_deps": True,
+    "autoclean": False,
+    "autoremove": False,
+    "clean": False,
+    "deb": None,
+    "default_release": None,
+    "default-release": None,
+    "dpkg_options": "force-confdef,force-confold",
+    "fail_on_autoremove": False,
+    "force": False,
+    "force_apt_get": False,
+    "install_recommends": None,
+    "install-recommends": None,
+    "lock_timeout": 60,
+    "only_upgrade": False,
+    "policy_rc_d": None,
+    "purge": False,
+    "update_cache_retries": 5,
+    "update_cache_retry_max_delay": 12,
+    "upgrade": "no",
+}
+
+
+def _fallback_to_builtin(action, result, task_vars):
+    return merge_hash(
+        result,
+        action._execute_module(
+            module_name="ansible.builtin.apt", task_vars=task_vars
+        ),
+    )
+
+
+def _truthy_arg(value):
+    if isinstance(value, bool):
+        return value
+    return boolean(value, strict=False)
+
+
+def _arg_differs_from_default(name, value):
+    default = _APT_UNSUPPORTED_DEFAULTS[name]
+    if isinstance(default, bool):
+        return _truthy_arg(value) != default
+    return value != default
+
+
+def _should_fallback(args):
+    for name, value in args.items():
+        if name in _APT_SUPPORTED_ARGS:
+            continue
+        if name in _APT_UNSUPPORTED_ARGS:
+            if _arg_differs_from_default(name, value):
+                return True
+            continue
+        return True
+
+    state = args.get("state", "present")
+    if state in ("build-dep", "fixed"):
+        return True
+
+    names = args.get("name") or args.get("package") or args.get("pkg") or []
+    if isinstance(names, str):
+        names = [names]
+    for name in names:
+        if any(token in name for token in ("=", "<", ">", "*", "?", ":", "/")):
+            return True
+
+    return False
+
+
 class ActionModule(ActionBase):
 
     def run(self, tmp=None, task_vars=None):
@@ -22,59 +139,41 @@ class ActionModule(ActionBase):
         del tmp
 
         if self._connection.transport != "fastagent":
-            return merge_hash(
-                result,
-                self._execute_module(
-                    module_name="ansible.builtin.apt", task_vars=task_vars
-                ),
-            )
+            return _fallback_to_builtin(self, result, task_vars)
 
         self._connection._connect()
 
         args = self._task.args
+        if _should_fallback(args):
+            return _fallback_to_builtin(self, result, task_vars)
+
         names = args.get("name") or args.get("package") or args.get("pkg") or []
         if isinstance(names, str):
             names = [names]
         state = args.get("state", "present")
-        update_cache = boolean(args.get("update_cache", False), strict=False)
+        update_cache = boolean(
+            args.get("update_cache", args.get("update-cache", False)),
+            strict=False,
+        )
         cache_valid_time = args.get("cache_valid_time", 0)
-        purge = boolean(args.get("purge", False), strict=False)
-        deb = args.get("deb")
-        upgrade = args.get("upgrade")
-
-        # Fall back for features we don't handle in the fast path.
-        if deb or upgrade:
-            return merge_hash(
-                result,
-                self._execute_module(
-                    module_name="ansible.builtin.apt", task_vars=task_vars
-                ),
-            )
+        if (
+            cache_valid_time
+            and "update_cache" not in args
+            and "update-cache" not in args
+        ):
+            update_cache = True
 
         # Normalize state.
         if state == "installed":
             state = "present"
         elif state == "removed":
             state = "absent"
-        elif state == "build-dep":
-            return merge_hash(
-                result,
-                self._execute_module(
-                    module_name="ansible.builtin.apt", task_vars=task_vars
-                ),
-            )
 
         client = self._connection._agent_client
         check_mode = self._play_context.check_mode
 
         if check_mode:
-            if names:
-                result["changed"] = True
-                result["msg"] = f"Would {state} {', '.join(names)}"
-            else:
-                result["changed"] = update_cache
-                result["cache_updated"] = update_cache
-            return result
+            return _fallback_to_builtin(self, result, task_vars)
 
         # Send everything to the Package RPC — it handles update_cache
         # deduplication internally (skips if cache was updated recently).
