@@ -33,13 +33,27 @@ except Exception as exc:  # pragma: no cover
 class _RecordingAgentClient:
     def __init__(self):
         self.write_kwargs: dict | None = None
+        self.file_calls: list[dict] = []
+        self.stat_results: list[dict] = []
+        self.read_file_error: Exception | None = None
 
-    def stat(self, path, follow, checksum):
+    def stat(self, path, follow, checksum, checksum_algorithm=None):
+        if self.stat_results:
+            return self.stat_results.pop(0)
         return {"exists": False, "isdir": False}
+
+    def read_file(self, path):
+        if self.read_file_error is not None:
+            raise self.read_file_error
+        return {"content": base64.b64encode(b"old").decode("ascii")}
 
     def write_file(self, **kwargs):
         self.write_kwargs = kwargs
         return {"changed": True, "checksum": ""}
+
+    def file(self, **kwargs):
+        self.file_calls.append(kwargs)
+        return {"changed": True}
 
 
 class _FakeConnection:
@@ -434,6 +448,147 @@ class TestCopyActionVaultDecrypt(unittest.TestCase):
             self.assertEqual(loader.calls, [(source, True)])
             write_kwargs = action._connection._agent_client.write_kwargs
             self.assertEqual(base64.b64decode(write_kwargs["content"]), payload)
+
+    def test_decrypt_false_is_passed_to_loader(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "vault.txt")
+            with open(source, "wb") as f:
+                f.write(b"$ANSIBLE_VAULT;1.1;AES256\n6165...\n")
+
+            loader = _RecordingLoader(resolved_path=source)
+            action = _make_action(
+                task_args={
+                    "src": source,
+                    "dest": "/tmp/vault.txt",
+                    "decrypt": False,
+                },
+                loader=loader,
+            )
+
+            with patch.object(ActionBase, "run", return_value={}):
+                result = action.run(task_vars={})
+
+            self.assertFalse(result.get("failed"), msg=result)
+            self.assertEqual(loader.calls, [(source, False)])
+
+    def test_force_false_existing_destination_does_not_write(self) -> None:
+        action = _make_action(
+            task_args={
+                "content": "new content",
+                "dest": "/tmp/existing.txt",
+                "force": False,
+                "mode": "0600",
+            },
+            loader=_RecordingLoader(resolved_path="/unused"),
+        )
+        client = action._connection._agent_client
+        client.stat_results = [
+            {
+                "exists": True,
+                "isdir": False,
+                "checksum": "different",
+            }
+        ]
+
+        with patch.object(ActionBase, "run", return_value={}):
+            result = action.run(task_vars={})
+
+        self.assertFalse(result.get("failed"), msg=result)
+        self.assertFalse(result.get("changed"))
+        self.assertEqual(result.get("dest"), "/tmp/existing.txt")
+        self.assertIsNone(client.write_kwargs)
+        self.assertEqual(client.file_calls, [])
+
+    def test_content_to_existing_directory_fails_without_write(self) -> None:
+        action = _make_action(
+            task_args={"content": "payload", "dest": "/tmp/destdir"},
+            loader=_RecordingLoader(resolved_path="/unused"),
+        )
+        client = action._connection._agent_client
+        client.stat_results = [{"exists": True, "isdir": True}]
+
+        with patch.object(ActionBase, "run", return_value={}):
+            result = action.run(task_vars={})
+
+        self.assertTrue(result.get("failed"), msg=result)
+        self.assertEqual(result.get("msg"), "can not use content with a dir as dest")
+        self.assertIsNone(client.write_kwargs)
+
+    def test_content_to_trailing_slash_fails_before_stat(self) -> None:
+        action = _make_action(
+            task_args={"content": "payload", "dest": "/tmp/destdir/"},
+            loader=_RecordingLoader(resolved_path="/unused"),
+        )
+
+        with patch.object(ActionBase, "run", return_value={}):
+            result = action.run(task_vars={})
+
+        self.assertTrue(result.get("failed"), msg=result)
+        self.assertEqual(result.get("msg"), "can not use content with a dir as dest")
+        self.assertIsNone(action._connection._agent_client.write_kwargs)
+
+    def test_selinux_args_delegate_to_builtin_action_plugin(self) -> None:
+        action = _make_action(
+            task_args={
+                "content": "payload",
+                "dest": "/etc/service.conf",
+                "setype": "etc_t",
+            },
+            loader=_RecordingLoader(resolved_path="/unused"),
+        )
+        action._shared_loader_obj = object()
+        action._templar = object()
+
+        delegated_calls: list[dict] = []
+
+        class _FakeBuiltin:
+            def __init__(self, **kwargs):
+                self.init_kwargs = kwargs
+
+            def _execute_module(self, **_kwargs):
+                return {"changed": False}
+
+            def run(self, task_vars):
+                delegated_calls.append(
+                    {"task_vars": task_vars, "init_kwargs": self.init_kwargs}
+                )
+                return {"changed": True, "dest": "/etc/service.conf"}
+
+        with patch(
+            "plugins.action.copy._BUILTIN_COPY_ACTION_CLASS", _FakeBuiltin
+        ), patch.object(ActionBase, "run", return_value={}):
+            result = action.run(task_vars={"inventory_hostname": "h"})
+
+        self.assertEqual(len(delegated_calls), 1)
+        self.assertEqual(result.get("dest"), "/etc/service.conf")
+        self.assertIsNone(action._connection._agent_client.write_kwargs)
+
+    def test_diff_read_error_fails_before_write(self) -> None:
+        action = _make_action(
+            task_args={"content": "new", "dest": "/tmp/existing.txt"},
+            loader=_RecordingLoader(resolved_path="/unused"),
+        )
+        action._play_context = type(
+            "DiffPlayContext",
+            (),
+            {"check_mode": False, "diff": True},
+        )()
+        client = action._connection._agent_client
+        client.stat_results = [
+            {
+                "exists": True,
+                "isdir": False,
+                "checksum": "different",
+            }
+        ]
+        client.read_file_error = OSError("permission denied")
+
+        with patch.object(ActionBase, "run", return_value={}):
+            result = action.run(task_vars={})
+
+        self.assertTrue(result.get("failed"), msg=result)
+        self.assertIn("fastagent read for diff failed", result.get("msg", ""))
+        self.assertIsNone(client.write_kwargs)
 
 
 if __name__ == "__main__":

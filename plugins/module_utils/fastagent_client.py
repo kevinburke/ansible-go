@@ -210,6 +210,7 @@ class FastAgentClient:
         path: str,
         follow: bool = False,
         checksum: bool = False,
+        checksum_algorithm: str | None = None,
     ) -> dict:
         """Stat a file on the remote host.
 
@@ -218,11 +219,14 @@ class FastAgentClient:
         couldn't otherwise see. Callers that need become-user stat
         semantics must fall back to the builtin stat module.
         """
-        return self.call("Stat", {
+        params = {
             "path": path,
             "follow": follow,
             "checksum": checksum,
-        })
+        }
+        if checksum_algorithm is not None:
+            params["checksum_algorithm"] = checksum_algorithm
+        return self.call("Stat", params)
 
     def read_file(self, path: str) -> dict:
         """Read a file from the remote host (content is base64-encoded).

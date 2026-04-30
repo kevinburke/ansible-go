@@ -1,7 +1,12 @@
 package fastagent
 
 import (
+	"crypto/md5"
+	"crypto/sha1"
+	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -46,6 +51,57 @@ func TestStatExistingFile(t *testing.T) {
 	}
 	if result.Checksum == "" {
 		t.Error("expected checksum to be set")
+	}
+}
+
+func TestStatChecksumAlgorithms(t *testing.T) {
+	s := newTestServer()
+
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "test.txt")
+	content := []byte("hello")
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sha1Sum := sha1.Sum(content)
+	sha224Sum := sha256.Sum224(content)
+	sha256Sum := sha256.Sum256(content)
+	sha384Sum := sha512.Sum384(content)
+	sha512Sum := sha512.Sum512(content)
+	md5Sum := md5.Sum(content)
+
+	cases := []struct {
+		algorithm string
+		want      string
+	}{
+		{algorithm: "md5", want: hex.EncodeToString(md5Sum[:])},
+		{algorithm: "sha1", want: hex.EncodeToString(sha1Sum[:])},
+		{algorithm: "sha224", want: hex.EncodeToString(sha224Sum[:])},
+		{algorithm: "sha256", want: hex.EncodeToString(sha256Sum[:])},
+		{algorithm: "sha384", want: hex.EncodeToString(sha384Sum[:])},
+		{algorithm: "sha512", want: hex.EncodeToString(sha512Sum[:])},
+	}
+	for _, tc := range cases {
+		t.Run(tc.algorithm, func(t *testing.T) {
+			resp := rpcCall(t, s, "Stat", StatParams{
+				Path:              path,
+				Checksum:          true,
+				ChecksumAlgorithm: tc.algorithm,
+			})
+			if resp.Error != nil {
+				t.Fatalf("unexpected error: %v", resp.Error)
+			}
+
+			resultJSON, _ := json.Marshal(resp.Result)
+			var result StatResult
+			if err := json.Unmarshal(resultJSON, &result); err != nil {
+				t.Fatal(err)
+			}
+			if result.Checksum != tc.want {
+				t.Errorf("checksum: got %s, want %s", result.Checksum, tc.want)
+			}
+		})
 	}
 }
 

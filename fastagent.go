@@ -80,10 +80,11 @@ type ExecResult struct {
 // callers fall back to running `stat` through the Exec RPC (which
 // does support BecomeUser).
 type StatParams struct {
-	Path       string `json:"path"`
-	Follow     bool   `json:"follow,omitempty"`
-	Checksum   bool   `json:"checksum,omitempty"`
-	BecomeUser string `json:"become_user,omitempty"`
+	Path              string `json:"path"`
+	Follow            bool   `json:"follow,omitempty"`
+	Checksum          bool   `json:"checksum,omitempty"`
+	ChecksumAlgorithm string `json:"checksum_algorithm,omitempty"`
+	BecomeUser        string `json:"become_user,omitempty"`
 }
 
 // StatResult contains file status information.

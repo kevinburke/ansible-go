@@ -164,6 +164,10 @@ class ActionModule(ActionBase):
             return self._run_builtin_copy(None, task_vars)
         if args.get("validate"):
             return self._run_builtin_copy(None, task_vars)
+        if self._has_selinux_args(args):
+            return self._run_builtin_copy(None, task_vars)
+        if args.get("mode") == "preserve":
+            return self._run_builtin_copy(None, task_vars)
 
         source = args.get("src")
         content = args.get("content")
@@ -172,6 +176,10 @@ class ActionModule(ActionBase):
         if not dest:
             result["failed"] = True
             result["msg"] = "dest is required"
+            return result
+        if content is not None and dest.endswith("/"):
+            result["failed"] = True
+            result["msg"] = "can not use content with a dir as dest"
             return result
         if not source and content is None:
             result["failed"] = True
@@ -209,7 +217,8 @@ class ActionModule(ActionBase):
         # playbook was trying to deploy.  See get_real_file() in
         # https://github.com/ansible/ansible/blob/devel/lib/ansible/parsing/dataloader.py
         try:
-            real_source = self._loader.get_real_file(source, decrypt=True)
+            decrypt = boolean(args.get("decrypt", True), strict=False)
+            real_source = self._loader.get_real_file(source, decrypt=decrypt)
         except Exception:
             return self._run_builtin_copy(None, task_vars)
 
@@ -249,6 +258,10 @@ class ActionModule(ActionBase):
 
         # If dest is a directory, append the source basename.
         if remote_stat.get("exists") and remote_stat.get("isdir"):
+            if args.get("content") is not None:
+                result["failed"] = True
+                result["msg"] = "can not use content with a dir as dest"
+                return result
             src = args.get("src", "")
             basename = os.path.basename(src) if src else "content"
             dest = os.path.join(dest, basename)
@@ -259,6 +272,11 @@ class ActionModule(ActionBase):
                 result["failed"] = True
                 result["msg"] = f"fastagent stat failed: {e}"
                 return result
+
+        if remote_stat.get("exists") and not force:
+            result["changed"] = False
+            result["dest"] = dest
+            return result
 
         changed = True
 
@@ -298,14 +316,16 @@ class ActionModule(ActionBase):
                 try:
                     old = client.read_file(dest)
                     old_content = base64.b64decode(old["content"])
-                    result["diff"].append({
-                        "before": to_text(old_content),
-                        "after": to_text(data),
-                        "before_header": dest,
-                        "after_header": "new content",
-                    })
-                except Exception:
-                    pass
+                except Exception as e:
+                    result["failed"] = True
+                    result["msg"] = f"fastagent read for diff failed: {e}"
+                    return result
+                result["diff"].append({
+                    "before": to_text(old_content),
+                    "after": to_text(data),
+                    "before_header": dest,
+                    "after_header": "new content",
+                })
 
         if check_mode:
             result["changed"] = True
@@ -349,3 +369,10 @@ class ActionModule(ActionBase):
         if not mode_str.startswith("0"):
             mode_str = "0" + mode_str
         return mode_str
+
+    def _has_selinux_args(self, args):
+        for key in ("seuser", "serole", "setype", "selevel"):
+            value = args.get(key)
+            if value not in (None, "_default"):
+                return True
+        return False

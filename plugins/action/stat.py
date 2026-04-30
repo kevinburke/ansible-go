@@ -51,16 +51,32 @@ class ActionModule(ActionBase):
         path = args.get("path")
         follow = boolean(args.get("follow", False), strict=False)
         get_checksum = boolean(args.get("get_checksum", True), strict=False)
-        checksum_algorithm = args.get("checksum_algorithm", "sha256")
+        get_mime = boolean(args.get("get_mime", True), strict=False)
+        get_attributes = boolean(args.get("get_attributes", True), strict=False)
+        get_selinux_context = boolean(
+            args.get("get_selinux_context", False), strict=False
+        )
+        checksum_algorithm = args.get("checksum_algorithm", "sha1")
 
         if not path:
             result["failed"] = True
             result["msg"] = "path is required"
             return result
 
-        # We only support sha256 checksums (what the Go agent computes).
-        # For other algorithms, fall back to the builtin module.
-        if get_checksum and checksum_algorithm not in ("sha256", "sha-256"):
+        # The fast path does not run `file`, `lsattr`, or SELinux helpers.
+        # Stock stat enables mime and attributes by default, so callers only
+        # get the fast path when they opt out of those extra probes.
+        if get_mime or get_attributes or get_selinux_context:
+            return merge_hash(
+                result,
+                self._execute_module(
+                    module_name="ansible.builtin.stat", task_vars=task_vars
+                ),
+            )
+
+        supported_algorithms = {"md5", "sha1", "sha224", "sha256", "sha384", "sha512"}
+        normalized_algorithm = checksum_algorithm.lower().replace("-", "")
+        if get_checksum and normalized_algorithm not in supported_algorithms:
             return merge_hash(
                 result,
                 self._execute_module(
@@ -71,7 +87,12 @@ class ActionModule(ActionBase):
         client = self._connection._agent_client
 
         try:
-            stat_result = client.stat(path, follow=follow, checksum=get_checksum)
+            stat_result = client.stat(
+                path,
+                follow=follow,
+                checksum=get_checksum,
+                checksum_algorithm=normalized_algorithm if get_checksum else None,
+            )
         except Exception as e:
             result["failed"] = True
             result["msg"] = f"fastagent stat failed: {e}"

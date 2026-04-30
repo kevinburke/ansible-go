@@ -59,11 +59,13 @@ source comparison.
 
 - `Stat` and `ReadFile` reject `BecomeUser`. The action plugins fall back for
   become tasks, but direct RPC callers cannot match stock module behavior.
-- Checksum support is SHA-256 only. The stat action falls back for other
-  algorithms, but the RPC is narrower than Ansible.
-- `stat` result coverage is intentionally close, but should be diffed against
-  stock output for symlinks, special files, inaccessible paths, uid/gid lookup
-  failures, and mount option effects.
+- Checksum support now covers Ansible's stat algorithms (`md5`, `sha1`,
+  `sha224`, `sha256`, `sha384`, and `sha512`). The action plugin falls back to
+  `ansible.builtin.stat` for unsupported algorithms and for stock's default
+  `get_mime`/`get_attributes` probes unless callers opt out.
+- `stat` result coverage is intentionally close for the fast subset, but should
+  still be diffed against stock output for special files, inaccessible paths,
+  uid/gid lookup failures, and mount option effects.
 
 ### copy/template
 
@@ -71,11 +73,9 @@ source comparison.
   but the fallback is fragile because it loads ansible-core's copy action by
   file path and rewrites internal `ansible.legacy.*` calls.
 - SELinux attributes and labels are not applied by `WriteFile`.
-- `force=false` semantics need a reference check. Current code writes when the
-  destination exists with different content and `force=false`; stock copy
-  should avoid replacing existing content in that case.
-- Diff generation suppresses read errors while building the before/after diff.
-  That can hide a difference from stock Ansible's failure or warning behavior.
+- `force=false` now avoids replacing an existing destination in the fast path.
+- Diff generation now fails before writing if the fast path cannot read the old
+  file for a requested diff.
 - Backup file naming is simplified and may not match Ansible's timestamp and
   metadata behavior.
 

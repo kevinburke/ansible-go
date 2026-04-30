@@ -1,12 +1,16 @@
 package fastagent
 
 import (
+	"crypto/md5"
+	"crypto/sha1"
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"io/fs"
 	"os"
@@ -130,7 +134,11 @@ func (s *Server) handleStat(params json.RawMessage) (any, error) {
 	}
 
 	if p.Checksum && mode.IsRegular() {
-		checksum, err := sha256File(p.Path)
+		algorithm := p.ChecksumAlgorithm
+		if algorithm == "" {
+			algorithm = "sha256"
+		}
+		checksum, err := digestFile(p.Path, algorithm)
 		if err != nil {
 			return nil, fmt.Errorf("checksum %s: %w", p.Path, err)
 		}
@@ -581,18 +589,41 @@ func (s *Server) handleFileAbsent(p FileParams) (any, error) {
 	return FileResult{Changed: true, Path: p.Path, State: "absent"}, nil
 }
 
-// sha256File computes the SHA-256 hex digest of a file.
-func sha256File(path string) (string, error) {
+// digestFile computes a hex digest for the algorithms supported by
+// ansible.builtin.stat's checksum_algorithm parameter.
+func digestFile(path, algorithm string) (string, error) {
+	var h hash.Hash
+	switch strings.ToLower(strings.ReplaceAll(algorithm, "-", "")) {
+	case "md5":
+		h = md5.New()
+	case "sha1":
+		h = sha1.New()
+	case "sha224":
+		h = sha256.New224()
+	case "sha256":
+		h = sha256.New()
+	case "sha384":
+		h = sha512.New384()
+	case "sha512":
+		h = sha512.New()
+	default:
+		return "", fmt.Errorf("unsupported checksum algorithm %q", algorithm)
+	}
+
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
-	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// sha256File computes the SHA-256 hex digest of a file.
+func sha256File(path string) (string, error) {
+	return digestFile(path, "sha256")
 }
 
 // copyFile copies src to dst, preserving permissions.
