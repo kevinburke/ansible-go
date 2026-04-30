@@ -2,6 +2,19 @@
 
 All notable changes to fastagent are documented in this file.
 
+## 0.7.2 — April 30, 2026
+
+### Bug fixes
+
+- **Honor `recurse: true` for `ansible.builtin.file` directory
+  tasks.** The File RPC parsed `recurse` but ignored it when
+  `state=directory`, so tasks like `file: path=/srv/git
+  state=directory owner=git group=git recurse=true` updated only the
+  leaf directory and left existing descendants untouched. The daemon
+  now walks descendants after ensuring the directory exists, applies
+  owner/group/mode only when they differ, and preserves the
+  `follow:` symlink behavior sent by the action plugin.
+
 ## 0.7.1 — April 28, 2026
 
 ### Bug fixes
