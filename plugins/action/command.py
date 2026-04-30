@@ -12,7 +12,6 @@ action plugin name matches `command`.
 from __future__ import annotations
 
 import datetime
-import glob
 import shlex
 
 from ansible.errors import AnsibleError
@@ -22,6 +21,18 @@ from ansible.utils.vars import merge_hash
 
 
 class ActionModule(ActionBase):
+    def _run_builtin_command(self, result, task_vars):
+        wrap_async = self._task.async_val and not getattr(
+            self._connection, "has_native_async", False
+        )
+        return merge_hash(
+            result,
+            self._execute_module(
+                module_name="ansible.builtin.command",
+                task_vars=task_vars,
+                wrap_async=wrap_async,
+            ),
+        )
 
     def _compute_environment_dict(self):
         """Template + merge ``self._task.environment`` into a flat dict.
@@ -61,17 +72,7 @@ class ActionModule(ActionBase):
         # because if the user has wired up library = .../fastagent/modules
         # in ansible.cfg, our command shim shadows ansible.legacy.command.
         if self._connection.transport != "fastagent":
-            return merge_hash(
-                result,
-                self._execute_module(
-                    module_name="ansible.builtin.command",
-                    task_vars=task_vars,
-                    wrap_async=self._task.async_val,
-                ),
-            )
-
-        # Ensure the connection is established before accessing _agent_client.
-        self._connection._connect()
+            return self._run_builtin_command(result, task_vars)
 
         args = self._task.args
         uses_shell = args.get("_uses_shell", False)
@@ -81,6 +82,8 @@ class ActionModule(ActionBase):
         chdir = args.get("chdir")
         creates = args.get("creates")
         removes = args.get("removes")
+        executable = args.get("executable")
+        expand_argument_vars = args.get("expand_argument_vars", True)
         stdin = args.get("stdin")
         stdin_add_newline = args.get("stdin_add_newline", True)
         strip_empty_ends = args.get("strip_empty_ends", True)
@@ -111,33 +114,25 @@ class ActionModule(ActionBase):
         else:
             r["cmd"] = cmd_string
 
+        # If the connection left a become plugin attached, it is a become
+        # method the agent-side sudo wrapper does not implement. Let Ansible's
+        # normal module path apply that plugin rather than silently running
+        # with the wrong privilege model.
+        if getattr(self._connection, "become", None) is not None:
+            return self._run_builtin_command(result, task_vars)
+
+        if executable:
+            return self._run_builtin_command(result, task_vars)
+
+        if not uses_shell and expand_argument_vars:
+            for arg in r["cmd"] or []:
+                if arg.startswith("~") or "$" in arg:
+                    return self._run_builtin_command(result, task_vars)
+
         # creates/removes idempotence checks.
         check_mode = self._play_context.check_mode
-        shoulda = "Would" if check_mode else "Did"
-
-        if creates:
-            # Send Stat RPC to check if file exists on remote.
-            try:
-                stat_result = self._connection._agent_client.stat(creates)
-                if stat_result.get("exists"):
-                    r["msg"] = f"{shoulda} not run command since '{creates}' exists"
-                    r["stdout"] = f"skipped, since {creates} exists"
-                    r["rc"] = 0
-                    return merge_hash(result, r)
-            except Exception:
-                # If stat fails, fall through and try to run the command.
-                pass
-
-        if removes:
-            try:
-                stat_result = self._connection._agent_client.stat(removes)
-                if not stat_result.get("exists"):
-                    r["msg"] = f"{shoulda} not run command since '{removes}' does not exist"
-                    r["stdout"] = f"skipped, since {removes} does not exist"
-                    r["rc"] = 0
-                    return merge_hash(result, r)
-            except Exception:
-                pass
+        if check_mode and (creates or removes):
+            return self._run_builtin_command(result, task_vars)
 
         r["changed"] = True
 
@@ -151,9 +146,8 @@ class ActionModule(ActionBase):
 
         # Execute via fastagent RPC.
         # For non-shell command tasks, send the shlex-parsed argv rather than
-        # the raw cmd_string. The agent's cmd_string handling uses naive
-        # whitespace splitting (strings.Fields), which corrupts quoted
-        # arguments like `su - plex -c 'systemctl --user daemon-reload'`.
+        # the raw cmd_string. The agent rejects non-shell cmd_string payloads
+        # because it cannot parse them with Ansible's shlex semantics.
         # For shell tasks, send cmd_string so the remote shell does the
         # parsing.
         exec_argv = argv
@@ -172,6 +166,11 @@ class ActionModule(ActionBase):
         # Pass become_user through the RPC instead, and the agent will
         # sudo to that user for us.
         become_user = self._connection.get_become_user()
+        if become_user is not None and (creates or removes):
+            return self._run_builtin_command(result, task_vars)
+
+        # Ensure the connection is established before accessing _agent_client.
+        self._connection._connect()
 
         # The action override bypasses Ansible's usual module pipeline,
         # which is also what would otherwise wire the task's
@@ -189,6 +188,8 @@ class ActionModule(ActionBase):
                 stdin=stdin,
                 stdin_add_newline=stdin_add_newline,
                 strip_empty_ends=strip_empty_ends,
+                creates=creates,
+                removes=removes,
                 become_user=become_user,
             )
         except Exception as e:
@@ -202,6 +203,10 @@ class ActionModule(ActionBase):
         r["rc"] = exec_result.get("rc", 0)
         r["stdout"] = exec_result.get("stdout", "")
         r["stderr"] = exec_result.get("stderr", "")
+        r["changed"] = exec_result.get("changed", r["changed"])
+        r["msg"] = exec_result.get("msg", r["msg"])
+        if exec_result.get("skipped"):
+            r["skipped"] = True
         r["start"] = to_text(start)
         r["end"] = to_text(end)
         r["delta"] = to_text(end - start)

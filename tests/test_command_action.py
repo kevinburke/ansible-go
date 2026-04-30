@@ -65,6 +65,8 @@ class _FakeConnection:
     def __init__(self, become_user):
         self._agent_client = _RecordingAgentClient()
         self._become_user = become_user
+        self.become = None
+        self.has_native_async = False
 
     def _connect(self):
         return self
@@ -127,6 +129,102 @@ class TestCommandActionBecomeUser(unittest.TestCase):
         conn = _FakeConnection(become_user=None)
         self._run_with_mocked_base(conn)
         self.assertIsNone(conn._agent_client.last_kwargs["become_user"])
+
+    def test_creates_and_removes_are_passed_to_agent(self) -> None:
+        conn = _FakeConnection(become_user=None)
+        action = _make_action(
+            conn,
+            task_args={
+                "_raw_params": "touch marker",
+                "_uses_shell": False,
+                "creates": "marker",
+                "removes": "input.*",
+            },
+        )
+        with patch.object(ActionBase, "run", return_value={}):
+            action.run(task_vars={})
+        self.assertEqual(conn._agent_client.last_kwargs["creates"], "marker")
+        self.assertEqual(conn._agent_client.last_kwargs["removes"], "input.*")
+
+    def test_unsupported_become_method_falls_back_to_builtin(self) -> None:
+        conn = _FakeConnection(become_user=None)
+        conn.become = object()
+        action = _make_action(
+            conn,
+            task_args={
+                "_raw_params": "id -u",
+                "_uses_shell": False,
+            },
+        )
+        with patch.object(ActionBase, "run", return_value={}), patch.object(
+            ActionModule,
+            "_execute_module",
+            return_value={"rc": 0, "builtin": True},
+        ) as execute_module:
+            result = action.run(task_vars={})
+        execute_module.assert_called_once()
+        self.assertEqual(
+            execute_module.call_args.kwargs["module_name"],
+            "ansible.builtin.command",
+        )
+        self.assertTrue(result["builtin"])
+        self.assertIsNone(conn._agent_client.last_kwargs)
+
+    def test_target_side_variable_expansion_falls_back(self) -> None:
+        conn = _FakeConnection(become_user=None)
+        action = _make_action(
+            conn,
+            task_args={
+                "_raw_params": "printf %s $HOME",
+                "_uses_shell": False,
+            },
+        )
+        with patch.object(ActionBase, "run", return_value={}), patch.object(
+            ActionModule,
+            "_execute_module",
+            return_value={"rc": 0, "builtin": True},
+        ) as execute_module:
+            result = action.run(task_vars={})
+        execute_module.assert_called_once()
+        self.assertTrue(result["builtin"])
+        self.assertIsNone(conn._agent_client.last_kwargs)
+
+    def test_disabling_argument_expansion_keeps_fast_path(self) -> None:
+        conn = _FakeConnection(become_user=None)
+        action = _make_action(
+            conn,
+            task_args={
+                "_raw_params": "printf %s $HOME",
+                "_uses_shell": False,
+                "expand_argument_vars": False,
+            },
+        )
+        with patch.object(ActionBase, "run", return_value={}):
+            action.run(task_vars={})
+        self.assertEqual(
+            conn._agent_client.last_kwargs["argv"],
+            ["printf", "%s", "$HOME"],
+        )
+
+    def test_creates_with_become_falls_back_to_builtin(self) -> None:
+        conn = _FakeConnection(become_user="app")
+        action = _make_action(
+            conn,
+            task_args={
+                "_raw_params": "touch marker",
+                "_uses_shell": False,
+                "creates": "marker",
+            },
+        )
+        with patch.object(ActionBase, "run", return_value={}), patch.object(
+            ActionModule,
+            "_execute_module",
+            return_value={"rc": 0, "builtin": True},
+        ) as execute_module:
+            result = action.run(task_vars={})
+        execute_module.assert_called_once()
+        self.assertTrue(result["builtin"])
+        self.assertIsNone(conn._agent_client.last_kwargs)
 
 
 @unittest.skipIf(

@@ -38,17 +38,22 @@ source comparison.
 
 ### command/shell
 
-- `handleExec` still splits `cmd_string` with `strings.Fields` when
-  `use_shell=false` and no argv is supplied. The action plugin usually sends a
-  shlex-parsed argv now, but the RPC still has a footgun for direct callers or
-  future plugin paths.
-- `creates` and `removes` are checked with the daemon's uid. Stock Ansible
-  evaluates those through the module execution context, including become.
+- Non-shell `cmd_string` is rejected by the Exec RPC; fastagent's command
+  action plugin must send `argv` after shlex parsing or fall back to
+  `ansible.builtin.command`.
+- `creates` and `removes` now use glob matching relative to `chdir` on the
+  fast path. Tasks combining those guards with non-root `become_user` fall back
+  to the builtin command module because the Go RPC cannot yet evaluate the
+  guards in the become user's execution context.
+- Non-shell tasks whose arguments need target-side `expand_argument_vars`
+  behavior fall back to the builtin command module. The fast path still handles
+  arguments without `$` or leading `~`, and tasks that explicitly set
+  `expand_argument_vars=false`.
 - The Go side only returns `rc`, `stdout`, `stderr`, `changed`, `skipped`, and
   `msg`; the action plugin synthesizes some fields, but direct RPC behavior is
-  not result-compatible with `ansible.builtin.command`.
-- Become support assumes passwordless `sudo`. Other become methods are handled
-  by the connection plugin fallback path, not by the command fast path.
+  not fully result-compatible with `ansible.builtin.command`.
+- Become support assumes passwordless `sudo`. Other become methods must fall
+  back to Ansible's own become wrapping before the command fast path runs.
 
 ### stat/read_file
 

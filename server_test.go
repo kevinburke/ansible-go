@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"log/slog"
+	"os"
 	"os/user"
 	"strings"
 	"testing"
@@ -112,6 +113,20 @@ func TestExecShell(t *testing.T) {
 	}
 }
 
+func TestExecRejectsUnparsedCommandString(t *testing.T) {
+	s := newTestServer()
+	resp := rpcCall(t, s, "Exec", ExecParams{
+		CmdString: "printf '%s\\n' 'hello world'",
+	})
+
+	if resp.Error == nil {
+		t.Fatal("expected error for non-shell cmd_string without argv")
+	}
+	if !strings.Contains(resp.Error.Message, "send argv") {
+		t.Fatalf("error %q does not explain argv requirement", resp.Error.Message)
+	}
+}
+
 func TestExecCreatesSkip(t *testing.T) {
 	s := newTestServer()
 	resp := rpcCall(t, s, "Exec", ExecParams{
@@ -130,6 +145,38 @@ func TestExecCreatesSkip(t *testing.T) {
 	}
 	if !result.Skipped {
 		t.Error("expected skipped=true when creates path exists")
+	}
+	if result.Changed {
+		t.Error("expected changed=false when creates skips execution")
+	}
+}
+
+func TestExecCreatesSkipUsesGlobRelativeToCwd(t *testing.T) {
+	s := newTestServer()
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/created.txt", []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resp := rpcCall(t, s, "Exec", ExecParams{
+		Argv:    []string{"echo", "should not run"},
+		Cwd:     dir,
+		Creates: "created.*",
+	})
+
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+
+	resultJSON, _ := json.Marshal(resp.Result)
+	var result ExecResult
+	if err := json.Unmarshal(resultJSON, &result); err != nil {
+		t.Fatal(err)
+	}
+	if !result.Skipped {
+		t.Error("expected skipped=true when creates glob matches")
+	}
+	if result.Stdout != "skipped, since created.* exists" {
+		t.Errorf("stdout = %q, want creates skip message", result.Stdout)
 	}
 }
 
@@ -151,6 +198,22 @@ func TestExecRemovesSkip(t *testing.T) {
 	}
 	if !result.Skipped {
 		t.Error("expected skipped=true when removes path does not exist")
+	}
+}
+
+func TestExecCreatesWithBecomeFailsLoudly(t *testing.T) {
+	s := newTestServer()
+	resp := rpcCall(t, s, "Exec", ExecParams{
+		Argv:       []string{"echo", "should not run"},
+		Creates:    "/dev/null",
+		BecomeUser: "nobody",
+	})
+
+	if resp.Error == nil {
+		t.Fatal("expected error for creates with become_user")
+	}
+	if !strings.Contains(resp.Error.Message, "creates with become_user") {
+		t.Fatalf("error %q does not explain unsupported creates/become", resp.Error.Message)
 	}
 }
 

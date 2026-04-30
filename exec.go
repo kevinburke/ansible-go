@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -27,28 +28,67 @@ func becomeUserCwd(username string) string {
 	return "/"
 }
 
+func commandPathMatches(pattern, cwd string) (bool, error) {
+	if pattern == "" {
+		return false, nil
+	}
+	if cwd != "" && !filepath.IsAbs(pattern) {
+		pattern = filepath.Join(cwd, pattern)
+	}
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return false, fmt.Errorf("bad path pattern %q: %w", pattern, err)
+	}
+	return len(matches) > 0, nil
+}
+
 func (s *Server) handleExec(params json.RawMessage) (any, error) {
 	var p ExecParams
 	if err := json.Unmarshal(params, &p); err != nil {
 		return nil, fmt.Errorf("unmarshal ExecParams: %w", err)
 	}
+	if p.Cwd != "" {
+		fi, err := os.Stat(p.Cwd)
+		if err != nil {
+			return nil, fmt.Errorf("exec: chdir %q: %w", p.Cwd, err)
+		}
+		if !fi.IsDir() {
+			return nil, fmt.Errorf("exec: chdir %q: not a directory", p.Cwd)
+		}
+	}
 
 	// Handle creates/removes short-circuit.
 	if p.Creates != "" {
-		if _, err := os.Stat(p.Creates); err == nil {
+		if p.BecomeUser != "" {
+			return nil, fmt.Errorf("exec: creates with become_user is not implemented; use the builtin command module")
+		}
+		ok, err := commandPathMatches(p.Creates, p.Cwd)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
 			return ExecResult{
 				RC:      0,
+				Stdout:  fmt.Sprintf("skipped, since %s exists", p.Creates),
 				Skipped: true,
-				Msg:     fmt.Sprintf("skipped, %s exists", p.Creates),
+				Msg:     fmt.Sprintf("Did not run command since '%s' exists", p.Creates),
 			}, nil
 		}
 	}
 	if p.Removes != "" {
-		if _, err := os.Stat(p.Removes); os.IsNotExist(err) {
+		if p.BecomeUser != "" {
+			return nil, fmt.Errorf("exec: removes with become_user is not implemented; use the builtin command module")
+		}
+		ok, err := commandPathMatches(p.Removes, p.Cwd)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
 			return ExecResult{
 				RC:      0,
+				Stdout:  fmt.Sprintf("skipped, since %s does not exist", p.Removes),
 				Skipped: true,
-				Msg:     fmt.Sprintf("skipped, %s does not exist", p.Removes),
+				Msg:     fmt.Sprintf("Did not run command since '%s' does not exist", p.Removes),
 			}, nil
 		}
 	}
@@ -93,11 +133,7 @@ func (s *Server) handleExec(params json.RawMessage) (any, error) {
 	case len(p.Argv) > 0:
 		finalArgv = p.Argv
 	case p.CmdString != "":
-		parts := strings.Fields(p.CmdString)
-		if len(parts) == 0 {
-			return nil, fmt.Errorf("empty command string")
-		}
-		finalArgv = parts
+		return nil, fmt.Errorf("exec: cmd_string without use_shell is not supported; send argv")
 	default:
 		return nil, fmt.Errorf("no command specified: set argv or cmd_string")
 	}
