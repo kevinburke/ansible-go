@@ -231,6 +231,7 @@ type ServiceParams struct {
 	Name    string `json:"name"`
 	State   string `json:"state,omitempty"`   // started, stopped, restarted, reloaded
 	Enabled *bool  `json:"enabled,omitempty"` // pointer to distinguish unset from false
+	NoBlock bool   `json:"no_block,omitempty"`
 }
 
 // ServiceResult is the result of a service operation.

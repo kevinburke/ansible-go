@@ -319,6 +319,7 @@ class FastAgentClient:
         manager: str = "systemd",
         state: str | None = None,
         enabled: bool | None = None,
+        no_block: bool = False,
     ) -> dict:
         """Manage system services."""
         params: dict = {"name": name, "manager": manager}
@@ -326,4 +327,6 @@ class FastAgentClient:
             params["state"] = state
         if enabled is not None:
             params["enabled"] = enabled
+        if no_block:
+            params["no_block"] = True
         return self.call("Service", params)

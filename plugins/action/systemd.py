@@ -72,7 +72,6 @@ class ActionModule(ActionBase):
                     result["failed"] = True
                     result["msg"] = f"daemon-reload failed: {e}"
                     return result
-            changed = True
 
         if not name:
             result["changed"] = changed
@@ -93,6 +92,7 @@ class ActionModule(ActionBase):
                 manager="systemd",
                 state=state,
                 enabled=enabled,
+                no_block=no_block,
             )
             result["changed"] = svc_result.get("changed", False) or changed
             result["name"] = name

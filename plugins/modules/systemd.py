@@ -64,16 +64,23 @@ def main():
             force=dict(type="bool", default=False),
         ),
         supports_check_mode=True,
-        required_one_of=[["name", "daemon_reload"]],
+        required_one_of=[["state", "enabled", "masked", "daemon_reload", "daemon_reexec"]],
+        required_by=dict(
+            state=("name",),
+            enabled=("name",),
+            masked=("name",),
+        ),
     )
 
     name = module.params["name"]
     state = module.params["state"]
     enabled = module.params["enabled"]
     daemon_reload = module.params["daemon_reload"]
+    daemon_reexec = module.params["daemon_reexec"]
     masked = module.params["masked"]
     scope = module.params["scope"]
     no_block = module.params["no_block"]
+    force = module.params["force"]
 
     changed = False
     result = {"name": name, "changed": False}
@@ -85,6 +92,10 @@ def main():
         systemctl_cmd = [systemctl, "--global"]
     else:
         systemctl_cmd = [systemctl]
+    if no_block:
+        systemctl_cmd.append("--no-block")
+    if force:
+        systemctl_cmd.append("--force")
 
     # daemon-reload
     if daemon_reload:
@@ -97,7 +108,18 @@ def main():
                     stdout=stdout,
                     stderr=stderr,
                 )
-        changed = True
+
+    # daemon-reexec
+    if daemon_reexec:
+        if not module.check_mode:
+            rc, stdout, stderr = module.run_command(systemctl_cmd + ["daemon-reexec"])
+            if rc != 0:
+                module.fail_json(
+                    msg="daemon-reexec failed",
+                    rc=rc,
+                    stdout=stdout,
+                    stderr=stderr,
+                )
 
     if not name:
         result["changed"] = changed
@@ -148,10 +170,7 @@ def main():
             needs_action = True
 
         if needs_action and not module.check_mode:
-            cmd = systemctl_cmd + [action, name]
-            if no_block:
-                cmd.append("--no-block")
-            rc, stdout, stderr = module.run_command(cmd)
+            rc, stdout, stderr = module.run_command(systemctl_cmd + [action, name])
             if rc != 0:
                 module.fail_json(
                     msg=f"Unable to {action} service {name}",

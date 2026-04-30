@@ -64,7 +64,7 @@ func (s *Server) handleServiceSystemd(p ServiceParams) (any, error) {
 		}
 
 		if needsAction {
-			cmd := exec.Command("systemctl", action, p.Name)
+			cmd := systemctlCommand(p, action, p.Name)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				return nil, fmt.Errorf("systemctl %s %s: %s\n%s", action, p.Name, err, string(out))
 			}
@@ -80,7 +80,7 @@ func (s *Server) handleServiceSystemd(p ServiceParams) (any, error) {
 			if want {
 				action = "enable"
 			}
-			cmd := exec.Command("systemctl", action, p.Name)
+			cmd := systemctlCommand(p, action, p.Name)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				return nil, fmt.Errorf("systemctl %s %s: %s\n%s", action, p.Name, err, string(out))
 			}
@@ -101,4 +101,13 @@ func (s *Server) handleServiceSystemd(p ServiceParams) (any, error) {
 		State:   currentActive,
 		Enabled: currentEnabled,
 	}, nil
+}
+
+func systemctlCommand(p ServiceParams, args ...string) *exec.Cmd {
+	cmdArgs := make([]string, 0, len(args)+1)
+	if p.NoBlock {
+		cmdArgs = append(cmdArgs, "--no-block")
+	}
+	cmdArgs = append(cmdArgs, args...)
+	return exec.Command("systemctl", cmdArgs...)
 }

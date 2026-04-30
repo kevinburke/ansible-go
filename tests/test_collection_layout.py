@@ -243,6 +243,63 @@ class TestInstalledCollection(unittest.TestCase):
         )
         self.assertEqual(result.stdout.strip(), "ok")
 
+    def test_systemd_action_routing(self):
+        """Verify fastagent's systemd action only wins the routes it should.
+
+        Plain unqualified ``systemd`` and ``ansible.legacy.systemd`` resolve
+        through the configured action plugin path, matching the README routing
+        setup. Unqualified ``systemd`` with
+        ``collections: [kevinburke.fastagent]`` and explicit
+        ``kevinburke.fastagent.systemd`` resolve to this collection.
+        ``ansible.builtin`` is pinned to ansible-core and must not resolve to
+        fastagent.
+        """
+        env = os.environ.copy()
+        action_dir = os.path.join(self.collection_dir, "plugins", "action")
+        env["ANSIBLE_ACTION_PLUGINS"] = action_dir
+        env["ANSIBLE_COLLECTIONS_PATH"] = self.install_path
+        code = r"""
+from ansible.plugins.loader import action_loader, init_plugin_loader
+
+init_plugin_loader()
+
+expected = "plugins/action/systemd.py"
+cases = [
+    ("systemd", None, True),
+    ("systemd", ["kevinburke.fastagent"], True),
+    ("ansible.legacy.systemd", None, True),
+    ("kevinburke.fastagent.systemd", None, True),
+    ("ansible.builtin.systemd", None, False),
+]
+for name, collections, should_fastagent in cases:
+    ctx = action_loader.find_plugin_with_context(
+        name,
+        collection_list=collections,
+    )
+    if not ctx.resolved and should_fastagent:
+        raise SystemExit(f"{name} did not resolve")
+    path = ctx.plugin_resolved_path or ""
+    is_fastagent = path.endswith(expected)
+    if is_fastagent != should_fastagent:
+        raise SystemExit(
+            f"{name} resolved to {path}, fastagent={is_fastagent}, "
+            f"want {should_fastagent}"
+        )
+print("ok")
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            result.returncode, 0,
+            f"routing check failed:\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}",
+        )
+        self.assertEqual(result.stdout.strip(), "ok")
+
 
 if __name__ == "__main__":
     unittest.main()

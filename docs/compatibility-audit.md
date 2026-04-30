@@ -133,17 +133,19 @@ source comparison.
 
 ### systemd/service
 
-- The systemd fast path supports only `name`, `state`, `enabled`, and
-  `daemon_reload`; it falls back for `masked`, non-system scopes, and
+- The systemd fast path supports `name`, `state`, `enabled`, `daemon_reload`,
+  and `no_block`; it falls back for `masked`, non-system scopes, and
   `daemon_reexec`.
-- `no_block` is parsed but ignored.
-- `daemon_reload` always marks changed. Stock behavior should be checked.
 - Service state detection ignores failed/inactive/activating nuances and
   ignores errors from `systemctl is-active` and `is-enabled`.
 - `reloaded` always runs `systemctl reload`; stock behavior and failure shape
   for services that cannot reload should be compared.
-- There is a TODO saying the systemd override may not fire in real playbooks;
-  routing should be verified separately from semantic parity.
+- Routing is covered for unqualified `systemd`, unqualified `systemd` with
+  `collections: [kevinburke.fastagent]`, `ansible.legacy.systemd`,
+  `kevinburke.fastagent.systemd`, and builtin-pinned
+  `ansible.builtin.systemd` action resolution. The first three route to
+  fastagent when the documented action plugin path is configured; builtin
+  pinned tasks do not route to fastagent.
 
 ### connection/raw/module fallback
 
