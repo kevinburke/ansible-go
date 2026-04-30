@@ -1,0 +1,249 @@
+# Ansible Compatibility Audit Plan
+
+Reference baseline: compare fastagent against stock `ansible-core 2.20.4`
+behavior, with older supported behavior checked where the public contract changed
+since `meta/runtime.yml` says `requires_ansible: ">=2.12.0"`.
+
+The goal is to stop fixing compatibility one report at a time. Every fast path
+should either:
+
+1. match the stock Ansible result and side effects for a documented subset, or
+2. fall back to `ansible.builtin.*` before doing any work, or
+3. document a known incompatibility with a test proving the current behavior.
+
+The known `file: state=directory recurse=true owner=... group=...` tree walk
+gap is intentionally excluded from this plan because it is being fixed
+separately.
+
+## Known Compatibility Problems
+
+These are visible from the current Go/Python fast paths before doing a deeper
+source comparison.
+
+### command/shell
+
+- `handleExec` still splits `cmd_string` with `strings.Fields` when
+  `use_shell=false` and no argv is supplied. The action plugin usually sends a
+  shlex-parsed argv now, but the RPC still has a footgun for direct callers or
+  future plugin paths.
+- `creates` and `removes` are checked with the daemon's uid. Stock Ansible
+  evaluates those through the module execution context, including become.
+- The Go side only returns `rc`, `stdout`, `stderr`, `changed`, `skipped`, and
+  `msg`; the action plugin synthesizes some fields, but direct RPC behavior is
+  not result-compatible with `ansible.builtin.command`.
+- Become support assumes passwordless `sudo`. Other become methods are handled
+  by the connection plugin fallback path, not by the command fast path.
+
+### stat/read_file
+
+- `Stat` and `ReadFile` reject `BecomeUser`. The action plugins fall back for
+  become tasks, but direct RPC callers cannot match stock module behavior.
+- Checksum support is SHA-256 only. The stat action falls back for other
+  algorithms, but the RPC is narrower than Ansible.
+- `stat` result coverage is intentionally close, but should be diffed against
+  stock output for symlinks, special files, inaccessible paths, uid/gid lookup
+  failures, and mount option effects.
+
+### copy/template
+
+- Directory copy falls back to the builtin action. That is probably correct,
+  but the fallback is fragile because it loads ansible-core's copy action by
+  file path and rewrites internal `ansible.legacy.*` calls.
+- `validate` exists on `WriteFileParams` but is not implemented in
+  `handleWriteFile`. A fast-path copy using `validate:` will silently skip the
+  validation command unless the action plugin falls back first.
+- SELinux attributes and labels are not applied by `WriteFile`.
+- `force=false` semantics need a reference check. Current code writes when the
+  destination exists with different content and `force=false`; stock copy
+  should avoid replacing existing content in that case.
+- Diff generation suppresses read errors while building the before/after diff.
+  That can hide a difference from stock Ansible's failure or warning behavior.
+- Backup file naming is simplified and may not match Ansible's timestamp and
+  metadata behavior.
+
+### file
+
+- `mode` parsing only accepts octal strings/ints after the action plugin's
+  simple normalization. Symbolic modes like `u=rw,g=r,o=` are not supported.
+- `modification_time` and `access_time` are parsed in the action plugin but not
+  sent to or applied by the Go handler.
+- `follow` is not consistently honored by file attribute operations because
+  Go uses `os.Stat`, `os.Chmod`, and `os.Chown`.
+- Link and hardlink behavior is simplified: `force`, ownership, mode handling,
+  relative links, existing directory/file edge cases, and atomic replacement
+  should be compared against stock.
+- `state=touch` always changes timestamps for existing files and does not
+  implement Ansible's time formatting knobs.
+- `state=absent` returns a minimal result and does not expose the same
+  `path_contents`/diff behavior stock Ansible can produce.
+- The file action currently sets `uid` and `gid` to `0` after a successful
+  `state=file` operation instead of copying values from stat.
+
+### apt/package/dnf
+
+- The apt fast path supports a small subset: `name/pkg/package`, `state`,
+  `update_cache`, and `cache_valid_time`. Parameters such as `purge`,
+  `autoremove`, `allow_downgrade`, `only_upgrade`, `install_recommends`,
+  `policy_rc_d`, `default_release`, `dpkg_options`, lock timeout handling, and
+  deb file installs need either fallback or implementation.
+- `purge` is parsed but ignored.
+- `state=latest` uses `apt-get install --yes --upgrade`, which needs reference
+  comparison with `ansible.builtin.apt`.
+- The changed detection from apt output is string-based and likely wrong for
+  several no-op/update/remove cases.
+- The dpkg installed cache treats package names literally; version constraints,
+  virtual packages, architecture suffixes, and package specs like
+  `foo=1.2.3` need reference tests.
+- The dnf/yum shim accepts many parameters but ignores most of them when
+  building the command.
+- The Go `Package` RPC does not model check mode; action plugins synthesize
+  rough check-mode results instead.
+
+### systemd/service
+
+- The systemd fast path supports only `name`, `state`, `enabled`, and
+  `daemon_reload`; it falls back for `masked`, non-system scopes, and
+  `daemon_reexec`.
+- `no_block` is parsed but ignored.
+- `daemon_reload` always marks changed. Stock behavior should be checked.
+- Service state detection ignores failed/inactive/activating nuances and
+  ignores errors from `systemctl is-active` and `is-enabled`.
+- `reloaded` always runs `systemctl reload`; stock behavior and failure shape
+  for services that cannot reload should be compared.
+- There is a TODO saying the systemd override may not fire in real playbooks;
+  routing should be verified separately from semantic parity.
+
+### connection/raw/module fallback
+
+- Unsupported become methods fall back to Ansible's wrapping. That is the right
+  safety choice, but needs regression tests so unsupported methods never run
+  with silently elevated or lowered privileges.
+- `_try_local_socket` can connect to a stale local forward and then fail on the
+  first RPC if the remote daemon timed out. This is not a module semantic issue,
+  but it creates user-visible differences from stock SSH reliability.
+- Fallbacks must call `ansible.builtin.*`, not `ansible.legacy.*`, whenever the
+  fastagent legacy module shims are on the module path.
+
+## Reference Harness
+
+Build a parity harness that can run the same task twice:
+
+- stock: `ansible_connection=ssh` or `local`, with no fastagent action path
+- fastagent: `ansible_connection=kevinburke.fastagent.fastagent`
+
+For each case, capture:
+
+- full JSON result after removing expected volatile fields such as timestamps,
+  temp paths, `invocation`, elapsed deltas, and backup suffixes
+- filesystem state after the task
+- command/service/package side effects where relevant
+- whether a fastagent task used the fast path or fell back
+
+The harness should fail loudly when a fast path claims support but differs from
+the reference. If a case is intentionally unsupported, assert that it falls back
+to `ansible.builtin.*`.
+
+## Subagent Work Plan
+
+Each subagent should start by reading the stock Ansible source for
+`ansible-core 2.20.4` installed locally, then write focused parity tests before
+changing behavior.
+
+### Agent 1: command/shell parity
+
+Owned files: `exec.go`, `plugins/action/command.py`, command tests.
+
+Tasks:
+
+- Build a matrix for `cmd`, free-form args, `argv`, shell, quoted arguments,
+  `chdir`, `creates`, `removes`, stdin, newline stripping, check mode,
+  environment, timeout, nonzero rc, and become.
+- Prove every unsupported become/privilege case falls back or fails loudly.
+- Decide whether `handleExec` should reject unparsed `cmd_string` without
+  `use_shell` or use a real shell lexer.
+
+### Agent 2: stat/read_file/copy parity
+
+Owned files: `fileops.go`, `plugins/action/stat.py`,
+`plugins/action/copy.py`, copy/stat tests.
+
+Tasks:
+
+- Compare stat output for file types, symlinks with `follow` true/false,
+  checksum algorithms, missing paths, unreadable paths, uid/gid lookup
+  failures, and special files.
+- Add fallback tests for unsupported checksum algorithms and become.
+- Check copy semantics for `content`, `src`, destination directories,
+  `force=false`, `backup`, `mode`, `owner`, `group`, `validate`, diff mode,
+  check mode, vault-decrypted files, and SELinux args.
+- Fix `validate` by falling back before the fast path or implementing it.
+
+### Agent 3: file parity
+
+Owned files: `fileops.go`, `plugins/action/file.py`,
+`plugins/module_utils/file_state.py`, file tests.
+
+Tasks:
+
+- Compare `state=file,directory,touch,absent,link,hard` across existing,
+  missing, symlink, and wrong-type paths.
+- Exclude the known recursive directory attribute walk issue from this branch.
+- Cover symbolic modes, `follow`, `force`, access/modification time options,
+  link replacement, hardlink errors, check mode, diff mode, and result fields.
+- Fix the action plugin's incorrect `uid`/`gid` result fields.
+
+### Agent 4: apt/dnf/package parity
+
+Owned files: `package.go`, `plugins/action/apt.py`,
+`plugins/modules/apt.py`, `plugins/modules/dnf.py`, package tests.
+
+Tasks:
+
+- List every accepted Ansible apt/dnf argument and classify it as implemented,
+  fallback, or unsupported.
+- Add preflight fallback for any argument currently parsed but ignored,
+  especially `purge`.
+- Reference-test package specs with versions, architecture suffixes, virtual
+  packages, multiple packages, no-op installs, removes, `latest`,
+  `update_cache`, and check mode.
+- Replace fragile changed detection where it differs from stock output.
+
+### Agent 5: systemd/service and routing parity
+
+Owned files: `service.go`, `plugins/action/systemd.py`,
+`plugins/modules/systemd.py`, connection/routing tests.
+
+Tasks:
+
+- Verify whether the systemd action override fires for unqualified,
+  `ansible.legacy`, collection-routed, and builtin-pinned tasks.
+- Compare `started`, `stopped`, `restarted`, `reloaded`, `enabled`,
+  `daemon_reload`, `no_block`, missing services, failed services, and check
+  mode.
+- Add fallback tests for `masked`, `scope`, `daemon_reexec`, and unsupported
+  service managers.
+- Decide whether `no_block` should be implemented or should trigger fallback.
+
+### Agent 6: compatibility docs and guardrails
+
+Owned files: `README.md`, `docs/testing.md`, `TODO`, lint/tests for plugin
+fallbacks.
+
+Tasks:
+
+- Turn the audited matrix into user-facing compatibility docs.
+- Add a test or lint that rejects `ansible.legacy.*` fallback calls from
+  `plugins/action/*.py`.
+- Add a generated-artifact check so docs and any compatibility fixture outputs
+  do not drift.
+- Document exact Ansible versions used for compatibility testing.
+
+## Exit Criteria
+
+- Every accelerated module has a checked-in compatibility matrix.
+- Every matrix row is implemented, falls back before side effects, or is listed
+  as a known incompatibility.
+- The known incompatibility list is user-visible and versioned.
+- CI runs the parity tests that do not require privileged package/service
+  changes, and the privileged cases have a documented manual or containerized
+  runner.
