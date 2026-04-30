@@ -289,6 +289,13 @@ func (s *Server) handleFileDirectory(p FileParams) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if p.Recurse {
+		ch, err := recursivelySetAttributes(p.Path, p.Owner, p.Group, p.Mode, p.Follow)
+		if err != nil {
+			return nil, err
+		}
+		changed = changed || ch
+	}
 	return FileResult{Changed: changed, Path: p.Path, State: "directory"}, nil
 }
 
@@ -342,6 +349,103 @@ func ensureDirectoryAnsible(path, owner, group, mode string) (bool, error) {
 		if _, err := applyOwnershipAndMode(curpath, owner, group, mode); err != nil {
 			return changed, err
 		}
+	}
+	return changed, nil
+}
+
+func recursivelySetAttributes(path, owner, group, mode string, follow bool) (bool, error) {
+	changed := false
+	if !follow {
+		err := filepath.WalkDir(path, func(child string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if child == path {
+				return nil
+			}
+			if d.Type()&fs.ModeSymlink != 0 {
+				if d.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			ch, err := applyOwnershipAndMode(child, owner, group, mode)
+			if err != nil {
+				return err
+			}
+			changed = changed || ch
+			return nil
+		})
+		if err != nil {
+			return changed, fmt.Errorf("walk %s: %w", path, err)
+		}
+		return changed, nil
+	}
+
+	seen := make(map[fileID]bool)
+	if err := markSeenDir(path, seen); err != nil {
+		return changed, err
+	}
+	ch, err := recursivelySetAttributesFollow(path, owner, group, mode, seen)
+	if err != nil {
+		return changed || ch, err
+	}
+	return changed || ch, nil
+}
+
+type fileID struct {
+	dev uint64
+	ino uint64
+}
+
+func markSeenDir(path string, seen map[fileID]bool) error {
+	var st unix.Stat_t
+	if err := unix.Stat(path, &st); err != nil {
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+	seen[fileID{dev: uint64(st.Dev), ino: uint64(st.Ino)}] = true
+	return nil
+}
+
+func recursivelySetAttributesFollow(path, owner, group, mode string, seen map[fileID]bool) (bool, error) {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return false, fmt.Errorf("read dir %s: %w", path, err)
+	}
+
+	changed := false
+	for _, entry := range entries {
+		child := filepath.Join(path, entry.Name())
+		isSymlink := entry.Type()&fs.ModeSymlink != 0
+		ch, err := applyOwnershipAndModeWithChown(child, owner, group, mode, isSymlink)
+		if err != nil {
+			return changed, err
+		}
+		changed = changed || ch
+
+		info, err := os.Stat(child)
+		if err != nil {
+			return changed, fmt.Errorf("stat %s: %w", child, err)
+		}
+		if !info.IsDir() {
+			continue
+		}
+
+		var st unix.Stat_t
+		if err := unix.Stat(child, &st); err != nil {
+			return changed, fmt.Errorf("stat %s: %w", child, err)
+		}
+		id := fileID{dev: uint64(st.Dev), ino: uint64(st.Ino)}
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+
+		ch, err = recursivelySetAttributesFollow(child, owner, group, mode, seen)
+		if err != nil {
+			return changed || ch, err
+		}
+		changed = changed || ch
 	}
 	return changed, nil
 }
@@ -517,6 +621,10 @@ func copyFile(src, dst string) error {
 // applyOwnershipAndMode sets owner, group, and mode on a path. Returns true if
 // anything changed.
 func applyOwnershipAndMode(path, owner, group, mode string) (bool, error) {
+	return applyOwnershipAndModeWithChown(path, owner, group, mode, false)
+}
+
+func applyOwnershipAndModeWithChown(path, owner, group, mode string, lchown bool) (bool, error) {
 	changed := false
 
 	if mode != "" {
@@ -524,15 +632,27 @@ func applyOwnershipAndMode(path, owner, group, mode string) (bool, error) {
 		if err != nil {
 			return false, fmt.Errorf("parse mode %q: %w", mode, err)
 		}
-		info, err := os.Stat(path)
-		if err != nil {
-			return false, fmt.Errorf("stat %s: %w", path, err)
-		}
-		if info.Mode().Perm() != fs.FileMode(m) {
-			if err := os.Chmod(path, fs.FileMode(m)); err != nil {
-				return false, fmt.Errorf("chmod %s: %w", path, err)
+		skipMode := false
+		if lchown {
+			info, err := os.Lstat(path)
+			if err != nil {
+				return false, fmt.Errorf("stat %s: %w", path, err)
 			}
-			changed = true
+			if info.Mode()&fs.ModeSymlink != 0 {
+				skipMode = true
+			}
+		}
+		if !skipMode {
+			info, err := os.Stat(path)
+			if err != nil {
+				return false, fmt.Errorf("stat %s: %w", path, err)
+			}
+			if info.Mode().Perm() != fs.FileMode(m) {
+				if err := os.Chmod(path, fs.FileMode(m)); err != nil {
+					return false, fmt.Errorf("chmod %s: %w", path, err)
+				}
+				changed = true
+			}
 		}
 	}
 
@@ -564,7 +684,11 @@ func applyOwnershipAndMode(path, owner, group, mode string) (bool, error) {
 
 		// Check current ownership before changing.
 		var st unix.Stat_t
-		if err := unix.Stat(path, &st); err != nil {
+		statFn := unix.Stat
+		if lchown {
+			statFn = unix.Lstat
+		}
+		if err := statFn(path, &st); err != nil {
 			return changed, fmt.Errorf("stat %s: %w", path, err)
 		}
 		needChange := false
@@ -575,7 +699,11 @@ func applyOwnershipAndMode(path, owner, group, mode string) (bool, error) {
 			needChange = true
 		}
 		if needChange {
-			if err := os.Chown(path, uid, gid); err != nil {
+			chownFn := os.Chown
+			if lchown {
+				chownFn = os.Lchown
+			}
+			if err := chownFn(path, uid, gid); err != nil {
 				return changed, fmt.Errorf("chown %s: %w", path, err)
 			}
 			changed = true

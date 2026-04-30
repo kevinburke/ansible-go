@@ -129,6 +129,7 @@ class ActionModule(ActionBase):
                     group=group,
                     mode=self._format_mode(mode),
                     recurse=recurse,
+                    follow=follow,
                 )
                 result.update(file_result)
                 result["path"] = path

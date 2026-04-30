@@ -524,6 +524,97 @@ func TestFileDirectoryLeavesExistingAncestorsAlone(t *testing.T) {
 	}
 }
 
+func TestFileDirectoryRecurseAppliesModeToChildren(t *testing.T) {
+	s := newTestServer()
+
+	tmp := t.TempDir()
+	dir := filepath.Join(tmp, "repo")
+	nested := filepath.Join(dir, "github.com", "example.git")
+	file := filepath.Join(nested, "HEAD")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte("ref: refs/heads/main\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := rpcCall(t, s, "File", FileParams{
+		Path:    dir,
+		State:   "directory",
+		Mode:    "0700",
+		Recurse: true,
+		Follow:  true,
+	})
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+
+	resultJSON, _ := json.Marshal(resp.Result)
+	var result FileResult
+	if err := json.Unmarshal(resultJSON, &result); err != nil {
+		t.Fatal(err)
+	}
+	if !result.Changed {
+		t.Error("expected changed=true")
+	}
+
+	for _, path := range []string{dir, filepath.Join(dir, "github.com"), nested, file} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat %s: %v", path, err)
+		}
+		if got := info.Mode().Perm(); got != 0o700 {
+			t.Errorf("%s: got mode %#o, want %#o", path, got, 0o700)
+		}
+	}
+}
+
+func TestFileDirectoryRecurseSkipsSymlinksWhenFollowFalse(t *testing.T) {
+	s := newTestServer()
+
+	tmp := t.TempDir()
+	dir := filepath.Join(tmp, "repo")
+	targetDir := filepath.Join(tmp, "target")
+	targetFile := filepath.Join(targetDir, "data")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(targetFile, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(targetDir, filepath.Join(dir, "linked-dir")); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := rpcCall(t, s, "File", FileParams{
+		Path:    dir,
+		State:   "directory",
+		Mode:    "0700",
+		Recurse: true,
+		Follow:  false,
+	})
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+
+	info, err := os.Stat(targetFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Errorf("symlink target got mode %#o, want %#o", got, 0o600)
+	}
+}
+
 func TestFileAbsent(t *testing.T) {
 	s := newTestServer()
 

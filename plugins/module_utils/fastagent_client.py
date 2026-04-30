@@ -277,6 +277,7 @@ class FastAgentClient:
         group: str | None = None,
         mode: str | None = None,
         recurse: bool = False,
+        follow: bool = True,
         src: str | None = None,
     ) -> dict:
         """Manage file/directory/link state."""
@@ -289,6 +290,8 @@ class FastAgentClient:
             params["mode"] = mode
         if recurse:
             params["recurse"] = True
+        if not follow:
+            params["follow"] = False
         if src is not None:
             params["src"] = src
         return self.call("File", params)
