@@ -284,6 +284,47 @@ class TestCopyActionVaultDecrypt(unittest.TestCase):
         self.assertEqual(len(delegated_calls), 1)
         self.assertEqual(result.get("dest"), "/remote")
 
+    def test_validate_delegates_to_builtin_action_plugin(self) -> None:
+        # WriteFileParams has a validate field, but the Go agent does not
+        # implement Ansible's validate command semantics. A copy task with
+        # validate must use the builtin action plugin rather than silently
+        # taking the fastagent write path.
+        action = _make_action(
+            task_args={
+                "content": "candidate config\n",
+                "dest": "/etc/service.conf",
+                "validate": "/usr/sbin/service-check %s",
+            },
+            loader=_RecordingLoader(resolved_path="/unused"),
+        )
+        action._shared_loader_obj = object()
+        action._templar = object()
+
+        delegated_calls: list[dict] = []
+
+        class _FakeBuiltin:
+            def __init__(self, **kwargs):
+                self.init_kwargs = kwargs
+
+            def _execute_module(self, **_kwargs):
+                return {"changed": False}
+
+            def run(self, task_vars):
+                delegated_calls.append(
+                    {"task_vars": task_vars, "init_kwargs": self.init_kwargs}
+                )
+                return {"changed": True, "dest": "/etc/service.conf"}
+
+        with patch(
+            "plugins.action.copy._BUILTIN_COPY_ACTION_CLASS", _FakeBuiltin
+        ), patch.object(ActionBase, "run", return_value={}):
+            result = action.run(task_vars={"inventory_hostname": "h"})
+
+        self.assertEqual(len(delegated_calls), 1)
+        self.assertEqual(delegated_calls[0]["task_vars"], {"inventory_hostname": "h"})
+        self.assertEqual(result.get("dest"), "/etc/service.conf")
+        self.assertIsNone(action._connection._agent_client.write_kwargs)
+
     def test_builtin_copy_action_class_loads_on_this_ansible(self) -> None:
         # Integration guard: the fallback's whole premise is that we can
         # load ansible-core's real builtin copy action by file path,

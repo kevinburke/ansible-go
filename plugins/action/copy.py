@@ -162,6 +162,8 @@ class ActionModule(ActionBase):
         # Fall back for cases we don't handle in the fast path.
         if remote_src:
             return self._run_builtin_copy(None, task_vars)
+        if args.get("validate"):
+            return self._run_builtin_copy(None, task_vars)
 
         source = args.get("src")
         content = args.get("content")
