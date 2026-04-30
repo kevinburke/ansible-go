@@ -15,6 +15,22 @@ The known `file: state=directory recurse=true owner=... group=...` tree walk
 gap is intentionally excluded from this plan because it is being fixed
 separately.
 
+## Workflow
+
+Each compatibility fix should be handled as one reviewable work item:
+
+- create or reuse a dedicated worktree for the fix group
+- keep the implementation scoped to one compatibility problem
+- add a focused regression test before or with the behavior change
+- update this document when the fix lands, moving the item out of known
+  problems or tightening the remaining caveat
+- run the narrowest useful tests and record them in the commit/final note
+- create a commit in the worktree when the work is complete
+
+Subagents should include this checklist in their task instructions. Their final
+response should name the commit they created, list changed files, list tests
+run, and call out any remaining compatibility gap.
+
 ## Known Compatibility Problems
 
 These are visible from the current Go/Python fast paths before doing a deeper
@@ -49,9 +65,6 @@ source comparison.
 - Directory copy falls back to the builtin action. That is probably correct,
   but the fallback is fragile because it loads ansible-core's copy action by
   file path and rewrites internal `ansible.legacy.*` calls.
-- `validate` exists on `WriteFileParams` but is not implemented in
-  `handleWriteFile`. A fast-path copy using `validate:` will silently skip the
-  validation command unless the action plugin falls back first.
 - SELinux attributes and labels are not applied by `WriteFile`.
 - `force=false` semantics need a reference check. Current code writes when the
   destination exists with different content and `force=false`; stock copy
@@ -176,7 +189,6 @@ Tasks:
 - Check copy semantics for `content`, `src`, destination directories,
   `force=false`, `backup`, `mode`, `owner`, `group`, `validate`, diff mode,
   check mode, vault-decrypted files, and SELinux args.
-- Fix `validate` by falling back before the fast path or implementing it.
 
 ### Agent 3: file parity
 
@@ -247,3 +259,9 @@ Tasks:
 - CI runs the parity tests that do not require privileged package/service
   changes, and the privileged cases have a documented manual or containerized
   runner.
+
+## Fixed Items
+
+- `copy validate:` falls back to ansible-core's builtin copy action before the
+  fast path. `WriteFileParams.Validate` is still not implemented in Go, but the
+  action plugin no longer silently skips validation for ordinary copy tasks.
