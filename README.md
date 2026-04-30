@@ -335,6 +335,11 @@ The `apt` override includes two optimizations:
 - **update_cache dedup**: tracks when `apt-get update` last ran; skips
   redundant updates within 60 seconds (configurable via `cache_valid_time`).
 
+For the exact supported subset, fallback behavior, and current known gaps, see
+[docs/compatibility.md](docs/compatibility.md). The current compatibility audit
+baseline is `ansible-core 2.20.4`; the collection declares support for
+Ansible `>=2.12.0`.
+
 ## Architecture
 
 ```

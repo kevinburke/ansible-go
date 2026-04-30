@@ -2,14 +2,6 @@ Follow-ups from the perf-debugging session that established the
 collections+role-meta routing requirement.
 
 Routing / docs
-- Document that `collections: [kevinburke.fastagent]` must be set on each
-  play AND each role's `meta/main.yml` for action overrides to fire on
-  unqualified module names. Without role-meta, only apt routes (mechanism
-  for that one is still unexplained).
-- Decide on legacy-paths fallback as the documented "easy mode": add
-  `library = .../plugins/modules` and `action_plugins = .../plugins/action`
-  to `ansible.cfg`, which routes everything via `ansible.legacy` and
-  bypasses the per-role meta requirement.
 - Update the README's speedup claim. Real measured on a converged plex
   deploy: ~15-25% (57-69s -> 48s) with all overrides firing and
   pipelining on. The earlier 37s number was an incomplete run (a
@@ -36,13 +28,8 @@ Agent
   when use_shell=False.
 
 Action plugin discipline
-- Every fallback path (`if self._connection.transport != "fastagent": ...`)
-  must call _execute_module with `module_name="ansible.builtin.X"`,
-  never `ansible.legacy.X`. Once users wire up `library = .../fastagent/
-  modules` in ansible.cfg, our shim modules sit in the legacy namespace
-  and silently shadow the real builtin — so any `ansible.legacy.command`
-  fallback ends up invoking our shim, which fails loudly. Add a test or
-  lint that scans plugins/action/*.py for `ansible.legacy.` references.
+- Keep every fallback path on `ansible.builtin.*`; this is now documented in
+  docs/compatibility.md and guarded by tests/test_action_plugin_fallbacks.py.
 
 Coverage
 - Add action overrides for the highest-frequency non-overridden modules.

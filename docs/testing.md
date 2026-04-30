@@ -1,5 +1,25 @@
 ## Testing and rollout
 
+### Compatibility baseline
+
+Fastagent compatibility is audited against `ansible-core 2.20.4`. The exact
+controller stack used for the current audit was:
+
+| Tool | Version |
+|------|---------|
+| Ansible | `ansible-core 2.20.4` |
+| Controller Python used by Ansible | `Python 3.14.3` |
+| Jinja | `3.1.6` |
+| PyYAML | `6.0.3` with libyaml `0.2.5` |
+
+The collection declares `requires_ansible: ">=2.12.0"`. When adding or changing
+fast paths, compare against `ansible-core 2.20.4` first and add older-version
+checks only where Ansible's public behavior changed within the supported range.
+
+The user-facing compatibility matrix lives in `docs/compatibility.md`. The test
+suite checks that README and testing docs keep pointing at that matrix and that
+the module summary table does not drift.
+
 ### Setup
 
 The fastagent plugins are discovered via `ansible.cfg` in the repo root. If
@@ -157,3 +177,6 @@ likely sources of divergence:
   accelerates these (persistent session), but the action plugin fast paths
   won't apply.
 - **SELinux contexts**: WriteFile does not yet set SELinux labels.
+
+For the full current list, including package/service caveats and direct-RPC
+gaps, read `docs/compatibility.md`.
