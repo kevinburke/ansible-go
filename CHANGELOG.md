@@ -6,6 +6,15 @@ All notable changes to fastagent are documented in this file.
 
 ### Bug fixes
 
+- **Open become-daemon logs as root.** When a play used
+  `become: true`, the connection plugin ran the daemon under `sudo`
+  but left `</dev/null >>/tmp/fastagent-root-<version>.sock.log
+  2>&1` on the outer SSH user's shell. If a previous run had created
+  that log as `root`, daemon startup failed before `sudo` executed
+  with `Permission denied` and then `timeout waiting for socket`.
+  The become daemon launch now moves the redirection inside
+  `sudo sh -c`, so stale root-owned logs no longer block startup.
+
 - **Honor `recurse: true` for `ansible.builtin.file` directory
   tasks.** The File RPC parsed `recurse` but ignored it when
   `state=directory`, so tasks like `file: path=/srv/git

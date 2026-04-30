@@ -409,17 +409,26 @@ class Connection(ConnectionBase):
         debug_flag = " --debug" if display.verbosity >= 3 else ""
         allow_flag = f" --allow-user {shlex.quote(user)}" if user else ""
         daemon_cmd = f"{agent_bin} --daemon --socket {shlex.quote(remote_socket)}{allow_flag}{debug_flag}"
+        log_path = remote_socket + ".log"
         if use_become:
             # Daemon runs as root so a single instance can sudo to any
             # become_user the play requests (including non-sudoers, where
             # launching the daemon as that user would produce recursive
             # sudo-not-in-sudoers failures when ansible's own `sudo -u`
             # wrapper arrives).
-            daemon_cmd = f"sudo {daemon_cmd}"
+            #
+            # Keep the redirection inside the sudo shell too. Otherwise the
+            # SSH user's shell opens {socket}.log before sudo runs, which
+            # fails when a previous root-daemon start left a root-owned log.
+            daemon_cmd = "sudo sh -c " + shlex.quote(
+                f"{daemon_cmd} </dev/null >>{shlex.quote(log_path)} 2>&1"
+            )
+            daemon_redirect = ""
+        else:
+            daemon_redirect = f" </dev/null >>{shlex.quote(log_path)} 2>&1"
 
-        log_path = remote_socket + ".log"
         start_cmd = (
-            f"setsid {daemon_cmd} </dev/null >>{shlex.quote(log_path)} 2>&1 &"
+            f"setsid {daemon_cmd}{daemon_redirect} &"
             f" for i in 1 2 3 4 5; do"
             f"   test -S {shlex.quote(remote_socket)} && exit 0;"
             f"   sleep 0.1;"

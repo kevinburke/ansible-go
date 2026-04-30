@@ -458,5 +458,58 @@ class TestGetBecomeUser(unittest.TestCase):
         )
 
 
+@unittest.skipIf(
+    _FASTAGENT_IMPORT_ERROR is not None,
+    "ansible is required to run connection plugin tests",
+)
+class TestEnsureRemoteDaemon(unittest.TestCase):
+    def _conn(self):
+        conn = _bare_connection()
+        conn.get_option = lambda key, *a, **kw: (
+            "/opt/fastagent-{version}-{os}-{arch}"
+            if key == "agent_path" else None
+        )
+        return conn
+
+    def test_become_opens_daemon_log_inside_sudo_shell(self) -> None:
+        conn = self._conn()
+        commands = []
+
+        def run_ssh(host, user, port, command):
+            commands.append(command)
+            if command.startswith("test -S "):
+                return 1, "", ""
+            return 0, "", ""
+
+        with mock.patch.object(conn, "_run_ssh_command", side_effect=run_ssh), \
+             mock.patch.object(conn, "_detect_remote_arch", return_value="amd64"), \
+             mock.patch.object(conn, "_ensure_agent_deployed"):
+            conn._ensure_remote_daemon(
+                "serval",
+                "deploy",
+                None,
+                f"/tmp/fastagent-root-{fastagent_plugin.AGENT_VERSION}.sock",
+                True,
+            )
+
+        start_cmd = commands[-1]
+        remote_socket = f"/tmp/fastagent-root-{fastagent_plugin.AGENT_VERSION}.sock"
+        expected_inner = (
+            f"/opt/fastagent-{fastagent_plugin.AGENT_VERSION}-linux-amd64 "
+            f"--daemon --socket {remote_socket} --allow-user deploy "
+            f"</dev/null >>{remote_socket}.log 2>&1"
+        )
+        self.assertIn(f"setsid sudo sh -c {shlex_quote(expected_inner)} &",
+                      start_cmd)
+        self.assertNotIn(f"sudo /opt/fastagent-{fastagent_plugin.AGENT_VERSION}"
+                         f"-linux-amd64 --daemon --socket {remote_socket} "
+                         f"--allow-user deploy </dev/null >>{remote_socket}.log",
+                         start_cmd)
+
+
+def shlex_quote(value: str) -> str:
+    return fastagent_plugin.shlex.quote(value)
+
+
 if __name__ == "__main__":
     unittest.main()
