@@ -2,9 +2,18 @@
 
 All notable changes to fastagent are documented in this file.
 
-## 0.7.2 — April 30, 2026
+## 0.7.3 — May 8, 2026
 
 ### Bug fixes
+
+- **Accept native scalar values in `command: argv:`.** When
+  `jinja2_native_types` rendered a single templated argv element as
+  an integer, boolean, float, or null value, stock
+  `ansible.builtin.command` stringified the value before exec but
+  fastagent rejected the Exec RPC with a Go JSON unmarshal error.
+  The agent now coerces scalar argv values to strings before
+  execution, while arrays and objects fail with an indexed
+  `argv[N]` error.
 
 - **Open become-daemon logs as root.** When a play used
   `become: true`, the connection plugin ran the daemon under `sudo`
@@ -14,6 +23,43 @@ All notable changes to fastagent are documented in this file.
   with `Permission denied` and then `timeout waiting for socket`.
   The become daemon launch now moves the redirection inside
   `sudo sh -c`, so stale root-owned logs no longer block startup.
+
+- **Tighten command and shell fast-path compatibility.** Non-shell
+  Exec requests with only `cmd_string` now fail loudly instead of
+  splitting with `strings.Fields`, `creates`/`removes` now use glob
+  matching relative to `chdir`, and tasks with unsupported command
+  features such as target-side argument expansion, executable
+  overrides, unsupported become wrappers, or non-root
+  `creates`/`removes` fall back to `ansible.builtin.command`.
+
+- **Guard unsupported package-module options.** The `apt` and `dnf`
+  fast paths now model a narrower, explicit subset of
+  ansible-core's argument specs. Unsupported action-plugin options
+  fall back to `ansible.builtin.apt` before the Package RPC, while
+  module-shim-only routes fail before running `apt-get`, `dnf`, or
+  `yum` with silently ignored arguments. `cache_valid_time` also
+  implies `update_cache`, matching stock `apt`.
+
+- **Improve `stat`, `copy`, and `systemd` parity.** `stat` now
+  supports requested checksum algorithms and falls back for stock
+  mime, attribute, and SELinux probes. `copy` avoids fast-path side
+  effects for SELinux and preserve-mode cases, honors
+  `decrypt=false` and `force=false`, rejects content-to-directory
+  writes before changing the target, and surfaces diff read errors.
+  `systemd` now carries `no_block` through the RPC, treats
+  daemon-reload-only tasks as unchanged, and routes unsupported
+  masked, scoped, and daemon-reexec cases away from the fast path.
+
+### Documentation
+
+- **Add the compatibility audit plan and fix workflow.** The repo now
+  records how fastagent checks its module overrides against
+  ansible-core behavior and classifies each option as implemented,
+  fallback, or explicit failure.
+
+## 0.7.2 — April 30, 2026
+
+### Bug fixes
 
 - **Honor `recurse: true` for `ansible.builtin.file` directory
   tasks.** The File RPC parsed `recurse` but ignored it when
