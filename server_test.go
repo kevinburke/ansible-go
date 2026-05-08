@@ -45,6 +45,30 @@ func rpcCall(t *testing.T, s *Server, method string, params any) Response {
 	return resp
 }
 
+func rpcCallRawParams(t *testing.T, s *Server, method string, params json.RawMessage) Response {
+	t.Helper()
+
+	req := Request{ID: 1, Method: method, Params: params}
+	reqJSON, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reqJSON = append(reqJSON, '\n')
+
+	input := bytes.NewReader(reqJSON)
+	var output bytes.Buffer
+
+	if err := s.Serve(input, &output); err != nil {
+		t.Fatal(err)
+	}
+
+	var resp Response
+	if err := json.Unmarshal(output.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response %q: %v", output.String(), err)
+	}
+	return resp
+}
+
 func TestHello(t *testing.T) {
 	s := newTestServer()
 	resp := rpcCall(t, s, "Hello", HelloParams{Version: "test"})
@@ -89,6 +113,40 @@ func TestExecSimple(t *testing.T) {
 	}
 	if !result.Changed {
 		t.Error("expected changed=true")
+	}
+}
+
+func TestExecCoercesNativeArgvScalars(t *testing.T) {
+	s := newTestServer()
+	resp := rpcCallRawParams(t, s, "Exec", json.RawMessage(`{
+		"argv": ["printf", "%s|%s|%s|%s", 120, true, null, 1.5]
+	}`))
+
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+
+	resultJSON, _ := json.Marshal(resp.Result)
+	var result ExecResult
+	if err := json.Unmarshal(resultJSON, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Stdout != "120|True|None|1.5" {
+		t.Errorf("got stdout %q, want native argv scalars stringified", result.Stdout)
+	}
+}
+
+func TestExecRejectsNonScalarArgvElement(t *testing.T) {
+	s := newTestServer()
+	resp := rpcCallRawParams(t, s, "Exec", json.RawMessage(`{
+		"argv": ["echo", {"bad": "value"}]
+	}`))
+
+	if resp.Error == nil {
+		t.Fatal("expected error for non-scalar argv element")
+	}
+	if !strings.Contains(resp.Error.Message, "argv[1]: expected scalar, got object") {
+		t.Fatalf("error %q does not identify bad argv element", resp.Error.Message)
 	}
 }
 

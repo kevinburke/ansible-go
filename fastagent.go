@@ -2,7 +2,11 @@
 // remote execution. It speaks a newline-delimited JSON-RPC protocol over stdio.
 package fastagent
 
-import "encoding/json"
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+)
 
 // Version is the agent version. Bump this when the protocol or behavior changes.
 const Version = "0.7.2"
@@ -57,6 +61,88 @@ type ExecParams struct {
 	StdinAddNewline *bool             `json:"stdin_add_newline,omitempty"`
 	StripEmptyEnds  *bool             `json:"strip_empty_ends,omitempty"`
 	BecomeUser      string            `json:"become_user,omitempty"`
+}
+
+// UnmarshalJSON accepts the heterogeneous argv lists Ansible can produce when
+// jinja2_native_types renders a single expression as an int, bool, or null.
+func (p *ExecParams) UnmarshalJSON(data []byte) error {
+	type execParams ExecParams
+
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	argvJSON := fields["argv"]
+	delete(fields, "argv")
+
+	rest, err := json.Marshal(fields)
+	if err != nil {
+		return err
+	}
+	var decoded execParams
+	if err := json.Unmarshal(rest, &decoded); err != nil {
+		return err
+	}
+	*p = ExecParams(decoded)
+
+	p.Argv = nil
+	if len(argvJSON) > 0 && !bytes.Equal(argvJSON, []byte("null")) {
+		argv, err := decodeExecArgv(argvJSON)
+		if err != nil {
+			return err
+		}
+		p.Argv = argv
+	}
+	return nil
+}
+
+func decodeExecArgv(data json.RawMessage) ([]string, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+
+	var values []any
+	if err := dec.Decode(&values); err != nil {
+		return nil, fmt.Errorf("argv: expected array: %w", err)
+	}
+
+	argv := make([]string, 0, len(values))
+	for i, value := range values {
+		arg, err := execArgvString(i, value)
+		if err != nil {
+			return nil, err
+		}
+		argv = append(argv, arg)
+	}
+	return argv, nil
+}
+
+func execArgvString(index int, value any) (string, error) {
+	switch v := value.(type) {
+	case string:
+		return v, nil
+	case json.Number:
+		return v.String(), nil
+	case bool:
+		if v {
+			return "True", nil
+		}
+		return "False", nil
+	case nil:
+		return "None", nil
+	default:
+		return "", fmt.Errorf("argv[%d]: expected scalar, got %s (%v)", index, execArgvType(value), value)
+	}
+}
+
+func execArgvType(value any) string {
+	switch value.(type) {
+	case []any:
+		return "array"
+	case map[string]any:
+		return "object"
+	default:
+		return fmt.Sprintf("%T", value)
+	}
 }
 
 // ExecResult is the result of command execution.
