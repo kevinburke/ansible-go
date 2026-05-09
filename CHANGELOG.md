@@ -2,6 +2,19 @@
 
 All notable changes to fastagent are documented in this file.
 
+## Unreleased
+
+### Bug fixes
+
+- **Detach become-daemon sudo from SSH stdio.** Version 0.7.3 moved
+  daemon log redirection inside `sudo sh -c`, but the background
+  `sudo` process itself still inherited SSH stdio. On become
+  bootstrap, the remote shell could finish quickly while the SSH
+  process waited on the background sudo fd until the controller's
+  30-second subprocess timeout fired. The launcher now verifies
+  non-interactive sudo in the foreground and fully detaches the
+  background sudo process from SSH stdio.
+
 ## 0.7.3 — May 8, 2026
 
 ### Bug fixes

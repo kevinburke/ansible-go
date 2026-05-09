@@ -471,7 +471,7 @@ class TestEnsureRemoteDaemon(unittest.TestCase):
         )
         return conn
 
-    def test_become_opens_daemon_log_inside_sudo_shell(self) -> None:
+    def test_become_detaches_sudo_stdio_and_opens_log_as_root(self) -> None:
         conn = self._conn()
         commands = []
 
@@ -495,12 +495,17 @@ class TestEnsureRemoteDaemon(unittest.TestCase):
         start_cmd = commands[-1]
         remote_socket = f"/tmp/fastagent-root-{fastagent_plugin.AGENT_VERSION}.sock"
         expected_inner = (
-            f"/opt/fastagent-{fastagent_plugin.AGENT_VERSION}-linux-amd64 "
+            f"exec /opt/fastagent-{fastagent_plugin.AGENT_VERSION}-linux-amd64 "
             f"--daemon --socket {remote_socket} --allow-user deploy "
             f"</dev/null >>{remote_socket}.log 2>&1"
         )
-        self.assertIn(f"setsid sudo sh -c {shlex_quote(expected_inner)} &",
-                      start_cmd)
+        self.assertIn("sudo -n true || exit $?; ", start_cmd)
+        self.assertIn(
+            f"setsid sudo -n sh -c {shlex_quote(expected_inner)} "
+            f"</dev/null >/dev/null 2>&1 &",
+            start_cmd,
+        )
+        self.assertNotIn("setsid sudo sh -c", start_cmd)
         self.assertNotIn(f"sudo /opt/fastagent-{fastagent_plugin.AGENT_VERSION}"
                          f"-linux-amd64 --daemon --socket {remote_socket} "
                          f"--allow-user deploy </dev/null >>{remote_socket}.log",

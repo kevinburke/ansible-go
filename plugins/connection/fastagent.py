@@ -408,7 +408,7 @@ class Connection(ConnectionBase):
         # the SSH user (needed for SSH socket forwarding).
         debug_flag = " --debug" if display.verbosity >= 3 else ""
         allow_flag = f" --allow-user {shlex.quote(user)}" if user else ""
-        daemon_cmd = f"{agent_bin} --daemon --socket {shlex.quote(remote_socket)}{allow_flag}{debug_flag}"
+        daemon_exec_cmd = f"{agent_bin} --daemon --socket {shlex.quote(remote_socket)}{allow_flag}{debug_flag}"
         log_path = remote_socket + ".log"
         if use_become:
             # Daemon runs as root so a single instance can sudo to any
@@ -420,15 +420,23 @@ class Connection(ConnectionBase):
             # Keep the redirection inside the sudo shell too. Otherwise the
             # SSH user's shell opens {socket}.log before sudo runs, which
             # fails when a previous root-daemon start left a root-owned log.
-            daemon_cmd = "sudo sh -c " + shlex.quote(
-                f"{daemon_cmd} </dev/null >>{shlex.quote(log_path)} 2>&1"
+            #
+            # The background sudo process itself must also be detached from
+            # SSH stdio. If sudo keeps the SSH stderr fd open while waiting
+            # on the daemon, the remote shell can finish but the controller's
+            # ssh process still waits until subprocess.run(timeout=30) fires.
+            daemon_cmd = "sudo -n sh -c " + shlex.quote(
+                f"exec {daemon_exec_cmd} </dev/null >>{shlex.quote(log_path)} 2>&1"
             )
-            daemon_redirect = ""
+            daemon_prefix = "sudo -n true || exit $?; "
+            daemon_redirect = " </dev/null >/dev/null 2>&1"
         else:
+            daemon_cmd = daemon_exec_cmd
+            daemon_prefix = ""
             daemon_redirect = f" </dev/null >>{shlex.quote(log_path)} 2>&1"
 
         start_cmd = (
-            f"setsid {daemon_cmd}{daemon_redirect} &"
+            f"{daemon_prefix}setsid {daemon_cmd}{daemon_redirect} &"
             f" for i in 1 2 3 4 5; do"
             f"   test -S {shlex.quote(remote_socket)} && exit 0;"
             f"   sleep 0.1;"
