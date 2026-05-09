@@ -2,6 +2,20 @@
 
 All notable changes to fastagent are documented in this file.
 
+## 0.7.5 — May 9, 2026
+
+### Bug fixes
+
+- **Stringify native scalar `command: argv:` elements before the
+  fast-path scan.** When `jinja2_native_types` rendered a templated
+  argv element as a non-string scalar (e.g. `argv: [qm, config,
+  "{{ vmid }}"]` where `vmid` is an int), the action plugin's
+  tilde/`$` pre-flight scan crashed with `'_AnsibleTaggedInt' object
+  has no attribute 'startswith'` before the Exec RPC ran. The action
+  plugin now coerces argv elements to strings up front, matching
+  `ansible.builtin.command`'s `elements=str` argument-spec coercion.
+  This complements the agent-side coercion added in 0.7.3.
+
 ## 0.7.4 — May 8, 2026
 
 ### Bug fixes
