@@ -206,6 +206,28 @@ class TestCommandActionBecomeUser(unittest.TestCase):
             ["printf", "%s", "$HOME"],
         )
 
+    def test_native_int_argv_element_does_not_crash(self) -> None:
+        # Ansible 2.18+ with native jinja types renders a templated
+        # scalar (e.g. "{{ vmid }}" where vmid is an int) as a tagged
+        # int that has no .startswith — the action plugin's tilde/$
+        # scan used to crash with AttributeError before reaching the
+        # agent. Match the builtin's argv elements=str coercion so
+        # numeric argv elements are stringified up front.
+        conn = _FakeConnection(become_user=None)
+        action = _make_action(
+            conn,
+            task_args={
+                "argv": ["qm", "config", 100],
+                "_uses_shell": False,
+            },
+        )
+        with patch.object(ActionBase, "run", return_value={}):
+            action.run(task_vars={})
+        self.assertEqual(
+            conn._agent_client.last_kwargs["argv"],
+            ["qm", "config", "100"],
+        )
+
     def test_creates_with_become_falls_back_to_builtin(self) -> None:
         conn = _FakeConnection(become_user="app")
         action = _make_action(

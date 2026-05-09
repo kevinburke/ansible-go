@@ -79,6 +79,15 @@ class ActionModule(ActionBase):
         raw_params = args.get("_raw_params", "")
         cmd = args.get("cmd", "")
         argv = args.get("argv")
+        # ansible.builtin.command's argument_spec coerces argv to
+        # elements=str. The override path bypasses that, so a templated
+        # int (e.g. "{{ vmid }}" with native jinja types) arrives as an
+        # _AnsibleTaggedInt and breaks the scan below with
+        # 'AttributeError: ... has no attribute startswith'. Match the
+        # builtin's coercion up front so r["cmd"] and the RPC payload
+        # are plain strings.
+        if argv:
+            argv = [to_text(arg) for arg in argv]
         chdir = args.get("chdir")
         creates = args.get("creates")
         removes = args.get("removes")
