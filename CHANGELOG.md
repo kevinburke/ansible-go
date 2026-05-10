@@ -2,6 +2,23 @@
 
 All notable changes to fastagent are documented in this file.
 
+## Unreleased
+
+### Bug fixes
+
+- **Skip the bootstrap `sudo` wrap when the SSH user is already
+  root.** When a play set `ansible_user: root` plus `become: true`,
+  the daemon launcher wrapped the start command with
+  `sudo -n true || exit $?; …`. On minimal hosts that don't ship
+  the sudo package (e.g. Proxmox where root logs in directly) the
+  wrap failed before the daemon ran, surfacing as
+  `fastagent: failed to start daemon: rc=127 / bash: line 1:
+  sudo: command not found`. The connection now skips the wrap
+  whenever `remote_user == "root"`. The per-RPC sudo wrap also
+  now skips when `become_user == remote_user`, matching ansible-
+  core's default `BECOME_ALLOW_SAME_USER=False` behavior at
+  `action/__init__.py:1416`.
+
 ## 0.7.5 — May 9, 2026
 
 ### Bug fixes

@@ -433,10 +433,13 @@ class TestGetBecomeUser(unittest.TestCase):
     silently returned None — commands then ran as root on the remote.
     """
 
-    def _conn(self, become_user, *, use_become=True):
+    def _conn(self, become_user, *, use_become=True, remote_user=None):
         conn = _bare_connection()
         conn._use_become = use_become
         conn._play_context = _FakePlayContext(become_user)
+        conn.get_option = lambda key, *a, **kw: (
+            remote_user if key == "remote_user" else None
+        )
         return conn
 
     def test_returns_templated_user(self) -> None:
@@ -455,6 +458,14 @@ class TestGetBecomeUser(unittest.TestCase):
     def test_not_using_become_returns_none(self) -> None:
         self.assertIsNone(
             self._conn("returns", use_become=False).get_become_user()
+        )
+
+    def test_become_user_equals_remote_user_returns_none(self) -> None:
+        # Mirror ansible-core's default BECOME_ALLOW_SAME_USER=False
+        # behavior: when the connecting user is already become_user,
+        # the per-RPC sudo wrap is redundant.
+        self.assertIsNone(
+            self._conn("returns", remote_user="returns").get_become_user()
         )
 
 
@@ -510,6 +521,41 @@ class TestEnsureRemoteDaemon(unittest.TestCase):
                          f"-linux-amd64 --daemon --socket {remote_socket} "
                          f"--allow-user deploy </dev/null >>{remote_socket}.log",
                          start_cmd)
+
+    def test_root_remote_user_skips_sudo_wrap(self) -> None:
+        # When the SSH user is already root (e.g. `ansible_user: root`
+        # on a Proxmox host), wrapping the daemon launch with `sudo -n`
+        # is redundant. More importantly, on minimal hosts that don't
+        # ship the sudo package the wrap fails with `sudo: command not
+        # found` (rc=127) and the daemon never starts. Mirrors
+        # ansible-core's BECOME_ALLOW_SAME_USER=False default.
+        conn = self._conn()
+        commands = []
+
+        def run_ssh(host, user, port, command):
+            commands.append(command)
+            if command.startswith("test -S "):
+                return 1, "", ""
+            return 0, "", ""
+
+        with mock.patch.object(conn, "_run_ssh_command", side_effect=run_ssh), \
+             mock.patch.object(conn, "_detect_remote_arch", return_value="amd64"), \
+             mock.patch.object(conn, "_ensure_agent_deployed"):
+            conn._ensure_remote_daemon(
+                "caracal",
+                "root",
+                None,
+                f"/tmp/fastagent-root-{fastagent_plugin.AGENT_VERSION}.sock",
+                False,  # wrap_with_sudo: False because remote_user is root
+            )
+
+        kill_cmd = commands[1]
+        start_cmd = commands[-1]
+        # No sudo anywhere — bootstrap must be safe on hosts that don't
+        # ship the sudo package.
+        self.assertNotIn("sudo", kill_cmd)
+        self.assertNotIn("sudo", start_cmd)
+        self.assertIn("setsid /opt/fastagent-", start_cmd)
 
 
 def shlex_quote(value: str) -> str:

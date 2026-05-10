@@ -244,14 +244,20 @@ class Connection(ConnectionBase):
         overrides (command, copy, file, stat) that talk to the agent
         directly and so can't rely on the exec_command code path.
 
-        Returns None when become is off, or when become_user is root
+        Returns None when become is off, when become_user is root
         (the daemon already runs as root under become, so sudo -u root
-        would be a no-op fork+exec per RPC).
+        would be a no-op fork+exec per RPC), or when become_user equals
+        remote_user (mirrors ansible-core's default
+        BECOME_ALLOW_SAME_USER=False at action/__init__.py:1416 — the
+        wrap is redundant when we're already running as the target user).
         """
         if not self._use_become:
             return None
         become_user = self._play_context.become_user or "root"
         if become_user == "root":
+            return None
+        remote_user = self.get_option("remote_user")
+        if remote_user and remote_user == become_user:
             return None
         return become_user
 
@@ -265,6 +271,17 @@ class Connection(ConnectionBase):
         user = self.get_option("remote_user")
         port = self.get_option("port")
 
+        # The daemon must run as root whenever the play uses become, so it
+        # can sudo to any become_user the play requests. The bootstrap
+        # therefore wraps the daemon launch with `sudo -n` — except when
+        # the SSH user is already root, in which case the wrap is
+        # redundant and, on minimal hosts that don't ship the sudo
+        # package (e.g. Proxmox, where `ansible_user: root` connects
+        # directly), the wrap fails with `sudo: command not found`
+        # before the daemon ever starts. Mirrors ansible-core's
+        # BECOME_ALLOW_SAME_USER=False default at action/__init__.py:1416,
+        # which skips become entirely when remote_user equals become_user.
+        wrap_with_sudo = use_become and user != "root"
 
         # Socket paths. When become is enabled the daemon always runs as
         # root (it re-executes commands via ansible's own `sudo -u X`
@@ -296,7 +313,7 @@ class Connection(ConnectionBase):
         display.vvv(f"FASTAGENT: local socket not available, setting up", host=host)
 
         # Ensure the remote daemon is running.
-        self._ensure_remote_daemon(host, user, port, remote_socket, use_become)
+        self._ensure_remote_daemon(host, user, port, remote_socket, wrap_with_sudo)
 
         # Start SSH socket forwarding if not already running.
         self._ensure_ssh_forwarding(host, user, port, local_socket, remote_socket)
@@ -355,7 +372,7 @@ class Connection(ConnectionBase):
         user: str | None,
         port: int | None,
         remote_socket: str,
-        use_become: bool,
+        wrap_with_sudo: bool,
     ) -> None:
         """Ensure the remote daemon is running, bootstrapping if needed."""
         # Check if daemon is already running by testing the remote socket.
@@ -400,7 +417,7 @@ class Connection(ConnectionBase):
             f" pkill -f 'fastagent[^ ]* --daemon' 2>/dev/null || true;"
             f" rm -f {shlex.quote(remote_socket)} {shlex.quote(pid_file)}"
         )
-        if use_become:
+        if wrap_with_sudo:
             kill_cmd = f"sudo sh -c {shlex.quote(kill_cmd)}"
         self._run_ssh_command(host, user, port, kill_cmd)
 
@@ -410,7 +427,7 @@ class Connection(ConnectionBase):
         allow_flag = f" --allow-user {shlex.quote(user)}" if user else ""
         daemon_exec_cmd = f"{agent_bin} --daemon --socket {shlex.quote(remote_socket)}{allow_flag}{debug_flag}"
         log_path = remote_socket + ".log"
-        if use_become:
+        if wrap_with_sudo:
             # Daemon runs as root so a single instance can sudo to any
             # become_user the play requests (including non-sudoers, where
             # launching the daemon as that user would produce recursive
