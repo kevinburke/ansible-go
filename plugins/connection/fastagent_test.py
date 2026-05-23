@@ -460,12 +460,20 @@ class TestGetBecomeUser(unittest.TestCase):
             self._conn("returns", use_become=False).get_become_user()
         )
 
-    def test_become_user_equals_remote_user_returns_none(self) -> None:
-        # Mirror ansible-core's default BECOME_ALLOW_SAME_USER=False
-        # behavior: when the connecting user is already become_user,
-        # the per-RPC sudo wrap is redundant.
-        self.assertIsNone(
-            self._conn("returns", remote_user="returns").get_become_user()
+    def test_become_user_equals_remote_user_still_wraps(self) -> None:
+        # Ansible-core's classic SSH path skips the per-task sudo wrap
+        # when remote_user == become_user (BECOME_ALLOW_SAME_USER=False)
+        # because the SSH session itself is running as remote_user.
+        # Fastagent's daemon is sudo-wrapped at launch and runs as
+        # root whenever the play uses become, so it does *not* match
+        # remote_user — skipping the per-RPC wrap would leave the
+        # command running as root and the resulting files root-owned.
+        # Hit this with the dotfiles clone in roles/dev (caracal-server)
+        # where ansible_user=kevin and become_user=kevin both resolved
+        # to "kevin" but the agent was running as root.
+        self.assertEqual(
+            self._conn("returns", remote_user="returns").get_become_user(),
+            "returns",
         )
 
 

@@ -244,20 +244,26 @@ class Connection(ConnectionBase):
         overrides (command, copy, file, stat) that talk to the agent
         directly and so can't rely on the exec_command code path.
 
-        Returns None when become is off, when become_user is root
+        Returns None when become is off, or when become_user is root
         (the daemon already runs as root under become, so sudo -u root
-        would be a no-op fork+exec per RPC), or when become_user equals
-        remote_user (mirrors ansible-core's default
-        BECOME_ALLOW_SAME_USER=False at action/__init__.py:1416 — the
-        wrap is redundant when we're already running as the target user).
+        would be a no-op fork+exec per RPC).
+
+        Note: we do NOT short-circuit when remote_user == become_user.
+        ansible-core's classic SSH path can skip the per-task sudo wrap
+        in that case (BECOME_ALLOW_SAME_USER=False) because the SSH
+        session itself is already running as remote_user. Fastagent's
+        model is different: when the play uses become anywhere, the
+        daemon is launched with `sudo -n` and runs as root regardless
+        of the SSH user (so it can sudo to *any* become_user the play
+        requests). Skipping the per-RPC wrap when remote_user matches
+        become_user would leave the command running as root, not as
+        the target user — files end up owned by root and git refuses
+        to operate on the resulting trees with "dubious ownership".
         """
         if not self._use_become:
             return None
         become_user = self._play_context.become_user or "root"
         if become_user == "root":
-            return None
-        remote_user = self.get_option("remote_user")
-        if remote_user and remote_user == become_user:
             return None
         return become_user
 
