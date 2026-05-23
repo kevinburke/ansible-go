@@ -2,6 +2,22 @@
 
 All notable changes to fastagent are documented in this file.
 
+## 0.8.1 — May 23, 2026
+
+### Bug fixes
+
+- **Keep the per-task `sudo` wrap when `remote_user` matches
+  `become_user`.** Version 0.8.0 skipped the per-RPC sudo wrapper
+  whenever the SSH user and target become user were the same. That
+  matches ansible-core's SSH behavior, but fastagent's daemon runs as
+  root whenever a play uses `become`, so skipping the per-task wrap
+  left those commands running as root instead of the requested user.
+  Tasks such as git clones and Go installs could create root-owned
+  files in the user's tree, causing later commands to fail with
+  ownership errors. The bootstrap still skips `sudo` for direct root
+  SSH sessions, but per-task become execution now preserves the
+  `sudo -u <user>` path.
+
 ## 0.8.0 — May 9, 2026
 
 ### Bug fixes

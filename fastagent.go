@@ -9,7 +9,7 @@ import (
 )
 
 // Version is the agent version. Bump this when the protocol or behavior changes.
-const Version = "0.8.0"
+const Version = "0.8.1"
 
 // Request is a JSON-RPC request from the controller.
 type Request struct {
