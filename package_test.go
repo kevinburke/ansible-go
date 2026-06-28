@@ -3,6 +3,7 @@ package fastagent
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -142,5 +143,21 @@ func TestAptSkipBypassedByNewerSources(t *testing.T) {
 	}
 	if aptCacheFresh(cacheUpdated, mtime, now, 60*time.Second) {
 		t.Error("expected cache to be considered stale after newer .sources file written")
+	}
+}
+
+// Every apt-get invocation must carry the dpkg frontend lock timeout so we
+// wait out unattended-upgrades instead of failing exit 100 on a busy lock.
+func TestAptGetArgsCarryLockTimeout(t *testing.T) {
+	want := "DPkg::Lock::Timeout=" + strconv.Itoa(aptLockTimeout)
+	for _, verb := range [][]string{{"update"}, {"install", "--yes", "vim"}, {"remove", "--yes", "neovim"}} {
+		got := aptGetArgs(verb...)
+		if len(got) < 3 || got[0] != "-o" || got[1] != want {
+			t.Errorf("aptGetArgs(%q) = %q, want it to start with -o %s", verb, got, want)
+		}
+		// The original verb and operands must still trail the option.
+		if got[len(got)-len(verb)] != verb[0] {
+			t.Errorf("aptGetArgs(%q) = %q, dropped the verb", verb, got)
+		}
 	}
 }

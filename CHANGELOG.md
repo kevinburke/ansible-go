@@ -2,6 +2,21 @@
 
 All notable changes to fastagent are documented in this file.
 
+## 0.8.2 — June 28, 2026
+
+### Bug fixes
+
+- **Wait for the dpkg frontend lock instead of failing on a busy
+  lock.** Every `apt-get` invocation (update, install, remove, latest)
+  now passes `-o DPkg::Lock::Timeout=300`. On a freshly provisioned
+  machine, `unattended-upgrades` fires right after boot and holds
+  `/var/lib/dpkg/lock-frontend`; without a timeout, `apt-get` exited
+  100 the instant it found the lock busy, failing the play with "Could
+  not get lock /var/lib/dpkg/lock-frontend". apt-get now waits up to
+  300 seconds for the lock to free, matching the behavior of
+  ansible-core's apt module (which sets the same option via its
+  `lock_timeout` parameter).
+
 ## 0.8.1 — May 23, 2026
 
 ### Bug fixes

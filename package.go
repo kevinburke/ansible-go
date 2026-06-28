@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +28,24 @@ var (
 	aptSourcesDir  = "/etc/apt/sources.list.d"
 	aptListsLock   = "/var/lib/apt/lists/lock"
 )
+
+// aptLockTimeout is how long apt-get will wait for the dpkg frontend lock
+// before giving up, rendered into "-o DPkg::Lock::Timeout=<seconds>". On a
+// freshly provisioned machine unattended-upgrades fires right after boot and
+// holds /var/lib/dpkg/lock-frontend; without this, apt-get exits 100 the
+// instant it finds the lock busy. Stock Ansible's apt module sets the same
+// option (its lock_timeout default is 60s); 300s gives a slow upgrade plenty
+// of room to finish. Prepended to every apt-get invocation.
+const aptLockTimeout = 300
+
+// aptLockOpt is the rendered "-o" value, computed once rather than on every
+// apt-get call.
+var aptLockOpt = "DPkg::Lock::Timeout=" + strconv.Itoa(aptLockTimeout)
+
+// aptGetArgs returns apt-get arguments with the dpkg lock timeout prepended.
+func aptGetArgs(args ...string) []string {
+	return append([]string{"-o", aptLockOpt}, args...)
+}
 
 // latestAptSourcesMTime returns the most recent mtime across the apt
 // source list file and one level of entries in the sources.list.d
@@ -187,7 +206,7 @@ func (s *Server) handlePackageApt(p PackageParams) (any, error) {
 
 		if !skip {
 			s.Logger.Debug("running apt-get update")
-			cmd := exec.Command("apt-get", "update")
+			cmd := exec.Command("apt-get", aptGetArgs("update")...)
 			cmd.Env = append(cmd.Environ(), "DEBIAN_FRONTEND=noninteractive")
 			out, err := cmd.CombinedOutput()
 			if err != nil {
@@ -251,7 +270,7 @@ func (s *Server) handlePackageApt(p PackageParams) (any, error) {
 		return nil, fmt.Errorf("unsupported state %q for apt", p.State)
 	}
 
-	cmd := exec.Command("apt-get", args...)
+	cmd := exec.Command("apt-get", aptGetArgs(args...)...)
 	cmd.Env = append(cmd.Environ(), "DEBIAN_FRONTEND=noninteractive")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
