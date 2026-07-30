@@ -566,6 +566,60 @@ class TestEnsureRemoteDaemon(unittest.TestCase):
         self.assertNotIn("sudo", start_cmd)
         self.assertIn("setsid /opt/fastagent-", start_cmd)
 
+    def test_daemon_running_but_unusable_by_this_user_restarts(self) -> None:
+        # Regression: a socket left behind by `--allow-user kevin` exists
+        # and is a socket special file (test -S succeeds regardless of who
+        # asks — that only needs search permission on /tmp), but a
+        # different SSH user (e.g. bootstrap's `admin`) can't actually
+        # connect to it. The liveness check must catch that with -r/-w,
+        # not just -S, or this user's connection fails with EACCES on
+        # every retry forever, since the daemon it's blocked from never
+        # changes.
+        conn = self._conn()
+        commands = []
+
+        def run_ssh(host, user, port, command):
+            commands.append(command)
+            if command.startswith("test -S "):
+                return 1, "", ""  # -S ok, but -r/-w fails -> combined rc=1
+            return 0, "", ""
+
+        with mock.patch.object(conn, "_run_ssh_command", side_effect=run_ssh), \
+             mock.patch.object(conn, "_detect_remote_arch", return_value="amd64"), \
+             mock.patch.object(conn, "_ensure_agent_deployed"):
+            conn._ensure_remote_daemon(
+                "serval", "admin", None,
+                f"/tmp/fastagent-root-{fastagent_plugin.AGENT_VERSION}.sock",
+                True,
+            )
+
+        liveness_cmd = commands[0]
+        self.assertIn("test -S ", liveness_cmd)
+        self.assertIn("test -r ", liveness_cmd)
+        self.assertIn("test -w ", liveness_cmd)
+        # Bootstrap must have proceeded past the liveness check (kill +
+        # start commands issued) rather than trusting the stale grant.
+        self.assertGreater(len(commands), 1)
+
+    def test_daemon_running_and_usable_skips_restart(self) -> None:
+        conn = self._conn()
+        commands = []
+
+        def run_ssh(host, user, port, command):
+            commands.append(command)
+            return 0, "", ""
+
+        with mock.patch.object(conn, "_run_ssh_command", side_effect=run_ssh), \
+             mock.patch.object(conn, "_detect_remote_arch") as mock_arch:
+            conn._ensure_remote_daemon(
+                "serval", "kevin", None,
+                f"/tmp/fastagent-root-{fastagent_plugin.AGENT_VERSION}.sock",
+                True,
+            )
+
+        self.assertEqual(len(commands), 1)
+        mock_arch.assert_not_called()
+
 
 def shlex_quote(value: str) -> str:
     return fastagent_plugin.shlex.quote(value)

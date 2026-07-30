@@ -391,10 +391,29 @@ class Connection(ConnectionBase):
         wrap_with_sudo: bool,
     ) -> None:
         """Ensure the remote daemon is running, bootstrapping if needed."""
-        # Check if daemon is already running by testing the remote socket.
-        rc, _, _ = self._run_ssh_command(
-            host, user, port, f"test -S {shlex.quote(remote_socket)}"
+        # Check if daemon is already running *and usable by this SSH user*.
+        # `test -S` alone only confirms the path is a socket special file —
+        # listing a directory entry's type needs search permission on the
+        # containing directory (world-executable /tmp), not permission on
+        # the socket itself, so it reports success even for a daemon that
+        # was started with `--allow-user <someone else>`. In become mode
+        # one socket is shared across every become_user on the host (see
+        # the comment in _connect), and whichever SSH user's connection
+        # last (re)started the daemon is the only one --allow-user grants
+        # access to. Without the -r/-w checks, a play that connects as a
+        # different SSH user (e.g. bootstrap-columbus.yml's `admin`, after
+        # configure.yml last ran as `kevin`) sees "daemon already running",
+        # never restarts it, and then gets a hard EACCES on every
+        # forwarded connection attempt — indistinguishable from the
+        # earlier stale-forwarder race except that no amount of retrying
+        # fixes it, since the daemon this user can never reach never
+        # changes.
+        test_cmd = (
+            f"test -S {shlex.quote(remote_socket)}"
+            f" && test -r {shlex.quote(remote_socket)}"
+            f" && test -w {shlex.quote(remote_socket)}"
         )
+        rc, _, _ = self._run_ssh_command(host, user, port, test_cmd)
         if rc == 0:
             display.vvv(f"FASTAGENT: remote daemon already running", host=host)
             return
