@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import socket as socket_mod
+import subprocess
 import sys
 import tempfile
 import threading
@@ -568,6 +569,133 @@ class TestEnsureRemoteDaemon(unittest.TestCase):
 
 def shlex_quote(value: str) -> str:
     return fastagent_plugin.shlex.quote(value)
+
+
+@unittest.skipIf(
+    _FASTAGENT_IMPORT_ERROR is not None,
+    "ansible is required to run connection plugin tests",
+)
+class TestConnectRetriesLocalSocketProbe(unittest.TestCase):
+    """A freshly created forwarder's socket *file* can exist before the
+    remote-side streamlocal proxy is ready to serve a connection, so the
+    post-forwarding Hello probe can lose a benign race. _connect must
+    retry that probe instead of failing on the first attempt.
+    """
+
+    def _conn(self):
+        conn = _bare_connection()
+        conn.get_option = lambda key, *a, **kw: {
+            "host": "serval",
+            "remote_user": "kevin",
+            "port": None,
+        }.get(key)
+        return conn
+
+    def test_transient_race_after_fresh_forwarding_is_retried(self) -> None:
+        conn = self._conn()
+        # Call 1: the fast-path probe, before forwarding exists (fails).
+        # Calls 2-3: the post-forwarding probe loses the race twice.
+        # Call 4: the race clears and the probe succeeds.
+        probe_results = iter([False, False, False, True])
+        with mock.patch.object(
+                conn, "_try_local_socket",
+                side_effect=lambda *a, **kw: next(probe_results)), \
+             mock.patch.object(conn, "_ensure_remote_daemon"), \
+             mock.patch.object(conn, "_ensure_ssh_forwarding"), \
+             mock.patch.object(fastagent_plugin.time_mod, "sleep") as mock_sleep:
+            result = conn._connect()
+
+        self.assertIs(result, conn)
+        # One backoff sleep per failed retry attempt, none after success.
+        self.assertEqual(mock_sleep.call_count, 2)
+
+    def test_gives_up_after_retries_exhausted(self) -> None:
+        conn = self._conn()
+        with mock.patch.object(conn, "_try_local_socket", return_value=False), \
+             mock.patch.object(conn, "_ensure_remote_daemon"), \
+             mock.patch.object(conn, "_ensure_ssh_forwarding"), \
+             mock.patch.object(fastagent_plugin.time_mod, "sleep"):
+            with self.assertRaises(fastagent_plugin.AnsibleConnectionFailure):
+                conn._connect()
+
+
+@unittest.skipIf(
+    _FASTAGENT_IMPORT_ERROR is not None,
+    "ansible is required to run connection plugin tests",
+)
+class TestKillStaleForwarder(unittest.TestCase):
+    """`ssh -f` forks after auth, so the forwarder that actually holds the
+    local socket open is never a child of this process — we can only find
+    it by asking who currently has the path open.
+    """
+
+    def test_kills_pids_reported_by_lsof(self) -> None:
+        conn = _bare_connection()
+        completed = subprocess.CompletedProcess(
+            args=["lsof"], returncode=0, stdout=b"1234\n5678\n", stderr=b"")
+
+        with mock.patch.object(fastagent_plugin.subprocess, "run",
+                                return_value=completed) as mock_run, \
+             mock.patch.object(fastagent_plugin.os, "kill") as mock_kill:
+            conn._kill_stale_forwarder(
+                "/tmp/fastagent-local-host-root-0.0.0.sock", "test-host")
+
+        mock_run.assert_called_once_with(
+            ["lsof", "-t", "/tmp/fastagent-local-host-root-0.0.0.sock"],
+            capture_output=True,
+            timeout=5,
+        )
+        mock_kill.assert_has_calls([
+            mock.call(1234, fastagent_plugin.signal.SIGTERM),
+            mock.call(5678, fastagent_plugin.signal.SIGTERM),
+        ])
+
+    def test_missing_lsof_is_non_fatal(self) -> None:
+        conn = _bare_connection()
+        with mock.patch.object(fastagent_plugin.subprocess, "run",
+                                side_effect=FileNotFoundError()), \
+             mock.patch.object(fastagent_plugin.os, "kill") as mock_kill:
+            conn._kill_stale_forwarder("/tmp/fake.sock", "test-host")
+        mock_kill.assert_not_called()
+
+    def test_already_dead_pid_does_not_raise(self) -> None:
+        conn = _bare_connection()
+        completed = subprocess.CompletedProcess(
+            args=["lsof"], returncode=0, stdout=b"999\n", stderr=b"")
+        with mock.patch.object(fastagent_plugin.subprocess, "run",
+                                return_value=completed), \
+             mock.patch.object(fastagent_plugin.os, "kill",
+                                side_effect=ProcessLookupError()):
+            conn._kill_stale_forwarder("/tmp/fake.sock", "test-host")
+
+
+@unittest.skipIf(
+    _FASTAGENT_IMPORT_ERROR is not None,
+    "ansible is required to run connection plugin tests",
+)
+class TestEnsureSshForwardingKillsStaleForwarder(unittest.TestCase):
+    def test_kills_stale_forwarder_before_replacing_socket(self) -> None:
+        conn = _bare_connection()
+        conn.get_option = lambda key, *a, **kw: {
+            "ssh_executable": "ssh",
+            "ssh_args": None,
+            "private_key": None,
+        }.get(key)
+
+        local_socket = "/tmp/fastagent-local-host-root-0.0.0.sock"
+        completed = subprocess.CompletedProcess(
+            args=["ssh"], returncode=0, stdout=b"", stderr=b"")
+
+        with mock.patch.object(conn, "_kill_stale_forwarder") as mock_kill, \
+             mock.patch.object(fastagent_plugin.os.path, "exists", return_value=True), \
+             mock.patch.object(fastagent_plugin.os, "remove") as mock_remove, \
+             mock.patch.object(fastagent_plugin.subprocess, "run", return_value=completed):
+            conn._ensure_ssh_forwarding(
+                "serval", "kevin", None, local_socket,
+                "/tmp/fastagent-root-0.0.0.sock")
+
+        mock_kill.assert_called_once_with(local_socket, "serval")
+        mock_remove.assert_called_once_with(local_socket)
 
 
 if __name__ == "__main__":

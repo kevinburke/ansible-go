@@ -146,6 +146,7 @@ options:
 import base64
 import os
 import shlex
+import signal
 import socket as socket_mod
 import subprocess
 import tempfile
@@ -324,13 +325,22 @@ class Connection(ConnectionBase):
         # Start SSH socket forwarding if not already running.
         self._ensure_ssh_forwarding(host, user, port, local_socket, remote_socket)
 
-        # Now connect to the local socket.
-        if not self._try_local_socket(local_socket, host):
-            raise AnsibleConnectionFailure(
-                f"fastagent: failed to connect to local forwarding socket {local_socket}"
-            )
+        # Now connect to the local socket. The local socket *file* existing
+        # only means OpenSSH's local listener has bound; -L unix-socket
+        # forwarding proxies each connection to the remote target lazily,
+        # over an additional round-trip through the SSH channel, so the
+        # very first connect can still race a not-yet-ready remote-side
+        # proxy and see EOF on the Hello handshake. Retry a few times with
+        # a short backoff instead of failing on that first race.
+        for attempt in range(5):
+            if self._try_local_socket(local_socket, host):
+                return self
+            if attempt < 4:
+                time_mod.sleep(0.1)
 
-        return self
+        raise AnsibleConnectionFailure(
+            f"fastagent: failed to connect to local forwarding socket {local_socket}"
+        )
 
     def _try_local_socket(self, local_socket: str, host: str) -> bool:
         """Try connecting to the local forwarding socket and probe the daemon.
@@ -474,6 +484,39 @@ class Connection(ConnectionBase):
             )
         display.vvv(f"FASTAGENT: daemon started at {remote_socket}", host=host)
 
+    def _kill_stale_forwarder(self, local_socket: str, host: str) -> None:
+        """Best-effort SIGTERM for any process still holding local_socket open.
+
+        `ssh -f` forks after authentication and the forked child (the one
+        that actually holds the listener open) is never a child of *this*
+        Python process, so we have no PID to track from the call that
+        created it. Shell out to `lsof` instead — it is standard on macOS
+        and virtually every Linux distro used as an Ansible controller. If
+        it is missing, skip the cleanup rather than fail the connection
+        over a leak: the caller unlinks and replaces the socket path
+        either way, so correctness does not depend on this succeeding.
+        """
+        try:
+            result = subprocess.run(
+                ["lsof", "-t", local_socket],
+                capture_output=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            display.vvv(f"FASTAGENT: could not check for stale forwarder: {e}", host=host)
+            return
+
+        for line in result.stdout.decode("utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line.isdigit():
+                continue
+            pid = int(line)
+            display.vvv(f"FASTAGENT: killing stale local forwarder pid={pid}", host=host)
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError as e:
+                display.vvv(f"FASTAGENT: failed to kill stale forwarder pid={pid}: {e}", host=host)
+
     def _ensure_ssh_forwarding(
         self,
         host: str,
@@ -483,7 +526,14 @@ class Connection(ConnectionBase):
         remote_socket: str,
     ) -> None:
         """Start a background SSH session that forwards local_socket to remote_socket."""
-        # Clean up stale local socket.
+        # Clean up any stale local socket, and the `ssh -f -N -L` process
+        # still holding it open. That process is always some earlier
+        # forwarder — either from this same host+become combo (its remote
+        # side went stale) or the loser of a race with a concurrent
+        # ansible-playbook run against the same host. Either way, once we
+        # unlink its socket path nothing can reach it again, so leaving it
+        # running just orphans an SSH session to nothing forever.
+        self._kill_stale_forwarder(local_socket, host)
         if os.path.exists(local_socket):
             os.remove(local_socket)
 
