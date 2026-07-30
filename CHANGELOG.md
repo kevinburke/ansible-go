@@ -2,6 +2,47 @@
 
 All notable changes to fastagent are documented in this file.
 
+## 0.8.3 — July 30, 2026
+
+### Bug fixes
+
+- **Retry the local forwarding socket probe instead of failing on the
+  first race.** `ssh -L` unix-socket forwarding proxies the first
+  connection to the remote target lazily, over an extra round-trip
+  through the SSH channel, so the very first Hello probe after the
+  local socket file appears could race that and see EOF, failing the
+  task with "failed to connect to local forwarding socket" even though
+  the remote daemon was healthy. `_connect` now retries up to 5 times
+  with a 100ms backoff before giving up.
+
+- **Reap stale SSH forwarders instead of orphaning them.**
+  `_ensure_ssh_forwarding` always unlinked the old local socket and
+  spawned a new `ssh -f -N -L` without killing whatever still held the
+  old path open. Because `ssh -f` forks after auth, the backgrounded
+  forwarder is never a child of the connection plugin's process, so a
+  superseded forwarder — a stale tunnel from an earlier run, or the
+  loser of a race with a concurrent `ansible-playbook` run against the
+  same host — was orphaned forever once its socket path was stolen.
+  `_ensure_ssh_forwarding` now shells out to `lsof -t` to find and
+  SIGTERM whoever holds the path first; a missing `lsof` is non-fatal
+  since the caller replaces the path regardless.
+
+- **Require read/write access, not just the socket type, when checking
+  daemon liveness.** `_ensure_remote_daemon` treated any socket-typed
+  file at `remote_socket` as "daemon already running" based solely on
+  `test -S`, but listing a directory entry's type only needs search
+  permission on the containing directory (world-executable `/tmp`),
+  not permission on the socket itself. In become mode one daemon
+  socket is shared across every `become_user` on the host, but only
+  the SSH user whose connection last (re)started it gets
+  `--allow-user <that user>`. A play that connects as a different SSH
+  user than whoever started the daemon saw "already running", never
+  restarted it, and got a hard EACCES on every forwarded connection
+  attempt from then on, with no amount of retrying able to fix it. The
+  liveness check now also runs `test -r`/`test -w` so this case falls
+  through to a restart with the right `--allow-user` instead of
+  failing forever.
+
 ## 0.8.2 — June 28, 2026
 
 ### Bug fixes
