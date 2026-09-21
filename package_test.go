@@ -1,12 +1,40 @@
 package fastagent
 
 import (
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 )
+
+func TestReadInstalledPackages(t *testing.T) {
+	status := "Package: installed\nStatus: install ok installed\n\nPackage: removed\nStatus: deinstall ok config-files\n\nPackage: last\nStatus: install ok installed\n"
+	pkgs, err := readInstalledPackages(strings.NewReader(status))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pkgs) != 2 || !pkgs["installed"] || !pkgs["last"] {
+		t.Fatalf("unexpected installed packages: %v", pkgs)
+	}
+}
+
+func TestReadInstalledPackagesRejectsPartialCache(t *testing.T) {
+	partial := "Package: installed\nStatus: install ok installed\n\n"
+	errRead := errors.New("status read failed")
+	pkgs, err := readInstalledPackages(io.MultiReader(strings.NewReader(partial), iotest.ErrReader(errRead)))
+	if !errors.Is(err, errRead) || pkgs != nil {
+		t.Fatalf("partial read was accepted: packages=%v, error=%v", pkgs, err)
+	}
+	pkgs, err = readInstalledPackages(strings.NewReader(partial + strings.Repeat("x", 128*1024)))
+	if err == nil || pkgs != nil {
+		t.Fatalf("oversized status line was accepted: packages=%v, error=%v", pkgs, err)
+	}
+}
 
 func TestAptCacheFresh(t *testing.T) {
 	now := time.Date(2026, 4, 28, 12, 0, 0, 0, time.UTC)

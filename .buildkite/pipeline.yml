@@ -25,6 +25,9 @@ steps:
   - label: ":go: Test"
     key: "test"
     command: "bash .buildkite/ci.sh test"
+    env:
+      # Daemon startup and bridge tests bind real Unix sockets.
+      CARACAL_BUILDKITE_ALLOW_UNIX_SOCKETS: "true"
     timeout_in_minutes: 15
 
   - label: ":go: Build"
@@ -35,4 +38,7 @@ steps:
   - label: ":python: Test"
     key: "python-test"
     command: "bash .buildkite/ci.sh python-test"
+    env:
+      # Exercise the connection plugin's probe against a real daemon.
+      CARACAL_BUILDKITE_ALLOW_UNIX_SOCKETS: "true"
     timeout_in_minutes: 15

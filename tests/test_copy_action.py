@@ -363,7 +363,12 @@ class TestCopyActionVaultDecrypt(unittest.TestCase):
         # CPython versions).
         self.assertIsNot(cls, ActionModule)
         path = cls.run.__code__.co_filename
-        self.assertNotIn("kevinburke", path, msg=path)
+        import ansible
+        self.assertEqual(
+            os.path.realpath(path),
+            os.path.realpath(os.path.join(os.path.dirname(ansible.__file__),
+                                         "plugins", "action", "copy.py")),
+        )
         self.assertTrue(
             path.endswith(os.path.join("plugins", "action", "copy.py")),
             msg=path,

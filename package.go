@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strconv"
@@ -102,8 +103,6 @@ func aptCacheFresh(updatedAt, sourcesMTime, now time.Time, validTime time.Durati
 // loadInstalledPackages reads dpkg status to build the installed package set.
 // Must be called with aptMu held.
 func loadInstalledPackages(logger interface{ Debug(string, ...any) }) {
-	pkgs := make(map[string]bool)
-
 	f, err := os.Open("/var/lib/dpkg/status")
 	if err != nil {
 		logger.Debug("cannot read dpkg status, disabling package cache", "error", err)
@@ -112,7 +111,20 @@ func loadInstalledPackages(logger interface{ Debug(string, ...any) }) {
 	}
 	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
+	pkgs, err := readInstalledPackages(f)
+	if err != nil {
+		logger.Debug("cannot scan dpkg status, disabling package cache", "error", err)
+		aptInstalledValid = false
+		return
+	}
+	aptInstalledPkgs = pkgs
+	aptInstalledValid = true
+	logger.Debug("loaded dpkg package cache", "count", len(pkgs))
+}
+
+func readInstalledPackages(r io.Reader) (map[string]bool, error) {
+	pkgs := make(map[string]bool)
+	scanner := bufio.NewScanner(r)
 	var currentPkg string
 	var installed bool
 
@@ -132,14 +144,15 @@ func loadInstalledPackages(logger interface{ Debug(string, ...any) }) {
 			installed = false
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
 	// Handle last entry if file doesn't end with blank line.
 	if currentPkg != "" && installed {
 		pkgs[currentPkg] = true
 	}
 
-	aptInstalledPkgs = pkgs
-	aptInstalledValid = true
-	logger.Debug("loaded dpkg package cache", "count", len(pkgs))
+	return pkgs, nil
 }
 
 func (s *Server) handlePackage(params json.RawMessage) (any, error) {

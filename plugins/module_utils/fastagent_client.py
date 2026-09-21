@@ -94,6 +94,7 @@ class FastAgentClient:
         self._stdout = stdout
         self._next_id = 1
         self._lock = threading.Lock()
+        self._broken = False
 
     def call(self, method: str, params: dict | None = None) -> dict:
         """Send a JSON-RPC request and return the result.
@@ -119,27 +120,35 @@ class FastAgentClient:
                 "params": params or {},
             }
 
-            line = json.dumps(request, separators=(",", ":")) + "\n"
             start_ns = _time.monotonic_ns() if _TRACE_PATH else 0
-            self._stdin.write(line.encode("utf-8"))
-            self._stdin.flush()
-
-            response_line = self._stdout.readline()
-            if not response_line:
-                raise IOError(
-                    "fastagent: no response (agent process may have exited)"
-                )
-
-            if _TRACE_PATH:
-                _trace(method, _time.monotonic_ns() - start_ns, _trace_hint(method, params))
-
-            response = json.loads(response_line)
-
-            if response.get("id") != req_id:
-                raise IOError(
-                    f"fastagent: response id mismatch: "
-                    f"expected {req_id}, got {response.get('id')}"
-                )
+            line = (json.dumps(request, separators=(",", ":")) + "\n").encode("utf-8")
+            if self._broken:
+                raise IOError("fastagent: RPC stream is unusable after an earlier failure")
+            try:
+                self._stdin.write(line)
+                self._stdin.flush()
+                response_line = self._stdout.readline()
+                if not response_line:
+                    raise IOError("no response (agent process may have exited)")
+                response = json.loads(response_line)
+                if not isinstance(response, dict) or type(response.get("id")) is not int or response["id"] != req_id:
+                    raise IOError("response id mismatch or invalid response")
+                if response.get("error") is not None and (
+                    not isinstance(response["error"], dict)
+                    or type(response["error"].get("code")) is not int
+                    or not isinstance(response["error"].get("message"), str)
+                ):
+                    raise IOError("invalid agent error response")
+                if response.get("error") is None and not isinstance(response.get("result"), dict):
+                    raise IOError("missing or invalid agent result")
+            except BaseException as exc:
+                self._broken = True
+                if not isinstance(exc, Exception):
+                    raise
+                raise IOError(f"fastagent: execution outcome unknown; request was not replayed: {exc}") from exc
+            finally:
+                if _TRACE_PATH:
+                    _trace(method, _time.monotonic_ns() - start_ns, _trace_hint(method, params))
 
             if "error" in response and response["error"] is not None:
                 err = response["error"]

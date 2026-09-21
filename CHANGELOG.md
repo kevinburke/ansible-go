@@ -2,6 +2,28 @@
 
 All notable changes to fastagent are documented in this file.
 
+## Unreleased
+
+### Bug fixes
+
+- Isolate local forwarding sockets and remote daemons by SSH arguments,
+  connecting user, port, key, controller identity, working directory, and
+  privilege mode. Reconnect when connection options change, and use short
+  hashed socket names that also work with long hostnames.
+- Serialize daemon startup with a persistent advisory lock. Only the lock
+  owner may replace a stale socket; preserve non-socket files and fail on
+  socket permission or PID-file errors.
+- Check remote readiness with a complete, version-matched Hello instead of
+  trusting a socket's existence. Remove remote process-kill and socket-removal
+  commands from bootstrap so concurrent starts cannot kill another daemon.
+- Propagate `--connect` I/O failures while allowing final responses to drain
+  after input EOF. Bound daemon liveness probes and handle fragmented replies.
+- Reject malformed RPC responses, report uncertain execution outcomes, and
+  prevent further requests on a broken stream. Valid agent errors and local
+  serialization failures do not poison otherwise usable connections.
+- Disable the installed-package cache on dpkg-status scan failures instead
+  of caching a partial package list.
+
 ## 0.8.3 — July 30, 2026
 
 ### Bug fixes

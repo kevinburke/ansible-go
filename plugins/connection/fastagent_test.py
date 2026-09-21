@@ -6,15 +6,15 @@ persist into later RPC reads. An earlier version shipped without clearing
 it, which made any module whose exec took >2s (e.g. ufw modifying
 iptables) fail with `timed out` / `cannot read from timed out object`.
 
-The tests use os.pipe() instead of real AF_UNIX sockets so they work
-inside sandboxed CI environments where the socket() syscall is blocked
-by seccomp.
+The timeout tests use os.pipe() to control reply timing. The daemon readiness
+integration test uses a real AF_UNIX socket, so CI must permit Unix sockets.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import select
 import socket as socket_mod
 import subprocess
 import sys
@@ -342,7 +342,9 @@ class TestSetBecomePlugin(unittest.TestCase):
     def test_unsupported_method_falls_back_to_ansible(self) -> None:
         conn = _bare_connection()
         plugin = _FakeBecomePlugin("su", {"become_user": "returns"})
-        conn.set_become_plugin(plugin)
+        with mock.patch.object(fastagent_plugin.display, "warning") as warning:
+            conn.set_become_plugin(plugin)
+        warning.assert_called_once()
         # Ansible's own wrap handles non-sudo methods.
         self.assertIs(conn.become, plugin)
         self.assertFalse(conn._use_become)
@@ -491,6 +493,42 @@ class TestEnsureRemoteDaemon(unittest.TestCase):
         )
         return conn
 
+    def test_readiness_probe_against_real_daemon(self):
+        from fastagent_client_test import _get_agent_binary
+
+        binary = _get_agent_binary()
+        with tempfile.TemporaryDirectory(prefix="fastagent-probe-") as directory:
+            path = os.path.join(directory, "agent.sock")
+            with subprocess.Popen(
+                [binary, "--daemon", "--socket", path],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            ) as daemon:
+                try:
+                    self.assertTrue(select.select([daemon.stdout], [], [], 5)[0], "daemon did not become ready")
+                    self.assertEqual(daemon.stdout.readline().decode().strip(), path)
+                    conn = self._conn()
+                    conn.get_option = lambda key, *a, **kw: binary if key == "agent_path" else None
+
+                    def run_probe(host, user, port, command):
+                        self.assertIn("--connect --socket", command)
+                        result = subprocess.run(["sh", "-c", command], capture_output=True, text=True, timeout=5)
+                        return result.returncode, result.stdout, result.stderr
+
+                    with mock.patch.object(conn, "_run_ssh_command", side_effect=run_probe) as ssh, \
+                         mock.patch.object(conn, "_detect_remote_arch", return_value="amd64"), \
+                         mock.patch.object(conn, "_ensure_agent_deployed"):
+                        conn._ensure_remote_daemon("localhost", None, 22, path, False)
+                    self.assertEqual(ssh.call_count, 1)
+                    self.assertIsNone(daemon.poll())
+                finally:
+                    daemon.terminate()
+                    try:
+                        daemon.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        daemon.kill()
+                        daemon.communicate()
+                        raise
+
     def test_become_detaches_sudo_stdio_and_opens_log_as_root(self) -> None:
         conn = self._conn()
         commands = []
@@ -558,30 +596,23 @@ class TestEnsureRemoteDaemon(unittest.TestCase):
                 False,  # wrap_with_sudo: False because remote_user is root
             )
 
-        kill_cmd = commands[1]
         start_cmd = commands[-1]
         # No sudo anywhere — bootstrap must be safe on hosts that don't
         # ship the sudo package.
-        self.assertNotIn("sudo", kill_cmd)
+        self.assertTrue(all("sudo" not in command for command in commands))
         self.assertNotIn("sudo", start_cmd)
         self.assertIn("setsid /opt/fastagent-", start_cmd)
 
-    def test_daemon_running_but_unusable_by_this_user_restarts(self) -> None:
-        # Regression: a socket left behind by `--allow-user kevin` exists
-        # and is a socket special file (test -S succeeds regardless of who
-        # asks — that only needs search permission on /tmp), but a
-        # different SSH user (e.g. bootstrap's `admin`) can't actually
-        # connect to it. The liveness check must catch that with -r/-w,
-        # not just -S, or this user's connection fails with EACCES on
-        # every retry forever, since the daemon it's blocked from never
-        # changes.
+    def test_unusable_socket_is_not_mistaken_for_a_live_daemon(self) -> None:
+        # A dead or inaccessible socket may still exist on disk. Probe it
+        # as the connecting user, then leave cleanup to the locked daemon.
         conn = self._conn()
         commands = []
 
         def run_ssh(host, user, port, command):
             commands.append(command)
-            if command.startswith("test -S "):
-                return 1, "", ""  # -S ok, but -r/-w fails -> combined rc=1
+            if "--connect --socket" in command:
+                return 1, "", "connection refused"
             return 0, "", ""
 
         with mock.patch.object(conn, "_run_ssh_command", side_effect=run_ssh), \
@@ -594,12 +625,12 @@ class TestEnsureRemoteDaemon(unittest.TestCase):
             )
 
         liveness_cmd = commands[0]
-        self.assertIn("test -S ", liveness_cmd)
-        self.assertIn("test -r ", liveness_cmd)
-        self.assertIn("test -w ", liveness_cmd)
-        # Bootstrap must have proceeded past the liveness check (kill +
-        # start commands issued) rather than trusting the stale grant.
-        self.assertGreater(len(commands), 1)
+        self.assertIn("--connect --socket", liveness_cmd)
+        self.assertIn('"method": "Hello"', liveness_cmd)
+        self.assertIn("--daemon --socket", commands[-1])
+        for command in commands:
+            self.assertNotIn("pkill", command)
+            self.assertNotIn("rm -f", command)
 
     def test_daemon_running_and_usable_skips_restart(self) -> None:
         conn = self._conn()
@@ -607,10 +638,11 @@ class TestEnsureRemoteDaemon(unittest.TestCase):
 
         def run_ssh(host, user, port, command):
             commands.append(command)
-            return 0, "", ""
+            return 0, json.dumps({"id": 1, "result": {"version": fastagent_plugin.AGENT_VERSION}}), ""
 
         with mock.patch.object(conn, "_run_ssh_command", side_effect=run_ssh), \
-             mock.patch.object(conn, "_detect_remote_arch") as mock_arch:
+             mock.patch.object(conn, "_detect_remote_arch", return_value="amd64"), \
+             mock.patch.object(conn, "_ensure_agent_deployed"):
             conn._ensure_remote_daemon(
                 "serval", "kevin", None,
                 f"/tmp/fastagent-root-{fastagent_plugin.AGENT_VERSION}.sock",
@@ -618,7 +650,18 @@ class TestEnsureRemoteDaemon(unittest.TestCase):
             )
 
         self.assertEqual(len(commands), 1)
-        mock_arch.assert_not_called()
+        self.assertIn("--connect --socket", commands[0])
+        self.assertNotIn("--daemon", commands[0])
+
+    def test_malformed_or_wrong_version_probe_cannot_skip_bootstrap(self):
+        for reply in ("not json", '{"id":1}', '{"id":1,"result":{"version":"old"}}'):
+            with self.subTest(reply=reply):
+                conn = self._conn()
+                with mock.patch.object(conn, "_run_ssh_command", return_value=(0, reply, "")) as ssh, \
+                     mock.patch.object(conn, "_detect_remote_arch", return_value="amd64"), \
+                     mock.patch.object(conn, "_ensure_agent_deployed"):
+                    conn._ensure_remote_daemon("serval", "deploy", 22, "/tmp/test.sock", False)
+                self.assertIn("--daemon --socket", ssh.call_args.args[3])
 
 
 def shlex_quote(value: str) -> str:
@@ -671,6 +714,66 @@ class TestConnectRetriesLocalSocketProbe(unittest.TestCase):
              mock.patch.object(fastagent_plugin.time_mod, "sleep"):
             with self.assertRaises(fastagent_plugin.AnsibleConnectionFailure):
                 conn._connect()
+
+
+@unittest.skipIf(_FASTAGENT_IMPORT_ERROR is not None, "ansible is required")
+class TestConnectionIsolation(unittest.TestCase):
+    def _paths(self, **options):
+        conn = _bare_connection()
+        values = {"host": "serval", "remote_user": "deploy", "port": 22}
+        values.update(options)
+        conn._use_become = values.pop("become", False)
+        conn.get_option = lambda key, *a, **kw: values.get(key)
+        with mock.patch.object(conn, "_try_local_socket", side_effect=[False, True]), \
+             mock.patch.object(conn, "_ensure_remote_daemon") as daemon, \
+             mock.patch.object(conn, "_ensure_ssh_forwarding") as forward:
+            conn._connect()
+        return forward.call_args.args[3], daemon.call_args.args[3]
+
+    def test_transport_options_isolate_both_ends(self):
+        original = self._paths()
+        for options in (
+            {"remote_user": "admin"}, {"port": 2222},
+            {"private_key": "/tmp/another-key"},
+            {"ssh_args": "-F /tmp/another-config"},
+            {"ssh_executable": "/tmp/another-ssh"}, {"become": True},
+            {"agent_path": "/opt/another-agent"},
+        ):
+            with self.subTest(options=options):
+                changed = self._paths(**options)
+                self.assertNotEqual(original[0], changed[0])
+                self.assertNotEqual(original[1], changed[1])
+        self.assertEqual(original, self._paths())
+
+    def test_working_directory_and_agent_environment_isolate_connections(self):
+        original = self._paths()
+        with mock.patch.object(fastagent_plugin.os, "getcwd", return_value="/another-checkout"):
+            self.assertNotEqual(original, self._paths())
+        with mock.patch.dict(os.environ, SSH_AUTH_SOCK="/tmp/another-auth-agent"):
+            self.assertNotEqual(original, self._paths())
+        with mock.patch.object(fastagent_plugin.os, "getuid", return_value=os.getuid() + 1):
+            self.assertNotEqual(original, self._paths())
+
+    def test_socket_names_fit_unix_limit_for_long_hostnames(self):
+        local, remote = self._paths(host="x" * 180 + ".example.com")
+        self.assertLess(len(local.encode()), 104)
+        self.assertLess(len(remote.encode()), 104)
+
+    def test_changing_options_reconnects_an_existing_connection(self):
+        conn = _bare_connection()
+        options = {"host": "serval", "remote_user": "deploy", "port": 22}
+        conn.get_option = lambda key, *a, **kw: options.get(key)
+        def connected(*args):
+            conn._connected = True
+            return True
+        with mock.patch.object(conn, "_try_local_socket", side_effect=connected) as probe:
+            conn._connect()
+            conn._connect()
+            self.assertEqual(probe.call_count, 1)
+            options["remote_user"] = "admin"
+            conn._connect()
+            self.assertEqual(probe.call_count, 2)
+            self.assertNotEqual(probe.call_args_list[0].args[0], probe.call_args_list[1].args[0])
 
 
 @unittest.skipIf(

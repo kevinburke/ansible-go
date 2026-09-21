@@ -144,6 +144,8 @@ options:
 """
 
 import base64
+import hashlib
+import json
 import os
 import shlex
 import signal
@@ -186,6 +188,7 @@ class Connection(ConnectionBase):
         # the comment on set_become_plugin for why the plugin itself
         # isn't a reliable source here.
         self._use_become: bool = False
+        self._socket_identity: str | None = None
 
     def set_become_plugin(self, plugin) -> None:
         """Swallow Ansible's become plugin so it doesn't wrap commands.
@@ -269,9 +272,6 @@ class Connection(ConnectionBase):
         return become_user
 
     def _connect(self) -> Connection:
-        if self._connected:
-            return self
-
         use_become = self._use_become
 
         host = self.get_option("host")
@@ -290,27 +290,26 @@ class Connection(ConnectionBase):
         # which skips become entirely when remote_user equals become_user.
         wrap_with_sudo = use_become and user != "root"
 
-        # Socket paths. When become is enabled the daemon always runs as
-        # root (it re-executes commands via ansible's own `sudo -u X`
-        # wrapper), so one socket serves every become_user on the host.
-        # The local socket name must still differ between the become and
-        # non-become cases so a stale forwarding session from one mode
-        # cannot be reused by the other (they point at different remote
-        # sockets owned by different uids).
-        #
-        # The version is embedded in the socket path so a controller on
-        # version X never connects to a daemon on version Y. Without
-        # this, Go's JSON decoder silently drops unknown fields, so an
-        # older daemon would accept RPCs for new features (e.g. become
-        # handling added in 0.5.5) and run them as if the new fields
-        # hadn't been set. A per-version path makes `test -S <sock>`
-        # an accurate proxy for "correct-version daemon is running".
-        if use_become:
-            remote_socket = f"/tmp/fastagent-root-{AGENT_VERSION}.sock"
-            local_socket = f"/tmp/fastagent-local-{host}-root-{AGENT_VERSION}.sock"
-        else:
-            remote_socket = f"/tmp/fastagent-{AGENT_VERSION}.sock"
-            local_socket = f"/tmp/fastagent-local-{host}-{AGENT_VERSION}.sock"
+        # Include the actual SSH arguments, including omitted user/port options
+        # that SSH may resolve from its configuration. Hashing keeps arbitrary
+        # hostnames and options out of filenames and below Unix socket limits.
+        identity = {
+            "schema": 1, "version": AGENT_VERSION, "uid": os.getuid(),
+            "ssh": self._build_ssh_command(host, user, port, "")[:-1],
+            "cwd": os.getcwd(), "become": use_become,
+            "agent_path": self.get_option("agent_path"),
+            "environment": {key: os.environ.get(key, "") for key in (
+                "HOME", "PATH", "SSH_AUTH_SOCK", "SSH_AGENT_PID",
+            )},
+        }
+        digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:32]
+        if self._connected and getattr(self, "_socket_identity", None) == digest:
+            return self
+        self.close()
+        self._socket_identity = digest
+        mode = "root-" if use_become else ""
+        remote_socket = f"/tmp/fastagent-{mode}{AGENT_VERSION}-{digest}.sock"
+        local_socket = f"/tmp/fastagent-local-{os.getuid()}-{digest}.sock"
 
         # Fast path: try connecting to the local forwarding socket directly.
         # This is a local Unix socket connect (~1ms), no SSH involved.
@@ -350,8 +349,8 @@ class Connection(ConnectionBase):
         connecting, we send a Hello and only declare success once we get a
         valid response back with a matching version. If any step fails
         (including version mismatch) we tear down the socket so the caller
-        falls through to the bootstrap path, which kills any stale daemon
-        and starts a fresh one at the right version.
+        falls through to bootstrap. The daemon's startup lock protects its
+        stale-socket cleanup; the controller never kills a remote daemon.
         """
         if not os.path.exists(local_socket):
             return False
@@ -391,35 +390,6 @@ class Connection(ConnectionBase):
         wrap_with_sudo: bool,
     ) -> None:
         """Ensure the remote daemon is running, bootstrapping if needed."""
-        # Check if daemon is already running *and usable by this SSH user*.
-        # `test -S` alone only confirms the path is a socket special file —
-        # listing a directory entry's type needs search permission on the
-        # containing directory (world-executable /tmp), not permission on
-        # the socket itself, so it reports success even for a daemon that
-        # was started with `--allow-user <someone else>`. In become mode
-        # one socket is shared across every become_user on the host (see
-        # the comment in _connect), and whichever SSH user's connection
-        # last (re)started the daemon is the only one --allow-user grants
-        # access to. Without the -r/-w checks, a play that connects as a
-        # different SSH user (e.g. bootstrap-columbus.yml's `admin`, after
-        # configure.yml last ran as `kevin`) sees "daemon already running",
-        # never restarts it, and then gets a hard EACCES on every
-        # forwarded connection attempt — indistinguishable from the
-        # earlier stale-forwarder race except that no amount of retrying
-        # fixes it, since the daemon this user can never reach never
-        # changes.
-        test_cmd = (
-            f"test -S {shlex.quote(remote_socket)}"
-            f" && test -r {shlex.quote(remote_socket)}"
-            f" && test -w {shlex.quote(remote_socket)}"
-        )
-        rc, _, _ = self._run_ssh_command(host, user, port, test_cmd)
-        if rc == 0:
-            display.vvv(f"FASTAGENT: remote daemon already running", host=host)
-            return
-
-        display.vvv(f"FASTAGENT: bootstrapping remote daemon", host=host)
-
         # Detect arch and deploy binary. The daemon runs as root when
         # become is enabled, so it can always exec the binary out of the
         # connecting user's home — no need to stage to a system path.
@@ -439,22 +409,27 @@ class Connection(ConnectionBase):
 
         agent_bin = shlex.quote(remote_agent_path)
 
-        # Kill any old daemon. Prefer the PID file (the daemon writes it at
-        # {socket}.pid); `pkill -F` parses it as an integer, so a garbage or
-        # adversarial pid file can't trick us into signalling arbitrary PIDs
-        # the way `kill $(cat …)` would. Fall back to pkill with a pattern
-        # that matches the versioned binary name (fastagent-X.Y.Z-OS-ARCH) —
-        # a literal 'fastagent --daemon' pattern never matches since the
-        # cmdline has no space between 'fastagent' and the version suffix.
-        pid_file = remote_socket + ".pid"
-        kill_cmd = (
-            f"pkill -F {shlex.quote(pid_file)} 2>/dev/null || true;"
-            f" pkill -f 'fastagent[^ ]* --daemon' 2>/dev/null || true;"
-            f" rm -f {shlex.quote(remote_socket)} {shlex.quote(pid_file)}"
-        )
-        if wrap_with_sudo:
-            kill_cmd = f"sudo sh -c {shlex.quote(kill_cmd)}"
-        self._run_ssh_command(host, user, port, kill_cmd)
+        # Probe through the connecting user's permissions. A socket file can
+        # outlive its daemon; only a complete, matching Hello proves readiness.
+        hello = json.dumps({"id": 1, "method": "Hello", "params": {"version": AGENT_VERSION}})
+        probe = f"printf '%s\\n' {shlex.quote(hello)} | {agent_bin} --connect --socket {shlex.quote(remote_socket)}"
+        rc, stdout, _ = self._run_ssh_command(host, user, port, probe)
+        if rc == 0:
+            try:
+                response = json.loads(stdout)
+                if (isinstance(response, dict) and type(response.get("id")) is int
+                        and response["id"] == 1 and response.get("error") is None
+                        and isinstance(response.get("result"), dict)
+                        and response["result"].get("version") == AGENT_VERSION):
+                    display.vvv("FASTAGENT: remote daemon already running", host=host)
+                    return
+            except ValueError:
+                pass  # A malformed probe is not evidence of a live daemon.
+
+        # RunDaemon alone owns stale-socket cleanup, under its startup lock.
+        # Never signal PID-file contents or unlink the socket from this shell:
+        # another starter may have made it live since the failed probe.
+        display.vvv("FASTAGENT: bootstrapping remote daemon", host=host)
 
         # Start the daemon. Pass --allow-user so the socket is accessible to
         # the SSH user (needed for SSH socket forwarding).

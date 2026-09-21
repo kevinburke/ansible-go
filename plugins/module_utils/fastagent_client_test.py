@@ -5,6 +5,8 @@ actual RPCs through the client. Requires Go to be installed.
 """
 
 import base64
+import io
+import json
 import os
 import subprocess
 import tempfile
@@ -15,6 +17,43 @@ from fastagent_client import (
     FastAgentError,
     FastAgentVersionMismatch,
 )
+
+
+class TestRPCFailures(unittest.TestCase):
+    def test_invalid_response_poisoned_stream_is_not_used_again(self):
+        responses = [b"", b"not json\n"] + [
+            (json.dumps(value) + "\n").encode() for value in (
+                [], {"id": True, "result": {}}, {"id": 2, "result": {}},
+                {"id": 1}, {"id": 1, "result": []},
+                {"id": 1, "error": "broken"},
+                {"id": 1, "error": {"code": "bad", "message": "bad"}},
+            )
+        ]
+        for response in responses:
+            with self.subTest(response=response):
+                output = io.BytesIO()
+                client = FastAgentClient(output, io.BytesIO(response))
+                with self.assertRaisesRegex(OSError, "outcome unknown"):
+                    client.call("Exec", {"argv": ["a-mutation"]})
+                sent = output.getvalue()
+                with self.assertRaisesRegex(OSError, "unusable"):
+                    client.call("Exec", {"argv": ["a-mutation"]})
+                self.assertEqual(output.getvalue(), sent)
+
+    def test_agent_error_does_not_poison_stream(self):
+        responses = b'{"id":1,"error":{"code":7,"message":"failed"}}\n{"id":2,"result":{"ok":true}}\n'
+        client = FastAgentClient(io.BytesIO(), io.BytesIO(responses))
+        with self.assertRaises(FastAgentError):
+            client.call("Exec")
+        self.assertEqual(client.call("Stat"), {"ok": True})
+
+    def test_serialization_failure_does_not_poison_stream(self):
+        output = io.BytesIO()
+        client = FastAgentClient(output, io.BytesIO(b'{"id":2,"result":{}}\n'))
+        with self.assertRaises(TypeError):
+            client.call("Exec", {"bad": object()})
+        self.assertEqual(output.getvalue(), b"")
+        self.assertEqual(client.call("Stat"), {})
 
 
 # Build once for all tests.
@@ -107,6 +146,25 @@ class TestHello(unittest.TestCase):
 
 
 class TestExec(unittest.TestCase):
+    def test_completed_mutation_with_lost_response_is_not_replayed(self):
+        with tempfile.TemporaryDirectory() as directory, AgentSession() as client:
+            path = os.path.join(directory, "counter")
+            original = client._stdout
+
+            class LostResponse:
+                def readline(self):
+                    original.readline()  # The daemon completed the command.
+                    raise OSError("injected response loss")
+
+            client._stdout = LostResponse()
+            command = ["sh", "-c", 'printf x >> "$1"', "sh", path]
+            with self.assertRaisesRegex(OSError, "outcome unknown"):
+                client.exec(argv=command)
+            with self.assertRaisesRegex(OSError, "unusable"):
+                client.exec(argv=command)
+            with open(path) as result:
+                self.assertEqual(result.read(), "x")
+
     def test_echo(self):
         with AgentSession() as client:
             result = client.exec(argv=["echo", "hello world"])

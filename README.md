@@ -355,12 +355,32 @@ Controller                          Remote Host
 - **Daemon**: persistent Go process on the remote host. Accepts JSON-RPC over
   a Unix socket. Handles Exec, Stat, ReadFile, WriteFile, File, Package,
   Service RPCs. Auto-exits after 1 hour idle.
-- **SSH forwarding**: `ssh -fN -L local.sock:remote.sock` runs once per host,
-  bridges the local and remote sockets. Persists across tasks and forks.
+- **SSH forwarding**: `ssh -fN -L local.sock:remote.sock` runs once per connection
+  configuration and bridges the local and remote sockets. Persists across tasks
+  and forks.
 - **Connection plugin**: on each task, connects to the local socket, sends
   RPCs, disconnects. First task bootstraps the daemon and SSH forwarding.
 - **Action plugins**: intercept common modules and send RPCs directly instead
   of transferring Python modules.
+
+Socket names include a hash of the SSH arguments, controller UID, working
+directory, authentication environment, agent path, version, and privilege
+mode. Different SSH users, ports, keys, and proxy options get separate local
+forwarders and remote daemon paths. The shorter names also support long
+hostnames. Ansible's per-task `become_user` is still passed with each Exec RPC;
+it does not change the daemon's identity.
+
+The identity describes connection settings, not the contents of SSH config or
+key files. Existing SSH sessions, including OpenSSH ControlMaster connections,
+retain their authenticated state until closed. Editing credentials in place
+does not force an existing session to reauthenticate.
+
+Daemon startup is serialized by a lock file beside the socket. Keep that file
+in place: removing a live lock file would allow a second starter to bypass it.
+The daemon owns stale-socket cleanup, and bootstrap never kills other daemons.
+If an RPC response is lost or malformed, fastagent reports an unknown execution
+outcome and stops using that stream. It does not retry the submitted operation;
+check the remote state before retrying a mutation yourself.
 
 ## Updating
 
@@ -368,9 +388,10 @@ Controller                          Remote Host
 ansible-galaxy collection install --upgrade -r requirements.yml
 ```
 
-The connection plugin detects daemon version mismatches automatically: when
-it talks to a remote daemon running an older version, it kills it and uploads
-the new binary on the next task. No coordinated upgrade needed.
+Daemon socket names are versioned. After an upgrade the connection plugin
+uploads the matching binary if needed and uses a separate daemon socket.
+Older daemons expire when idle; bootstrap does not terminate them. Every new
+connection verifies the remote version with Hello before running tasks.
 
 ## Disabling fastagent
 
@@ -385,11 +406,9 @@ ansible_connection: ssh
 The host falls back to standard SSH on the next run. Useful as an escape
 hatch if a particular host triggers a bug.
 
-To remove the daemon and binary from a remote host entirely:
-
-```bash
-ssh myhost 'sudo pkill fastagent; sudo rm -rf /tmp/fastagent-* ~/.ansible/fastagent'
-```
+Unused daemons expire after one hour without active connections. To uninstall
+the remote binaries, first stop using fastagent and allow its daemons to exit,
+then remove the binaries from the configured `fastagent_agent_path` location.
 
 To disable the auto-download of the agent binary on the controller (e.g. for
 air-gapped environments where you ship the binary out-of-band):
@@ -414,10 +433,11 @@ timestamps).
 
 ### Daemon log
 
-The daemon logs to a file next to its socket on the remote host:
+The daemon logs beside its socket. The exact path appears in the daemon launch
+command in `-vvv` output. To find the available logs on the remote host:
 
 ```bash
-ssh myhost "sudo cat /tmp/fastagent-root.sock.log"
+ssh myhost 'sudo ls -l /tmp/fastagent-*.sock.log'
 ```
 
 ### Common issues
@@ -450,20 +470,14 @@ The daemon failed to start. Check the daemon log on the remote host. Common
 causes: the binary wasn't uploaded (version mismatch), or a stale daemon
 process is holding the socket.
 
-```bash
-ssh myhost "sudo pkill fastagent; sudo rm -f /tmp/fastagent-root.sock*"
-```
-
 **"failed to start daemon" or hanging**
 
-Kill stale processes and sockets on both sides:
-
-```bash
-# Remote
-ssh myhost "sudo pkill fastagent; sudo rm -f /tmp/fastagent-root.sock*"
-# Local
-rm -f /tmp/fastagent-local-*
-```
+Inspect the log and PID file for the exact remote socket shown in `-vvv`
+output. A lock held by an unresponsive or inaccessible daemon is an error;
+startup does not bypass it. If manual termination is necessary, verify that
+the PID still belongs to the daemon serving that socket before signaling it.
+Do not remove active socket or lock files, or kill all fastagent processes:
+other configurations may be using them.
 
 **Tasks return different results than with SSH**
 
