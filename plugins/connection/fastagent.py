@@ -144,12 +144,15 @@ options:
 """
 
 import base64
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
 import shlex
 import signal
 import socket as socket_mod
+import stat
 import subprocess
 import tempfile
 import time as time_mod
@@ -168,6 +171,47 @@ display = Display()
 
 # Agent version must match the Go constant.
 AGENT_VERSION = "0.8.3"
+
+# Bound on how long a controller process waits for another process's
+# local-socket setup lock (see _local_socket_setup_lock) before giving up.
+# Keeps a wedged holder (e.g. a hung ssh) from hanging every other fork
+# hitting the same host forever; a timeout is a loud, clear failure instead.
+_LOCAL_SOCKET_LOCK_TIMEOUT = 30.0
+_LOCAL_SOCKET_LOCK_POLL = 0.1
+
+
+def _open_local_socket_lock(path: str) -> t.BinaryIO:
+    """Open (creating if needed) the advisory lock file beside local_socket.
+
+    Mirrors the safety checks daemon.go's openDaemonLock applies to the
+    *remote* daemon's own startup lock: refuse a symlink (O_NOFOLLOW),
+    anything that isn't a plain regular file, a file owned by someone
+    else, or one with any group/other permission bit set. The inode is
+    left in place afterward (never unlinked) so every racing process
+    flocks the same file instead of silently creating and locking
+    unrelated ones.
+    """
+    flags = os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError as e:
+        raise AnsibleConnectionFailure(
+            f"fastagent: cannot open local socket setup lock {path}: {e}"
+        )
+    try:
+        st = os.fstat(fd)
+        if (not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid()
+                or stat.S_IMODE(st.st_mode) & 0o077 != 0):
+            raise AnsibleConnectionFailure(
+                f"fastagent: refusing unsafe local socket setup lock {path} "
+                f"(must be a regular file owned by uid {os.getuid()} with "
+                f"no group/other permission bits)"
+            )
+    except BaseException:
+        os.close(fd)
+        raise
+    return os.fdopen(fd, "r+b")
+
 
 class Connection(ConnectionBase):
     """fastagent connection plugin."""
@@ -318,28 +362,119 @@ class Connection(ConnectionBase):
 
         display.vvv(f"FASTAGENT: local socket not available, setting up", host=host)
 
-        # Ensure the remote daemon is running.
-        self._ensure_remote_daemon(host, user, port, remote_socket, wrap_with_sudo)
-
-        # Start SSH socket forwarding if not already running.
-        self._ensure_ssh_forwarding(host, user, port, local_socket, remote_socket)
-
-        # Now connect to the local socket. The local socket *file* existing
-        # only means OpenSSH's local listener has bound; -L unix-socket
-        # forwarding proxies each connection to the remote target lazily,
-        # over an additional round-trip through the SSH channel, so the
-        # very first connect can still race a not-yet-ready remote-side
-        # proxy and see EOF on the Hello handshake. Retry a few times with
-        # a short backoff instead of failing on that first race.
-        for attempt in range(5):
-            if self._try_local_socket(local_socket, host):
-                return self
-            if attempt < 4:
-                time_mod.sleep(0.1)
-
-        raise AnsibleConnectionFailure(
-            f"fastagent: failed to connect to local forwarding socket {local_socket}"
+        self._setup_local_socket(
+            host, user, port, local_socket, remote_socket, wrap_with_sudo,
         )
+        return self
+
+    @contextlib.contextmanager
+    def _local_socket_setup_lock(self, local_socket: str, host: str):
+        """Serialize controller-side setup for one local_socket.
+
+        Two Ansible worker processes (forks) that `delegate_to` the same
+        host with the same connection settings compute the same identity
+        digest and so target the same local_socket. Without this lock both
+        can observe _try_local_socket() fail and both race `ssh -L` to
+        bind that path — the loser's ssh gets "Address already in use" and
+        the task is marked UNREACHABLE (seen in production 2026-09-23,
+        running two forks with `delegate_to` against the same host).
+        Commit 5388172's advisory lock (daemon.go's RunDaemon) only
+        protects the *remote* daemon's own startup; two controller
+        processes never contend for that lock at all, so it does nothing
+        for this race.
+
+        Held only across setup — callers should return from inside this
+        context as soon as a usable connection exists, not for the life
+        of the connection.
+        """
+        lock_path = local_socket + ".lock"
+        lock_file = _open_local_socket_lock(lock_path)
+        try:
+            deadline = time_mod.monotonic() + _LOCAL_SOCKET_LOCK_TIMEOUT
+            while True:
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time_mod.monotonic() >= deadline:
+                        raise AnsibleConnectionFailure(
+                            f"fastagent: timed out after "
+                            f"{_LOCAL_SOCKET_LOCK_TIMEOUT}s waiting for the "
+                            f"local socket setup lock {lock_path} (held by "
+                            f"another fastagent process for host {host!r}). "
+                            f"If no fastagent connection is actually in "
+                            f"progress, a previous run may have left a "
+                            f"wedged process holding it; investigate and "
+                            f"remove the lock file if so."
+                        )
+                    time_mod.sleep(_LOCAL_SOCKET_LOCK_POLL)
+            display.vvv(f"FASTAGENT: acquired local socket setup lock {lock_path}", host=host)
+            try:
+                yield
+            finally:
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+        finally:
+            lock_file.close()
+
+    def _setup_local_socket(
+        self,
+        host: str,
+        user: str | None,
+        port: int | None,
+        local_socket: str,
+        remote_socket: str,
+        wrap_with_sudo: bool,
+    ) -> None:
+        """Bootstrap the remote daemon and local forwarding for local_socket.
+
+        Runs under _local_socket_setup_lock so at most one controller
+        process performs setup for a given local_socket at a time. Sets
+        self._socket / self._agent_client / self._connected as a side
+        effect of _try_local_socket on success (matching _connect's
+        contract); raises AnsibleConnectionFailure otherwise.
+        """
+        with self._local_socket_setup_lock(local_socket, host):
+            # Another fork may have finished setup while we waited for the
+            # lock — the common outcome once two forks race the same
+            # host+identity. Re-checking here is what turns that race
+            # into a cheap socket reuse instead of a second `ssh -L`
+            # racing the winner's bind.
+            if self._try_local_socket(local_socket, host):
+                return
+
+            # Ensure the remote daemon is running.
+            self._ensure_remote_daemon(host, user, port, remote_socket, wrap_with_sudo)
+
+            # Start SSH socket forwarding if not already running. As
+            # defense in depth against a bind race this lock doesn't
+            # cover (e.g. a forwarder left by a pre-fix fastagent, or a
+            # process that hit the lock timeout above), this may itself
+            # resolve to a usable connection without raising — see the
+            # "Address already in use" handling in _ensure_ssh_forwarding.
+            self._ensure_ssh_forwarding(host, user, port, local_socket, remote_socket)
+            if self._connected:
+                return
+
+            # Now connect to the local socket. The local socket *file*
+            # existing only means OpenSSH's local listener has bound; -L
+            # unix-socket forwarding proxies each connection to the remote
+            # target lazily, over an additional round-trip through the SSH
+            # channel, so the very first connect can still race a
+            # not-yet-ready remote-side proxy and see EOF on the Hello
+            # handshake. Retry a few times with a short backoff instead of
+            # failing on that first race.
+            for attempt in range(5):
+                if self._try_local_socket(local_socket, host):
+                    return
+                if attempt < 4:
+                    time_mod.sleep(0.1)
+
+            raise AnsibleConnectionFailure(
+                f"fastagent: failed to connect to local forwarding socket {local_socket}"
+            )
 
     def _try_local_socket(self, local_socket: str, host: str) -> bool:
         """Try connecting to the local forwarding socket and probe the daemon.
@@ -561,9 +696,27 @@ class Connection(ConnectionBase):
 
         result = subprocess.run(cmd, capture_output=True, timeout=30)
         if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", errors="replace")
+            if "address already in use" in stderr.lower():
+                # Defense in depth: _local_socket_setup_lock should
+                # prevent two of our own processes from racing this
+                # bind, but something outside that lock can still win it
+                # — a forwarder left by a pre-fix fastagent build, or a
+                # process that gave up waiting for the lock after its
+                # timeout. Rather than fail the task, give the winner's
+                # socket a few short chances to answer a Hello before
+                # giving up on it.
+                display.vvv(
+                    f"FASTAGENT: forwarding bind raced another process, "
+                    f"retrying local socket probe", host=host,
+                )
+                for attempt in range(3):
+                    if self._try_local_socket(local_socket, host):
+                        return
+                    if attempt < 2:
+                        time_mod.sleep(0.2)
             raise AnsibleConnectionFailure(
-                f"fastagent: SSH forwarding failed: "
-                f"{result.stderr.decode('utf-8', errors='replace')}"
+                f"fastagent: SSH forwarding failed: {stderr}"
             )
 
         # Wait for the local socket to appear.

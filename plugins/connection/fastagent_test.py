@@ -12,10 +12,13 @@ integration test uses a real AF_UNIX socket, so CI must permit Unix sockets.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import select
 import socket as socket_mod
+import stat as stat_module
 import subprocess
 import sys
 import tempfile
@@ -686,14 +689,22 @@ class TestConnectRetriesLocalSocketProbe(unittest.TestCase):
             "remote_user": "kevin",
             "port": None,
         }.get(key)
+        # A no-op setup lock: these tests are about the post-forwarding
+        # probe, and the real lock would create a file in /tmp, which is
+        # read-only inside the CI sandbox (TestLocalSocketSetupLock covers
+        # the lock against a temporary directory).
+        conn._local_socket_setup_lock = (
+            lambda *a, **kw: contextlib.nullcontext())
         return conn
 
     def test_transient_race_after_fresh_forwarding_is_retried(self) -> None:
         conn = self._conn()
         # Call 1: the fast-path probe, before forwarding exists (fails).
-        # Calls 2-3: the post-forwarding probe loses the race twice.
-        # Call 4: the race clears and the probe succeeds.
-        probe_results = iter([False, False, False, True])
+        # Call 2: the setup-lock re-check, which also fails (no other
+        # fork has finished setup either), so setup proceeds.
+        # Calls 3-4: the post-forwarding probe loses the race twice.
+        # Call 5: the race clears and the probe succeeds.
+        probe_results = iter([False, False, False, False, True])
         with mock.patch.object(
                 conn, "_try_local_socket",
                 side_effect=lambda *a, **kw: next(probe_results)), \
@@ -724,9 +735,24 @@ class TestConnectionIsolation(unittest.TestCase):
         values.update(options)
         conn._use_become = values.pop("become", False)
         conn.get_option = lambda key, *a, **kw: values.get(key)
-        with mock.patch.object(conn, "_try_local_socket", side_effect=[False, True]), \
+        # False, False: the fast-path probe and the setup-lock re-check
+        # both fail (no other fork has set this local_socket up), so
+        # setup proceeds to _ensure_remote_daemon/_ensure_ssh_forwarding.
+        # True: the post-forwarding probe then succeeds immediately.
+        #
+        # The setup lock itself is mocked out to a no-op here: these
+        # tests are about socket *path* isolation (the identity digest),
+        # not the lock's own file-safety checks (covered separately by
+        # TestLocalSocketSetupLock), and some subtests patch os.getuid()
+        # to vary the digest, which would otherwise make a freshly
+        # created (real-uid-owned) lock file fail that safety check
+        # against the mocked uid.
+        with mock.patch.object(conn, "_try_local_socket", side_effect=[False, False, True]), \
              mock.patch.object(conn, "_ensure_remote_daemon") as daemon, \
-             mock.patch.object(conn, "_ensure_ssh_forwarding") as forward:
+             mock.patch.object(conn, "_ensure_ssh_forwarding") as forward, \
+             mock.patch.object(
+                conn, "_local_socket_setup_lock",
+                side_effect=lambda *a, **kw: contextlib.nullcontext()):
             conn._connect()
         return forward.call_args.args[3], daemon.call_args.args[3]
 
@@ -853,6 +879,254 @@ class TestEnsureSshForwardingKillsStaleForwarder(unittest.TestCase):
 
         mock_kill.assert_called_once_with(local_socket, "serval")
         mock_remove.assert_called_once_with(local_socket)
+
+
+@unittest.skipIf(
+    _FASTAGENT_IMPORT_ERROR is not None,
+    "ansible is required to run connection plugin tests",
+)
+class TestLocalSocketSetupLock(unittest.TestCase):
+    """Regression tests for the controller-side setup race.
+
+    Production, 2026-09-23: a playbook ran a task on two hosts in parallel
+    forks, each with `delegate_to: columbus-buckeye`. Both worker processes
+    computed the same identity digest (commit 5388172) and so targeted the
+    same local_socket. Both saw _try_local_socket() fail and both raced
+    `ssh -L` to bind it; the loser's ssh got "Address already in use" and
+    Ansible marked the host UNREACHABLE. Commit 5388172's advisory lock
+    only covers the *remote* daemon's own startup (RunDaemon's flock in
+    daemon.go) — it does nothing for this controller-side bind race, since
+    two controller processes never contend for that lock at all.
+
+    _setup_local_socket now serializes controller-side setup for one
+    local_socket with a sibling advisory lock file, and re-checks
+    _try_local_socket() after acquiring it so the loser reuses the
+    winner's connection instead of racing ssh a second time.
+    """
+
+    def test_concurrent_setup_serializes_and_reuses_winner(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="fastagent-lock-test-") as directory:
+            local_socket = os.path.join(directory, "fastagent-local-test.sock")
+            remote_socket = "/tmp/fastagent-test.sock"
+
+            usable = threading.Event()
+            forwarding_calls: list[str] = []
+            forwarding_calls_lock = threading.Lock()
+            start_gate = threading.Barrier(2, timeout=5)
+
+            def fake_ensure_ssh_forwarding(host, user, port, ls, rs):
+                with forwarding_calls_lock:
+                    forwarding_calls.append(threading.current_thread().name)
+                # Simulate the time `ssh -L` takes to authenticate and bind
+                # before the local socket file becomes connectable — the
+                # window the production race fell into.
+                time.sleep(0.3)
+                usable.set()
+
+            def fake_try_local_socket(ls, host):
+                return usable.is_set()
+
+            results: dict[str, bool] = {}
+            errors: list[BaseException] = []
+
+            def worker(name: str) -> None:
+                conn = _bare_connection()
+                conn.get_option = lambda key, *a, **kw: None
+                try:
+                    start_gate.wait()
+                    with mock.patch.object(
+                            conn, "_try_local_socket",
+                            side_effect=fake_try_local_socket), \
+                         mock.patch.object(conn, "_ensure_remote_daemon"), \
+                         mock.patch.object(
+                            conn, "_ensure_ssh_forwarding",
+                            side_effect=fake_ensure_ssh_forwarding):
+                        # _setup_local_socket has no return value on
+                        # success (it raises AnsibleConnectionFailure on
+                        # failure instead), so simply completing without
+                        # raising is the success signal.
+                        conn._setup_local_socket(
+                            "test-host", "kevin", None,
+                            local_socket, remote_socket, False,
+                        )
+                        results[name] = True
+                except BaseException as e:  # noqa: BLE001 - surfaced below
+                    errors.append(e)
+
+            fork_a = threading.Thread(target=worker, args=("fork-a",), name="fork-a")
+            fork_b = threading.Thread(target=worker, args=("fork-b",), name="fork-b")
+            fork_a.start()
+            fork_b.start()
+            fork_a.join(timeout=5)
+            fork_b.join(timeout=5)
+
+            self.assertFalse(errors, f"worker(s) raised: {errors!r}")
+            self.assertTrue(results.get("fork-a"))
+            self.assertTrue(results.get("fork-b"))
+            # Whichever fork gets there first, only ONE of them may ever
+            # call _ensure_ssh_forwarding (i.e. race `ssh -L`). The other
+            # must block on the setup lock and then reuse the winner's
+            # now-usable socket via the post-lock _try_local_socket
+            # re-check, instead of racing a second bind.
+            self.assertEqual(
+                len(forwarding_calls), 1,
+                f"exactly one fork should set up forwarding, got "
+                f"{forwarding_calls!r}",
+            )
+
+    def test_lock_file_is_created_with_safe_permissions(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="fastagent-lock-test-") as directory:
+            local_socket = os.path.join(directory, "fastagent-local-test.sock")
+            conn = _bare_connection()
+            with conn._local_socket_setup_lock(local_socket, "test-host"):
+                pass
+            lock_path = local_socket + ".lock"
+            st = os.stat(lock_path)
+            self.assertEqual(stat_module.S_IMODE(st.st_mode), 0o600)
+            self.assertEqual(st.st_uid, os.getuid())
+
+    def test_lock_wait_times_out_with_clear_message(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="fastagent-lock-test-") as directory:
+            local_socket = os.path.join(directory, "fastagent-local-test.sock")
+            lock_path = local_socket + ".lock"
+            holder_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(holder_fd, fcntl.LOCK_EX)
+                conn = _bare_connection()
+                with mock.patch.object(
+                        fastagent_plugin, "_LOCAL_SOCKET_LOCK_TIMEOUT", 0.2), \
+                     mock.patch.object(
+                        fastagent_plugin, "_LOCAL_SOCKET_LOCK_POLL", 0.05):
+                    with self.assertRaises(
+                            fastagent_plugin.AnsibleConnectionFailure) as ctx:
+                        with conn._local_socket_setup_lock(local_socket, "test-host"):
+                            pass  # pragma: no cover - must not be reached
+                self.assertIn("timed out", str(ctx.exception).lower())
+                self.assertIn(lock_path, str(ctx.exception))
+            finally:
+                fcntl.flock(holder_fd, fcntl.LOCK_UN)
+                os.close(holder_fd)
+
+    def test_rejects_group_writable_lock_file(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="fastagent-lock-test-") as directory:
+            lock_path = os.path.join(directory, "fastagent-local-test.sock.lock")
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+            os.close(fd)
+            with self.assertRaises(fastagent_plugin.AnsibleConnectionFailure):
+                fastagent_plugin._open_local_socket_lock(lock_path)
+
+    def test_rejects_symlink_lock_path(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="fastagent-lock-test-") as directory:
+            target = os.path.join(directory, "real-file")
+            with open(target, "wb"):
+                pass
+            lock_path = os.path.join(directory, "fastagent-local-test.sock.lock")
+            os.symlink(target, lock_path)
+            with self.assertRaises(fastagent_plugin.AnsibleConnectionFailure):
+                fastagent_plugin._open_local_socket_lock(lock_path)
+
+    def test_rejects_lock_file_owned_by_another_user(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="fastagent-lock-test-") as directory:
+            lock_path = os.path.join(directory, "fastagent-local-test.sock.lock")
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            os.close(fd)
+            # Simulate "owned by someone else" by making the current uid
+            # check disagree with the file's real (our own) uid, since the
+            # test process cannot actually chown a file to another user.
+            with mock.patch.object(
+                    fastagent_plugin.os, "getuid",
+                    return_value=os.getuid() + 1):
+                with self.assertRaises(fastagent_plugin.AnsibleConnectionFailure):
+                    fastagent_plugin._open_local_socket_lock(lock_path)
+
+
+@unittest.skipIf(
+    _FASTAGENT_IMPORT_ERROR is not None,
+    "ansible is required to run connection plugin tests",
+)
+class TestEnsureSshForwardingBindRace(unittest.TestCase):
+    """Defense in depth: even with the setup lock, retry the local socket
+    probe a few times if `ssh -L` fails to bind with "Address already in
+    use" before failing the task outright. Covers a leftover forwarder
+    started outside the lock (e.g. by an older fastagent build) or a lock
+    holder that only just released.
+    """
+
+    def _conn(self):
+        conn = _bare_connection()
+        conn.get_option = lambda key, *a, **kw: {
+            "ssh_executable": "ssh",
+            "ssh_args": None,
+            "private_key": None,
+        }.get(key)
+        return conn
+
+    def test_address_in_use_retries_before_failing(self) -> None:
+        conn = self._conn()
+        local_socket = "/tmp/fastagent-local-host-root-0.0.0.sock"
+        failed = subprocess.CompletedProcess(
+            args=["ssh"], returncode=255, stdout=b"",
+            stderr=b"unix_listener: cannot bind to path "
+                   b"/tmp/fastagent-local-host-root-0.0.0.sock: "
+                   b"Address already in use\n",
+        )
+
+        probe_results = iter([False, True])
+        with mock.patch.object(conn, "_kill_stale_forwarder"), \
+             mock.patch.object(fastagent_plugin.os.path, "exists", return_value=True), \
+             mock.patch.object(fastagent_plugin.os, "remove"), \
+             mock.patch.object(fastagent_plugin.subprocess, "run", return_value=failed), \
+             mock.patch.object(
+                conn, "_try_local_socket",
+                side_effect=lambda *a, **kw: next(probe_results)) as probe, \
+             mock.patch.object(fastagent_plugin.time_mod, "sleep") as sleep:
+            conn._ensure_ssh_forwarding(
+                "serval", "kevin", None, local_socket,
+                "/tmp/fastagent-root-0.0.0.sock",
+            )
+
+        self.assertEqual(probe.call_count, 2)
+        self.assertGreaterEqual(sleep.call_count, 1)
+
+    def test_address_in_use_raises_if_never_becomes_usable(self) -> None:
+        conn = self._conn()
+        local_socket = "/tmp/fastagent-local-host-root-0.0.0.sock"
+        failed = subprocess.CompletedProcess(
+            args=["ssh"], returncode=255, stdout=b"",
+            stderr=b"Address already in use\n",
+        )
+
+        with mock.patch.object(conn, "_kill_stale_forwarder"), \
+             mock.patch.object(fastagent_plugin.os.path, "exists", return_value=True), \
+             mock.patch.object(fastagent_plugin.os, "remove"), \
+             mock.patch.object(fastagent_plugin.subprocess, "run", return_value=failed), \
+             mock.patch.object(conn, "_try_local_socket", return_value=False), \
+             mock.patch.object(fastagent_plugin.time_mod, "sleep"):
+            with self.assertRaises(fastagent_plugin.AnsibleConnectionFailure):
+                conn._ensure_ssh_forwarding(
+                    "serval", "kevin", None, local_socket,
+                    "/tmp/fastagent-root-0.0.0.sock",
+                )
+
+    def test_other_failures_still_raise_immediately(self) -> None:
+        conn = self._conn()
+        local_socket = "/tmp/fastagent-local-host-root-0.0.0.sock"
+        failed = subprocess.CompletedProcess(
+            args=["ssh"], returncode=255, stdout=b"",
+            stderr=b"Permission denied (publickey).\n",
+        )
+
+        with mock.patch.object(conn, "_kill_stale_forwarder"), \
+             mock.patch.object(fastagent_plugin.os.path, "exists", return_value=True), \
+             mock.patch.object(fastagent_plugin.os, "remove"), \
+             mock.patch.object(fastagent_plugin.subprocess, "run", return_value=failed), \
+             mock.patch.object(conn, "_try_local_socket") as probe:
+            with self.assertRaises(fastagent_plugin.AnsibleConnectionFailure):
+                conn._ensure_ssh_forwarding(
+                    "serval", "kevin", None, local_socket,
+                    "/tmp/fastagent-root-0.0.0.sock",
+                )
+        probe.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -23,6 +23,11 @@ All notable changes to fastagent are documented in this file.
   serialization failures do not poison otherwise usable connections.
 - Disable the installed-package cache on dpkg-status scan failures instead
   of caching a partial package list.
+- Serialize controller-side local forwarding setup per socket with its own
+  advisory lock, so two forks delegating to the same host no longer race
+  `ssh -L` and fail one of them with "Address already in use". Re-check the
+  local socket after acquiring the lock so the loser reuses the winner's
+  connection, and retry once more if a forward still loses a bind race.
 
 ## 0.8.3 — July 30, 2026
 

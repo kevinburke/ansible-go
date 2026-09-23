@@ -378,6 +378,15 @@ does not force an existing session to reauthenticate.
 Daemon startup is serialized by a lock file beside the socket. Keep that file
 in place: removing a live lock file would allow a second starter to bypass it.
 The daemon owns stale-socket cleanup, and bootstrap never kills other daemons.
+
+The controller side has an analogous lock: setting up the local forwarding
+socket (bootstrapping the daemon and starting `ssh -L`) is serialized per
+socket by a `<local socket>.lock` file, so two Ansible forks that
+`delegate_to` the same host at the same time don't race each other's `ssh -L`
+bind. The loser waits on the lock (bounded, so a wedged holder can't hang
+every fork forever) and then reuses the winner's connection. Keep this file
+in place too, for the same reason.
+
 If an RPC response is lost or malformed, fastagent reports an unknown execution
 outcome and stops using that stream. It does not retry the submitted operation;
 check the remote state before retrying a mutation yourself.
