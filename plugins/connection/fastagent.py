@@ -170,7 +170,7 @@ from ansible_collections.kevinburke.fastagent.plugins.module_utils.fastagent_cli
 display = Display()
 
 # Agent version must match the Go constant.
-AGENT_VERSION = "0.8.3"
+AGENT_VERSION = "0.8.4"
 
 # Bound on how long a controller process waits for another process's
 # local-socket setup lock (see _local_socket_setup_lock) before giving up.

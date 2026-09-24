@@ -4,6 +4,8 @@ All notable changes to fastagent are documented in this file.
 
 ## Unreleased
 
+## 0.8.4 — September 24, 2026
+
 ### Bug fixes
 
 - Isolate local forwarding sockets and remote daemons by SSH arguments,
