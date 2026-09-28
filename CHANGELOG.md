@@ -27,8 +27,33 @@ All notable changes to fastagent are documented in this file.
   two on the controller against a local agent and, when
   `FASTAGENT_TEST_SSH_HOST` is set, on a test host through both connections.
 
+- `copy` and `template` run `validate` on the fast path instead of falling
+  back to `ansible.builtin.copy`, which uploaded the file and ran the copy
+  module. The agent validates a private copy of the new content that
+  already has the requested mode, owner and group, and replaces the
+  destination only if the command succeeds. As observed of stock, it
+  validates only when the content changes. The command is split like
+  shlex (no shell), `$VAR` and `~` are expanded, and the program is looked
+  up on the task environment's `PATH`. Failures return stock's result
+  shape. Any backup is made before validating. `validate` values stock
+  rejects with an error of its own still fall back. 20 `template` tasks
+  with `validate` took 0.83s instead of 5.4s against a local VM.
+  `tests/test_copy_validate_differential.py` compares the cases with stock
+  on the controller and, when `FASTAGENT_TEST_SSH_HOST` is set, on a test
+  host.
+- The agent's WriteFile RPC now rejects parameters it does not know,
+  instead of ignoring them. The Hello version check already keeps an older
+  agent from serving a newer controller; this makes a mismatched
+  development build fail rather than, say, write a file without the
+  validation it was asked for.
+
 ### Bug fixes
 
+- A command the agent ran that was killed by signal N reported return code
+  -1; stock reports -N. This affected `stat`'s `file` and `lsattr` runs,
+  and `validate` uses the same code. The wait status was checked against
+  `x/sys/unix`'s `WaitStatus` type, which never matches what `os/exec`
+  returns.
 - `copy` and `template` on the fast path left every file they wrote at mode
   0600 unless the task set `mode`, because the agent's temporary file was
   renamed into place with `os.CreateTemp`'s mode. That included replacing a

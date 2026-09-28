@@ -12,6 +12,7 @@ decrypted into a temp file before being read.
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 import sys
 import tempfile
@@ -303,46 +304,120 @@ class TestCopyActionVaultDecrypt(unittest.TestCase):
         self.assertEqual(len(delegated_calls), 1)
         self.assertEqual(result.get("dest"), "/remote")
 
-    def test_validate_delegates_to_builtin_action_plugin(self) -> None:
-        # WriteFileParams has a validate field, but the Go agent does not
-        # implement Ansible's validate command semantics. A copy task with
-        # validate must use the builtin action plugin rather than silently
-        # taking the fastagent write path.
-        action = _make_action(
-            task_args={
-                "content": "candidate config\n",
-                "dest": "/etc/service.conf",
-                "validate": "/usr/sbin/service-check %s",
-            },
-            loader=_RecordingLoader(resolved_path="/unused"),
-        )
+    def _run_with_fake_builtin(self, action, task_vars=None):
+        """Run the action with the builtin copy stubbed; returns (result,
+        number of delegations to the builtin)."""
         action._shared_loader_obj = object()
         action._templar = object()
-
         delegated_calls: list[dict] = []
 
         class _FakeBuiltin:
             def __init__(self, **kwargs):
-                self.init_kwargs = kwargs
+                pass
 
             def _execute_module(self, **_kwargs):
                 return {"changed": False}
 
             def run(self, task_vars):
-                delegated_calls.append(
-                    {"task_vars": task_vars, "init_kwargs": self.init_kwargs}
-                )
-                return {"changed": True, "dest": "/etc/service.conf"}
+                delegated_calls.append(task_vars)
+                return {"changed": True, "from": "builtin"}
 
         with patch(
             "plugins.action.copy._BUILTIN_COPY_ACTION_CLASS", _FakeBuiltin
         ), patch.object(ActionBase, "run", return_value={}):
-            result = action.run(task_vars={"inventory_hostname": "h"})
+            result = action.run(task_vars=task_vars or {"inventory_hostname": "h"})
+        return result, len(delegated_calls)
 
-        self.assertEqual(len(delegated_calls), 1)
-        self.assertEqual(delegated_calls[0]["task_vars"], {"inventory_hostname": "h"})
-        self.assertEqual(result.get("dest"), "/etc/service.conf")
-        self.assertIsNone(action._connection._agent_client.write_kwargs)
+    def _validate_action(self, validate, write_result=None):
+        action = _make_action(
+            task_args={
+                "content": "candidate config\n",
+                "dest": "/etc/service.conf",
+                "validate": validate,
+            },
+            loader=_RecordingLoader(resolved_path="/unused"),
+        )
+        action._task_environment = lambda: {"FOO": "bar"}
+        if write_result is not None:
+            client = action._connection._agent_client
+            client.write_file = lambda **kw: (setattr(client, "write_kwargs", kw), write_result)[1]
+        return action
+
+    def test_validate_is_sent_to_agent(self) -> None:
+        action = self._validate_action("/usr/sbin/check --file=%s 'a b' $HOME")
+        result, delegated = self._run_with_fake_builtin(action)
+        self.assertEqual(delegated, 0)
+        self.assertTrue(result["changed"])
+        kwargs = action._connection._agent_client.write_kwargs
+        spec = kwargs["validate"]
+        ph = spec["placeholder"]
+        self.assertRegex(ph, r"^@@FASTAGENT_VALIDATE_[0-9a-f]{32}@@$")
+        # $HOME stays for the agent to expand, as run_command does remotely.
+        self.assertEqual(spec["argv"], ["/usr/sbin/check", f"--file={ph}", "a b", "$HOME"])
+        self.assertEqual(kwargs["env"], {"FOO": "bar"})
+
+    def test_validate_forms_stock_rejects_fall_back(self) -> None:
+        # Stock fails each of these with its own message; let it.
+        for validate in (
+            "/usr/sbin/check",            # no %s
+            "/usr/sbin/check %s %s",      # not enough arguments for format string
+            "/usr/sbin/check %d %s",      # a directive %s can't satisfy
+            "/usr/sbin/check %%s",        # %s that formatting consumes
+            "/usr/sbin/check 'abc %s",    # unbalanced quote
+            "/usr/sbin/check %(x)s %s",   # mapping key
+            ["/usr/sbin/check", "%s"],    # not a string
+        ):
+            with self.subTest(validate=validate):
+                action = self._validate_action(validate)
+                result, delegated = self._run_with_fake_builtin(action)
+                self.assertEqual(delegated, 1)
+                self.assertEqual(result, {"changed": True, "from": "builtin"})
+                self.assertIsNone(action._connection._agent_client.write_kwargs)
+
+    def test_empty_validate_means_no_validation(self) -> None:
+        action = self._validate_action("")
+        _, delegated = self._run_with_fake_builtin(action)
+        self.assertEqual(delegated, 0)
+        self.assertIsNone(action._connection._agent_client.write_kwargs["validate"])
+
+    def test_validate_failure_matches_stock_result(self) -> None:
+        action = self._validate_action("/usr/sbin/check %s", write_result={
+            "changed": False, "dest": "/etc/service.conf", "checksum": "x",
+            "validate_failed": {"path": "/tmp/v/.source", "rc": 3,
+                                "stdout": "out 1\nout 2\n", "stderr": "bad\n"},
+        })
+        result, _ = self._run_with_fake_builtin(action)
+        self.assertEqual(result, {
+            "changed": False,
+            "failed": True,
+            "msg": "failed to validate",
+            "checksum": hashlib.sha1(b"candidate config\n").hexdigest(),
+            "exit_status": 3,
+            "stdout": "out 1\nout 2\n",
+            "stdout_lines": ["out 1", "out 2"],
+            "stderr": "bad\n",
+            "stderr_lines": ["bad"],
+        })
+
+    def test_validate_start_failure_matches_stock_result(self) -> None:
+        action = self._validate_action("/nonexistent/check -q %s", write_result={
+            "changed": False, "dest": "/etc/service.conf", "checksum": "x",
+            "validate_failed": {"path": "/tmp/v/.source", "rc": 0, "stdout": "", "stderr": "",
+                                "start_errno": 2, "start_error": "fork/exec: no such file"},
+        })
+        result, _ = self._run_with_fake_builtin(action)
+        self.assertEqual(result, {
+            "changed": False,
+            "failed": True,
+            "msg": "Error executing command.",
+            "checksum": hashlib.sha1(b"candidate config\n").hexdigest(),
+            "rc": 2,
+            "cmd": "/nonexistent/check -q /tmp/v/.source",
+            "stdout": "",
+            "stdout_lines": [],
+            "stderr": "",
+            "stderr_lines": [],
+        })
 
     def test_builtin_copy_action_class_loads_on_this_ansible(self) -> None:
         # Integration guard: the fallback's whole premise is that we can

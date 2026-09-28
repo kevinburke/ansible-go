@@ -297,6 +297,8 @@ class FastAgentClient:
         backup: bool = False,
         unsafe_writes: bool = False,
         checksum: str | None = None,
+        validate: dict | None = None,
+        env: dict | None = None,
     ) -> dict:
         """Write a file to the remote host.
 
@@ -309,6 +311,11 @@ class FastAgentClient:
             backup: create a backup of the existing file
             unsafe_writes: write directly instead of atomic rename
             checksum: expected checksum of existing file (skip if matches)
+            validate: {"argv": [...], "placeholder": str}; run against a
+                copy of the new content before it replaces dest. On
+                failure dest is left alone and the result has
+                "validate_failed" (see WriteValidate in fastagent.go).
+            env: the task's environment, for the validate command
         """
         params: dict = {"dest": dest, "content": content}
         if owner is not None:
@@ -323,6 +330,10 @@ class FastAgentClient:
             params["unsafe_writes"] = True
         if checksum is not None:
             params["checksum"] = checksum
+        if validate is not None:
+            params["validate"] = validate
+        if env:
+            params["env"] = env
         return self.call("WriteFile", params)
 
     def file(

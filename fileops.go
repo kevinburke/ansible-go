@@ -1,6 +1,7 @@
 package fastagent
 
 import (
+	"bytes"
 	"crypto/md5"
 	"crypto/sha1"
 	"crypto/sha256"
@@ -217,8 +218,15 @@ func (s *Server) handleReadFile(params json.RawMessage) (any, error) {
 
 func (s *Server) handleWriteFile(params json.RawMessage) (any, error) {
 	var p WriteFileParams
-	if err := json.Unmarshal(params, &p); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(params))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&p); err != nil {
 		return nil, fmt.Errorf("unmarshal WriteFileParams: %w", err)
+	}
+	if p.Validate != nil {
+		if err := p.Validate.check(); err != nil {
+			return nil, err
+		}
 	}
 
 	data, err := base64.StdEncoding.DecodeString(p.Content)
@@ -250,7 +258,8 @@ func (s *Server) handleWriteFile(params json.RawMessage) (any, error) {
 		}, nil
 	}
 
-	// Backup existing file if requested.
+	// Backup existing file if requested. Stock copy makes the backup
+	// before validating, so a failed validation still leaves one.
 	var backupFile string
 	if p.Backup {
 		if _, statErr := os.Stat(p.Dest); statErr == nil {
@@ -258,6 +267,24 @@ func (s *Server) handleWriteFile(params json.RawMessage) (any, error) {
 			if err := copyFile(p.Dest, backupFile); err != nil {
 				return nil, fmt.Errorf("backup %s: %w", p.Dest, err)
 			}
+		}
+	}
+
+	// Validate before touching the destination directory, so a file that
+	// fails validation creates nothing there.
+	if p.Validate != nil {
+		failure, err := runWriteValidate(p, data)
+		if err != nil {
+			return nil, err
+		}
+		if failure != nil {
+			return WriteFileResult{
+				Changed:        false,
+				Dest:           p.Dest,
+				Checksum:       newChecksum,
+				BackupFile:     backupFile,
+				ValidateFailed: failure,
+			}, nil
 		}
 	}
 

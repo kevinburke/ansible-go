@@ -321,14 +321,7 @@ func runModuleCommand(argv []string, env statEnv) (*StatCommandOutput, error) {
 	case err == nil:
 		return &StatCommandOutput{RC: 0, Stdout: stdout.String()}, nil
 	case errors.As(err, &exitErr):
-		rc := exitErr.ExitCode()
-		if rc < 0 {
-			// Killed by a signal; subprocess reports -signum.
-			if ws, ok := exitErr.Sys().(unix.WaitStatus); ok && ws.Signaled() {
-				rc = -int(ws.Signal())
-			}
-		}
-		return &StatCommandOutput{RC: rc, Stdout: stdout.String()}, nil
+		return &StatCommandOutput{RC: subprocessReturnCode(exitErr), Stdout: stdout.String()}, nil
 	default:
 		return nil, err
 	}

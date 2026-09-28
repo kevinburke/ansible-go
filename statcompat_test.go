@@ -140,3 +140,13 @@ func TestRunModuleCommandExpandsArgsAndReportsRC(t *testing.T) {
 		t.Error("expected an error for a command that cannot start")
 	}
 }
+
+func TestRunModuleCommandReportsSignalAsNegative(t *testing.T) {
+	out, err := runModuleCommand([]string{"/bin/sh", "-c", "kill -9 $$"}, newStatEnv(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.RC != -9 {
+		t.Errorf("rc = %d, want -9 as Python's subprocess reports", out.RC)
+	}
+}

@@ -16,6 +16,8 @@ import hashlib
 import importlib.util
 import json
 import os
+import secrets
+import shlex
 import stat
 
 import ansible.plugins.action as _ansible_action_pkg
@@ -24,6 +26,64 @@ from ansible.module_utils.common.text.converters import to_bytes, to_text
 from ansible.module_utils.parsing.convert_bool import boolean
 from ansible.plugins.action import ActionBase
 from ansible.utils.hashing import checksum
+
+
+def _validate_spec(validate):
+    """Split copy/template's `validate` into argv for the agent.
+
+    Stock formats the command with Python's `%` operator, substituting the
+    temporary path for %s, and passes the result to run_command, which
+    splits it with shlex (no shell). Here a random placeholder stands in for
+    the path; the agent substitutes the real one into the split arguments.
+    Returns None, so the caller falls back to ansible.builtin.copy, for
+    anything stock handles with its own error: no %s, a %s that formatting
+    doesn't consume (%%s), extra or invalid % directives, or quoting shlex
+    rejects.
+    """
+    if not isinstance(validate, str) or "%s" not in validate:
+        return None
+    placeholder = f"@@FASTAGENT_VALIDATE_{secrets.token_hex(16)}@@"
+    try:
+        formatted = validate % (placeholder,)
+        argv = shlex.split(formatted)
+    except (TypeError, ValueError):
+        return None
+    if not any(placeholder in arg for arg in argv):
+        return None
+    return {"argv": argv, "placeholder": placeholder}
+
+
+def _validate_failed_result(result, failure, validate, data):
+    """The result stock copy returns when validation fails.
+
+    Observed shapes: a validator that ran and exited non-zero gives
+    "failed to validate" with its exit_status and output; one that could
+    not be started gives run_command's "Error executing command." with rc
+    set to the errno and the formatted command. Neither has dest, and
+    checksum is the SHA-1 of the new content.
+    """
+    result.pop("dest", None)
+    result["changed"] = False
+    result["failed"] = True
+    result["checksum"] = hashlib.sha1(data).hexdigest()
+    if failure.get("start_errno"):
+        result.update(
+            msg="Error executing command.",
+            rc=failure["start_errno"],
+            cmd=validate % failure["path"],
+            stdout="",
+            stderr="",
+        )
+    else:
+        result.update(
+            msg="failed to validate",
+            exit_status=failure["rc"],
+            stdout=failure["stdout"],
+            stderr=failure["stderr"],
+        )
+    result["stdout_lines"] = result["stdout"].splitlines()
+    result["stderr_lines"] = result["stderr"].splitlines()
+    return result
 
 
 def _load_builtin_copy_action_class():
@@ -162,8 +222,13 @@ class ActionModule(ActionBase):
         # Fall back for cases we don't handle in the fast path.
         if remote_src:
             return self._run_builtin_copy(None, task_vars)
-        if args.get("validate"):
-            return self._run_builtin_copy(None, task_vars)
+        # An empty validate means no validation, as in stock.
+        validate = args.get("validate")
+        validate_spec = None
+        if validate:
+            validate_spec = _validate_spec(validate)
+            if validate_spec is None:
+                return self._run_builtin_copy(None, task_vars)
         if self._has_selinux_args(args):
             return self._run_builtin_copy(None, task_vars)
         if args.get("mode") == "preserve":
@@ -196,7 +261,7 @@ class ActionModule(ActionBase):
                 data = json.dumps(content).encode("utf-8")
             else:
                 data = to_bytes(content)
-            return self._fastagent_copy_data(data, dest, args, task_vars)
+            return self._fastagent_copy_data(data, dest, args, task_vars, validate_spec)
 
         # Resolve source file.
         try:
@@ -225,9 +290,15 @@ class ActionModule(ActionBase):
         with open(real_source, "rb") as f:
             data = f.read()
 
-        return self._fastagent_copy_data(data, dest, args, task_vars)
+        return self._fastagent_copy_data(data, dest, args, task_vars, validate_spec)
 
-    def _fastagent_copy_data(self, data, dest, args, task_vars):
+    def _task_environment(self) -> dict:
+        """The task's `environment:`, templated and merged as ActionBase does."""
+        env: dict = {}
+        self._compute_environment_string(raw_environment_out=env)
+        return {to_text(k): to_text(v) for k, v in env.items()}
+
+    def _fastagent_copy_data(self, data, dest, args, task_vars, validate_spec=None):
         """Copy data bytes to dest via fastagent RPC."""
         result = super().run(None, task_vars)
 
@@ -344,11 +415,17 @@ class ActionModule(ActionBase):
                 mode=self._format_mode(mode),
                 backup=backup,
                 unsafe_writes=unsafe_writes,
+                validate=validate_spec,
+                env=self._task_environment() if validate_spec else None,
             )
         except Exception as e:
             result["failed"] = True
             result["msg"] = f"fastagent write failed: {e}"
             return result
+
+        failure = write_result.get("validate_failed")
+        if failure:
+            return _validate_failed_result(result, failure, args["validate"], data)
 
         result["changed"] = write_result.get("changed", True)
         result["dest"] = dest

@@ -293,6 +293,9 @@ type ReadFileResult struct {
 }
 
 // WriteFileParams writes a file atomically.
+//
+// The agent decodes these strictly: an unknown field fails the call, so
+// the agent can never silently skip something the caller asked for.
 type WriteFileParams struct {
 	Dest         string `json:"dest"`
 	Content      string `json:"content"` // base64-encoded
@@ -301,8 +304,23 @@ type WriteFileParams struct {
 	Mode         string `json:"mode,omitempty"`
 	Backup       bool   `json:"backup,omitempty"`
 	UnsafeWrites bool   `json:"unsafe_writes,omitempty"`
-	Validate     string `json:"validate,omitempty"`
-	Checksum     string `json:"checksum,omitempty"` // expected checksum of existing file; skip write if matches
+	// Validate, if set, is run against a copy of the new content before
+	// it replaces Dest; see WriteValidate.
+	Validate *WriteValidate `json:"validate,omitempty"`
+	// Env is the task's `environment:`, laid over the agent's own
+	// environment for the Validate command.
+	Env      map[string]string `json:"env,omitempty"`
+	Checksum string            `json:"checksum,omitempty"` // expected checksum of existing file; skip write if matches
+}
+
+// WriteValidate is copy/template's `validate` option, already split into
+// argv by the action plugin. Every occurrence of Placeholder in an
+// argument is replaced by the path of the file to validate; each argument
+// then gets $VAR and ~ expansion, and argv[0] is looked up on the
+// environment's PATH, as AnsibleModule.run_command does.
+type WriteValidate struct {
+	Argv        []string `json:"argv"`
+	Placeholder string   `json:"placeholder"`
 }
 
 // WriteFileResult is the result of a file write.
@@ -311,6 +329,23 @@ type WriteFileResult struct {
 	Dest       string `json:"dest"`
 	Checksum   string `json:"checksum"`
 	BackupFile string `json:"backup_file,omitempty"`
+	// ValidateFailed is set, and Dest left untouched, when the Validate
+	// command could not be started or exited non-zero.
+	ValidateFailed *ValidateFailure `json:"validate_failed,omitempty"`
+}
+
+// ValidateFailure describes a failed WriteFile validation.
+type ValidateFailure struct {
+	// Path is the temporary file that was substituted for the
+	// placeholder.
+	Path   string `json:"path"`
+	RC     int    `json:"rc"` // exit status; -N for a signal
+	Stdout string `json:"stdout"`
+	Stderr string `json:"stderr"`
+	// StartErrno is non-zero when the command could not be started (for
+	// example ENOENT for a missing validator); RC is then meaningless.
+	StartErrno int    `json:"start_errno,omitempty"`
+	StartError string `json:"start_error,omitempty"`
 }
 
 // FileParams manages file/directory/link state.
