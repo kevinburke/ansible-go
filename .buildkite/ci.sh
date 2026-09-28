@@ -10,13 +10,20 @@ readonly REPO_ROOT="$(
 
 cd "${REPO_ROOT}"
 
-: "${GO_VERSION:?GO_VERSION is required (set in pipeline.yml or environment)}"
 : "${STATICCHECK_VERSION:?STATICCHECK_VERSION is required}"
 : "${GOIMPORTS_VERSION:?GOIMPORTS_VERSION is required}"
 : "${DIFFER_VERSION:?DIFFER_VERSION is required}"
 : "${ANSIBLE_VERSION:?ANSIBLE_VERSION is required}"
-export GO_VERSION STATICCHECK_VERSION GOIMPORTS_VERSION DIFFER_VERSION ANSIBLE_VERSION
+export STATICCHECK_VERSION GOIMPORTS_VERSION DIFFER_VERSION ANSIBLE_VERSION
+# Use the Go toolchain the Buildkite agent provides on PATH (host-managed,
+# /usr/local/go on the agents) rather than downloading one per job.
+# GOTOOLCHAIN=local turns an agent whose Go is older than the `go` line in
+# go.mod into a hard error instead of a silent toolchain download.
 export GOTOOLCHAIN=local
+if ! command -v go >/dev/null 2>&1; then
+  echo "go not found on PATH; the Buildkite agent must provide a Go toolchain" >&2
+  exit 1
+fi
 
 goflags="${GOFLAGS:-}"
 if [[ -n "${goflags}" ]]; then
@@ -25,7 +32,7 @@ fi
 goflags+="-trimpath"
 export GOFLAGS="${goflags}"
 
-source "${SCRIPT_DIR}/setup-go.sh"
+go version
 source "${SCRIPT_DIR}/setup-tools.sh"
 
 usage() {
@@ -35,11 +42,9 @@ EOF
 }
 
 run_format() {
-  # `./...` is module-aware and excludes the downloaded Go SDK in .go/.
   differ go fmt ./...
-  # `goimports -w .` would naively walk every directory under the repo
-  # root, including the downloaded Go SDK in .go/, and choke on the SDK's
-  # intentional-syntax-error files under test/syntax/. Restrict to tracked
+  # `goimports -w .` would walk every directory under the repo root,
+  # including untracked ones like tmp/ and worktrees/. Restrict to tracked
   # files only.
   differ sh -c "git ls-files -z -- '*.go' | xargs -0 goimports -w"
 }

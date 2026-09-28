@@ -1,6 +1,5 @@
 tmp/
 *.pyc
 __pycache__/
-.go/
 .tools/
 .python-venv/
