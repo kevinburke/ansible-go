@@ -56,74 +56,62 @@ python3 -m unittest -v tests.test_stat_differential
 The host needs Python 3 and passwordless sudo, and the agent binary must be
 available the way the connection plugin finds it (see Step 1 below).
 
-### Setup
+### Setup: install a development build
 
-The fastagent plugins are discovered via `ansible.cfg` in the repo root. If
-you're running Ansible from a different directory (e.g. an existing playbook
-repo), point Ansible at the plugin directories using environment variables or
-your own `ansible.cfg`.
-
-Environment variable approach (useful when running from another repo):
+To run this checkout, uncommitted changes included, against a real
+playbook repo:
 
 ```bash
-export ANSIBLE_GO_DIR="$HOME/src/github.com/kevinburke/ansible-go"
-export ANSIBLE_CONNECTION_PLUGINS="$ANSIBLE_GO_DIR/connection_plugins"
-export ANSIBLE_ACTION_PLUGINS="$ANSIBLE_GO_DIR/action_plugins"
-export ANSIBLE_LIBRARY="$ANSIBLE_GO_DIR/library"
-export ANSIBLE_MODULE_UTILS="$ANSIBLE_GO_DIR/module_utils"
+make dev-install
+~/.ansible/fastagent-dev/run ansible-playbook -i inventory site.yml
 ```
 
-Or add to the `ansible.cfg` in your playbook repo:
+`make dev-install` (`scripts/dev-install.sh`) gives the build a version of
+its own: the release version plus `-dev.g<commit>`, and `.w<tree hash>`
+when the working tree has changes, for example
+`0.9.0-dev.g39d5d0285149.w9e55789741`. It stamps that version into the Go
+agent, the connection plugin and `galaxy.yml`, then:
 
-```ini
-[defaults]
-connection_plugins = /path/to/ansible-go/connection_plugins
-action_plugins = /path/to/ansible-go/action_plugins
-library = /path/to/ansible-go/library
-module_utils = /path/to/ansible-go/module_utils
-```
+- builds `fastagent-<dev version>-linux-{amd64,arm64}` into
+  `~/.ansible/fastagent/`, next to the release binaries. The names never
+  match a release, so release deploys never read them.
+- installs the collection into `~/.ansible/fastagent-dev/collections`, which
+  nothing uses unless told to.
+- writes `~/.ansible/fastagent-dev/env.sh`, which puts that collection first
+  on `ANSIBLE_COLLECTIONS_PATH` (other collections still resolve from the
+  usual paths) and sets `ANSIBLE_ACTION_PLUGINS` to its action plugins,
+  overriding an `ansible.cfg` `action_plugins` line that names the release
+  collection. `~/.ansible/fastagent-dev/run` runs one command with it.
 
-### Step 1: Build the agent binary
+Commands run without `run` keep using the release collection and agent,
+so production deploys from the same machine are unaffected. Under `run`,
+the run warns once: `fastagent: using development build <version>`. On each
+host the dev agent is uploaded next to the release one and runs its own
+daemon, because the version is part of the remote binary's name and the
+daemon's socket. A host can never keep running an older build under the
+same name.
 
-```bash
-cd "$ANSIBLE_GO_DIR"
-make deploy
-```
-
-This cross-compiles the agent for linux/amd64 and linux/arm64, then copies the
-versioned binaries to `~/.ansible/fastagent/`:
-
-```
-~/.ansible/fastagent/fastagent-0.1.0-linux-amd64
-~/.ansible/fastagent/fastagent-0.1.0-linux-arm64
-```
-
-The connection plugin auto-uploads the correct binary to each remote host on
-first connect, streamed over the same `ssh` command (and `ssh_args`) as the
-rest of the bootstrap. On the remote host, it's placed at
-`~/.ansible/fastagent/fastagent-<version>-linux-<arch>`. If the correct version
-is already present on the remote host, the upload is skipped.
+Why not install under the release version? The version is how the plugin
+tells agents apart. A host that already had that release's agent would
+keep running it and silently ignore the new build, and real deploys would
+upload the development binary to hosts that did not. For the same reason,
+`make deploy`, which copies binaries to `~/.ansible/fastagent/` under the
+release name for hosts that cannot download them, only runs from a clean
+checkout of the release tag.
 
 The plugin searches for the local binary in this order:
 
 1. `fastagent_local_agent_dir` inventory variable (if set)
-2. `~/.ansible/fastagent/` (where `make deploy` puts them)
+2. `~/.ansible/fastagent/` (where `make dev-install` and `make deploy` put
+   them, and where downloads land)
 3. `tmp/` relative to the plugin directory (raw `make build` output)
+4. `fastagent_download_url`, a GitHub release by default
 
 You can override the remote path with `fastagent_agent_path`:
 
 ```ini
 [all:vars]
 fastagent_agent_path=/usr/local/bin/fastagent
-```
-
-If the upload fails or you prefer to deploy the binary yourself, copy it
-manually:
-
-```bash
-scp ~/.ansible/fastagent/fastagent-0.1.0-linux-amd64 \
-  yourhost:~/.ansible/fastagent/fastagent-0.1.0-linux-amd64
-ssh yourhost chmod +x ~/.ansible/fastagent/fastagent-0.1.0-linux-amd64
 ```
 
 ### Step 2: Smoke test locally (no remote host needed)

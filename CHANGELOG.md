@@ -47,8 +47,27 @@ All notable changes to fastagent are documented in this file.
   development build fail rather than, say, write a file without the
   validation it was asked for.
 
+- `make dev-install` builds the checkout, uncommitted changes included,
+  under its own version (`<release>-dev.g<commit>[.w<tree hash>]`) and
+  installs it next to the release. Only commands run through
+  `~/.ansible/fastagent-dev/run` use it, and the connection plugin warns
+  when it runs a development build. The agent's version names its binary
+  on each host and its daemon's socket, so a dev build can't be skipped on
+  a host that has the release, or leak into release deploys from the same
+  machine. See docs/testing.md.
+- `make deploy` only runs from a clean checkout of the release tag. It
+  installs binaries under the release name in `~/.ansible/fastagent/`, and
+  every deploy from the machine uploads them from there, so running it on
+  a modified tree sent unreleased agents to hosts that did not have that
+  release yet.
+
 ### Bug fixes
 
+- The plugin kept the agent already on a host if its `--version` output
+  merely contained the controller's version, instead of matching it
+  exactly, for example a development build of the same release.
+- `make build` never rebuilt `tmp/fastagent-linux-*` once they existed,
+  because the targets had no prerequisites.
 - A command the agent ran that was killed by signal N reported return code
   -1; stock reports -N. This affected `stat`'s `file` and `lsattr` runs,
   and `validate` uses the same code. The wait status was checked against

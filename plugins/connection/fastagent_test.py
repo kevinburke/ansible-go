@@ -589,15 +589,16 @@ class TestEnsureAgentDeployed(unittest.TestCase):
         conn.get_option = lambda key, *a, **kw: options.get(key)
         return conn
 
-    def _deploy(self, conn, remote_path, run_upload):
-        """Run _ensure_agent_deployed with the version check reporting a
-        missing agent and the upload handled by run_upload(cmd, stdin)."""
+    def _deploy(self, conn, remote_path, run_upload, version_stdout=b""):
+        """Run _ensure_agent_deployed with the version check printing
+        version_stdout (by default, nothing: no agent) and the upload
+        handled by run_upload(cmd, stdin)."""
         calls = []
 
         def fake_run(cmd, **kwargs):
             calls.append(cmd)
             if "--version" in cmd[-1]:
-                return subprocess.CompletedProcess(cmd, 0, b"", b"")
+                return subprocess.CompletedProcess(cmd, 0, version_stdout, b"")
             return run_upload(cmd, kwargs["stdin"])
 
         with tempfile.NamedTemporaryFile(delete=False) as binary:
@@ -628,6 +629,24 @@ class TestEnsureAgentDeployed(unittest.TestCase):
         self.assertEqual(upload_cmd[1:5], ["-F", "/cfg/ssh_config", "-o", "ProxyJump=bastion"])
         self.assertIn("fabench", upload_cmd)
         self.assertFalse(any("scp" in part for part in upload_cmd[:-1]), upload_cmd)
+
+    def test_skips_upload_only_for_the_exact_version(self):
+        # A substring check let a remote agent whose version merely
+        # contains ours (a dev build of this release, say) stand in for it.
+        version = fastagent_plugin.AGENT_VERSION
+        for reply, uploads in [
+            (f"fastagent {version}\n", False),
+            (f"fastagent {version}-dev.g39d5d02abcde\n", True),
+            (f"fastagent 1{version}\n", True),
+            (f"{version}\n", True),
+            ("", True),
+        ]:
+            with self.subTest(reply=reply):
+                def upload(cmd, stdin):
+                    return subprocess.CompletedProcess(cmd, 0, b"", b"")
+
+                calls, _ = self._deploy(self._conn({}), "/x/agent", upload, reply.encode())
+                self.assertEqual(len(calls), 2 if uploads else 1, calls)
 
     def _run_locally(self, cmd, stdin):
         # The last argument is what ssh would hand to the remote shell.

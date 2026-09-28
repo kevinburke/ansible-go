@@ -542,6 +542,11 @@ class Connection(ConnectionBase):
         remote_socket = f"/tmp/fastagent-{mode}{AGENT_VERSION}-{digest}.sock"
         local_socket = f"/tmp/fastagent-local-{os.getuid()}-{digest}.sock"
 
+        if "-dev." in AGENT_VERSION:
+            # Stamped by scripts/dev-install.sh. Ansible prints a repeated
+            # warning once per run.
+            display.warning(f"fastagent: using development build {AGENT_VERSION}")
+
         # Fast path: try connecting to the local forwarding socket directly.
         # This is a local Unix socket connect (~1ms), no SSH involved.
         if self._try_local_socket(local_socket, host):
@@ -1159,7 +1164,10 @@ class Connection(ConnectionBase):
             host, user, port,
             f"{shlex.quote(remote_path)} --version 2>/dev/null || true",
         )
-        if rc == 0 and AGENT_VERSION in stdout:
+        # `fastagent --version` prints "fastagent <version>". Match it
+        # exactly: a substring test accepted any agent whose version
+        # contains ours, such as a development build of this release.
+        if rc == 0 and stdout.split() == ["fastagent", AGENT_VERSION]:
             display.vvv("FASTAGENT: agent already deployed", host=host)
             return
 

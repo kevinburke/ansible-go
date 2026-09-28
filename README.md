@@ -460,9 +460,10 @@ Releases on first use. If the controller can't reach `github.com`:
    `curl -I <url>`.
 2. If you're behind a proxy, set the standard `https_proxy` / `HTTPS_PROXY`
    env var on the controller.
-3. As a fallback, build the binary locally (`make deploy`) and it will be
-   placed at `~/.ansible/fastagent/`. The connection plugin checks that
-   directory **before** attempting any download.
+3. As a fallback, build the release binaries locally from a clean checkout
+   of the release tag (`git checkout v<version> && make deploy`). They are
+   placed in `~/.ansible/fastagent/`, which the connection plugin checks
+   **before** attempting any download.
 
 **"remote /tmp is full" / "has no free inodes" / "is not writable"**
 
@@ -519,18 +520,32 @@ ssh myhost "sudo chown -R youruser:youruser ~/.ansible/tmp"
 
 ## Building from source
 
-If you prefer to build the agent binary yourself — for air-gapped environments,
-to pin to an unreleased commit, or to hack on the agent — clone this repo and
-run:
+To run an unreleased commit or your own changes against a playbook repo:
 
 ```bash
+make dev-install
+~/.ansible/fastagent-dev/run ansible-playbook -i inventory site.yml
+```
+
+This builds the checkout, uncommitted changes included, under its own
+development version (such as `0.9.0-dev.g39d5d0285149`), installs it next
+to the release, and uses it only for commands run through
+`~/.ansible/fastagent-dev/run`. See [docs/testing.md](docs/testing.md) for
+details.
+
+For air-gapped hosts that can't download the release binaries, build them
+from a clean checkout of the release tag:
+
+```bash
+git checkout v<version>
 make deploy
 ```
 
 This cross-compiles for `linux/amd64` and `linux/arm64` and copies the
-binaries to `~/.ansible/fastagent/`. The connection plugin checks this
-directory **before** attempting any download, so a locally built binary
-always takes precedence. Requires Go 1.21+.
+binaries to `~/.ansible/fastagent/` under the release name. The connection
+plugin checks this directory **before** attempting any download. `make
+deploy` refuses to run from any other checkout, because every deploy from
+the machine would upload what it installs. Requires Go 1.21+.
 
 To cut a full release (binaries plus collection tarball):
 
