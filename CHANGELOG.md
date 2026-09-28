@@ -4,6 +4,8 @@ All notable changes to fastagent are documented in this file.
 
 ## Unreleased
 
+## 0.9.0 — September 28, 2026
+
 ### Features
 
 - `stat` stays on the fast path with stock's defaults. `get_mime` and
