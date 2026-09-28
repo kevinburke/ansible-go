@@ -4,6 +4,18 @@ All notable changes to fastagent are documented in this file.
 
 ## Unreleased
 
+### Bug fixes
+
+- Explain daemon startup failures caused by a full, inode-exhausted or
+  read-only remote `/tmp`. These used to surface only as "timeout waiting for
+  socket", because the daemon's error went to a log on the same full
+  filesystem. On failure the start script now prints `df` output and the log
+  tail, and the plugin names the cause. Controller-side lock and `ssh -L`
+  failures from a full local `/tmp` report its free space.
+- Write the daemon PID file before touching the socket, so a full filesystem
+  fails startup before a socket can briefly appear and be mistaken for
+  readiness. Daemon errors from ENOSPC, EDQUOT and EROFS name the filesystem.
+
 ## 0.8.4 — September 24, 2026
 
 ### Bug fixes

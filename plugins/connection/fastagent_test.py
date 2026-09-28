@@ -1131,3 +1131,191 @@ class TestEnsureSshForwardingBindRace(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+_DF_HEADER_K = "Filesystem     1024-blocks    Used Available Capacity Mounted on"
+_DF_HEADER_I = "Filesystem      Inodes  IUsed   IFree IUse% Mounted on"
+
+
+def _diag_stderr(df_k: str, df_i: str, log: str = "", writable: bool = True) -> str:
+    m = "==> fastagent-diag "
+    lines = ["timeout waiting for socket"]
+    if not writable:
+        lines.append(m + "not-writable")
+    lines += [m + "df-k", _DF_HEADER_K, df_k, m + "df-i", _DF_HEADER_I, df_i,
+              m + "log", log]
+    return "\n".join(lines) + "\n"
+
+
+@unittest.skipIf(_FASTAGENT_IMPORT_ERROR is not None, "ansible is not installed")
+class TestRemoteFilesystemDiagnostics(unittest.TestCase):
+    """A full remote /tmp used to fail as a bare "timeout waiting for
+    socket": the daemon's own error went to a log on the same full
+    filesystem (or to /dev/null under sudo). The start script now prints
+    df output and the log tail on failure, and the plugin names the cause.
+    """
+
+    def test_full_blocks(self) -> None:
+        stderr = _diag_stderr(
+            "tmpfs              1048576 1048576         0     100% /tmp",
+            "tmpfs               262144     312  261832    1% /tmp",
+        )
+        hint = fastagent_plugin._remote_fs_hint("/tmp", stderr)
+        self.assertIsNotNone(hint)
+        self.assertIn("remote /tmp is full (0 KiB available, 100% used)", hint)
+
+    def test_exhausted_inodes(self) -> None:
+        stderr = _diag_stderr(
+            "/dev/sda1         20511312 9000000  10444720      47% /tmp",
+            "/dev/sda1          1310720 1310720       0  100% /tmp",
+        )
+        hint = fastagent_plugin._remote_fs_hint("/tmp", stderr)
+        self.assertIsNotNone(hint)
+        self.assertIn("has no free inodes (100% used)", hint)
+
+    def test_not_writable(self) -> None:
+        stderr = _diag_stderr(
+            "/dev/sda1         20511312 9000000  10444720      47% /tmp",
+            "/dev/sda1          1310720  20000 1290720    2% /tmp",
+            writable=False,
+        )
+        self.assertIn("is not writable",
+                      fastagent_plugin._remote_fs_hint("/tmp", stderr))
+
+    def test_log_mentions_enospc(self) -> None:
+        # e.g. a quota: df shows plenty of room, but the daemon could not write.
+        stderr = _diag_stderr(
+            "/dev/sda1         20511312 9000000  10444720      47% /tmp",
+            "/dev/sda1          1310720  20000 1290720    2% /tmp",
+            log="write daemon pid file: open /tmp/x.pid: disk quota exceeded",
+        )
+        self.assertIn("cannot accept new files",
+                      fastagent_plugin._remote_fs_hint("/tmp", stderr))
+
+    def test_healthy_filesystem_gives_no_hint(self) -> None:
+        # btrfs reports 0 total inodes and "-" usage; not an exhaustion.
+        stderr = _diag_stderr(
+            "/dev/nvme0n1p2    20511312 9000000  10444720      47% /tmp",
+            "/dev/nvme0n1p2           0       0        0     - /tmp",
+            log="daemon started",
+        )
+        self.assertIsNone(fastagent_plugin._remote_fs_hint("/tmp", stderr))
+
+    def test_extra_columns_and_spaces_in_filesystem_name(self) -> None:
+        # coreutils df on macOS prints two Capacity columns; a network
+        # filesystem name may contain spaces.
+        m = "==> fastagent-diag "
+        stderr = "\n".join([
+            m + "df-k",
+            "Filesystem     1024-blocks  Used Available Capacity Capacity Mounted on",
+            "//nas/tmp share       2008  2008         0        -     100% /tmp",
+            m + "df-i",
+            "Filesystem         Inodes IUsed      IFree IUse% Mounted on",
+            "//nas/tmp share      1000   400        600   40% /tmp",
+        ])
+        hint = fastagent_plugin._remote_fs_hint("/tmp", stderr)
+        self.assertIn("is full (0 KiB available, 100% used)", hint)
+        self.assertNotIn("inodes", hint)
+
+    def test_busybox_inode_layout(self) -> None:
+        m = "==> fastagent-diag "
+        stderr = "\n".join([
+            m + "df-k",
+            "Filesystem           1024-blocks    Used Available Capacity Mounted on",
+            "tmpfs                    65536     120     65416   0% /tmp",
+            m + "df-i",
+            "Filesystem              Inodes      Used Available Use% Mounted on",
+            "tmpfs                     1024      1024         0 100% /tmp",
+        ])
+        self.assertIn("has no free inodes (100% used)",
+                      fastagent_plugin._remote_fs_hint("/tmp", stderr))
+
+    def test_output_without_diagnostics_gives_no_hint(self) -> None:
+        self.assertIsNone(fastagent_plugin._remote_fs_hint(
+            "/tmp", "sudo: a password is required\n"))
+
+    def test_diag_command_runs_and_parses_on_this_host(self) -> None:
+        # Guard the shell syntax and the df parsing against a real df.
+        with tempfile.TemporaryDirectory(prefix="fastagent-diag-") as d:
+            log = os.path.join(d, "agent.sock.log")
+            with open(log, "w") as f:
+                f.write("daemon started\n")
+            cmd = (f"echo 'timeout waiting for socket' >&2; "
+                   f"{fastagent_plugin._remote_fs_diag_cmd(d, log)} exit 1")
+            result = subprocess.run(["sh", "-c", cmd], capture_output=True,
+                                    text=True, timeout=10)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        sections = result.stderr.split("==> fastagent-diag ")
+        df_k = sections[1].splitlines()[1:]
+        parsed = fastagent_plugin._parse_df(df_k, ("1024-blocks",), ("Available",))
+        self.assertIsNotNone(parsed, result.stderr)
+        self.assertTrue(parsed[1] is not None and parsed[1].isdigit(), result.stderr)
+        self.assertIsNone(fastagent_plugin._remote_fs_hint(d, result.stderr))
+        self.assertIn("daemon started", result.stderr)
+
+    def test_start_failure_reports_full_tmp(self) -> None:
+        conn = TestEnsureRemoteDaemon._conn(self)
+        remote_socket = f"/tmp/fastagent-root-{fastagent_plugin.AGENT_VERSION}.sock"
+        stderr = _diag_stderr(
+            "tmpfs              1048576 1048576         0     100% /tmp",
+            "tmpfs               262144     312  261832    1% /tmp",
+        )
+        commands = []
+
+        def run_ssh(host, user, port, command):
+            commands.append(command)
+            if "--daemon" in command:
+                return 1, "", stderr
+            return 1, "", ""
+
+        with mock.patch.object(conn, "_run_ssh_command", side_effect=run_ssh), \
+             mock.patch.object(conn, "_detect_remote_arch", return_value="amd64"), \
+             mock.patch.object(conn, "_ensure_agent_deployed"):
+            with self.assertRaises(fastagent_plugin.AnsibleConnectionFailure) as ctx:
+                conn._ensure_remote_daemon("serval", "deploy", None, remote_socket, True)
+
+        msg = str(ctx.exception)
+        self.assertIn("failed to start daemon on serval: remote /tmp is full", msg)
+        # Raw output is kept for anything the summary does not cover.
+        self.assertIn("timeout waiting for socket", msg)
+        self.assertIn(f"tail -n 20 {remote_socket}.log", commands[-1])
+
+
+@unittest.skipIf(_FASTAGENT_IMPORT_ERROR is not None, "ansible is not installed")
+class TestLocalFilesystemDiagnostics(unittest.TestCase):
+    def test_lock_open_enospc_reports_free_space(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="fastagent-lock-") as d:
+            path = os.path.join(d, "local.sock.lock")
+            err = OSError(fastagent_plugin.errno.ENOSPC, "No space left on device")
+            with mock.patch.object(fastagent_plugin.os, "open", side_effect=err):
+                with self.assertRaises(fastagent_plugin.AnsibleConnectionFailure) as ctx:
+                    fastagent_plugin._open_local_socket_lock(path)
+        self.assertIn(f"Local {d} has", str(ctx.exception))
+        self.assertIn("inodes available", str(ctx.exception))
+
+    def test_lock_open_other_error_has_no_hint(self) -> None:
+        err = OSError(fastagent_plugin.errno.EACCES, "Permission denied")
+        with mock.patch.object(fastagent_plugin.os, "open", side_effect=err):
+            with self.assertRaises(fastagent_plugin.AnsibleConnectionFailure) as ctx:
+                fastagent_plugin._open_local_socket_lock("/nonexistent/x.lock")
+        self.assertNotIn("inodes available", str(ctx.exception))
+
+    def test_forwarding_enospc_reports_free_space(self) -> None:
+        conn = TestEnsureSshForwardingBindRace._conn(self)
+        local_socket = "/tmp/fastagent-local-host-root-0.0.0.sock"
+        failed = subprocess.CompletedProcess(
+            args=["ssh"], returncode=255, stdout=b"",
+            stderr=b"unix_listener: cannot bind to path "
+                   b"/tmp/fastagent-local-host-root-0.0.0.sock: "
+                   b"No space left on device\n",
+        )
+        with mock.patch.object(conn, "_kill_stale_forwarder"), \
+             mock.patch.object(fastagent_plugin.os.path, "exists", return_value=False), \
+             mock.patch.object(fastagent_plugin.subprocess, "run", return_value=failed):
+            with self.assertRaises(fastagent_plugin.AnsibleConnectionFailure) as ctx:
+                conn._ensure_ssh_forwarding(
+                    "serval", "kevin", None, local_socket,
+                    "/tmp/fastagent-root-0.0.0.sock",
+                )
+        self.assertIn("Local /tmp has", str(ctx.exception))

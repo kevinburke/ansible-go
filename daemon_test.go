@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -191,6 +192,66 @@ func TestDaemonPIDFileFailureIsFatal(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("PID-file failure did not fail startup")
+	}
+}
+
+// A PID-file failure (e.g. the filesystem is full) must stop startup before
+// the daemon touches the socket path. Otherwise the socket can appear
+// briefly and the controller's start script mistakes it for readiness.
+func TestDaemonPIDFileFailurePrecedesSocketReplacement(t *testing.T) {
+	path := daemonTestSocket(t)
+	stale, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale.SetUnlinkOnClose(false)
+	stale.Close()
+	before, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path+".pid", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	p := startTestDaemon(t, path, "")
+	select {
+	case err := <-p.done:
+		if err == nil || !strings.Contains(p.stderr.String(), "pid file") {
+			t.Fatalf("expected PID-file failure: %v: %s", err, &p.stderr)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("PID-file failure did not fail startup")
+	}
+	after, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("stale socket was removed before the PID file was written: %v", err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("stale socket was replaced before the PID file was written")
+	}
+}
+
+func TestAnnotateFSError(t *testing.T) {
+	for _, tc := range []struct {
+		errno unix.Errno
+		want  string
+	}{
+		{unix.ENOSPC, "no free space or inodes"},
+		{unix.EDQUOT, "disk quota exceeded"},
+		{unix.EROFS, "read-only filesystem"},
+	} {
+		base := fmt.Errorf("write daemon pid file: %w", &os.PathError{Op: "open", Path: "/tmp/a.sock.pid", Err: tc.errno})
+		err := annotateFSError(base, "/tmp/a.sock.pid")
+		if !errors.Is(err, tc.errno) {
+			t.Errorf("%v: annotated error no longer wraps errno: %v", tc.errno, err)
+		}
+		if msg := err.Error(); !strings.Contains(msg, tc.want) || !strings.Contains(msg, "filesystem holding /tmp") {
+			t.Errorf("%v: got %q", tc.errno, msg)
+		}
+	}
+	base := &os.PathError{Op: "open", Path: "/tmp/a", Err: unix.EACCES}
+	if err := annotateFSError(base, "/tmp/a"); err != error(base) {
+		t.Errorf("unrelated error was annotated: %v", err)
 	}
 }
 

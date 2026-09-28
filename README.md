@@ -464,6 +464,17 @@ Releases on first use. If the controller can't reach `github.com`:
    placed at `~/.ansible/fastagent/`. The connection plugin checks that
    directory **before** attempting any download.
 
+**"remote /tmp is full" / "has no free inodes" / "is not writable"**
+
+Both the controller and the remote host keep fastagent's sockets, lock files,
+PID file and daemon log in `/tmp`. When the remote daemon cannot create its
+socket, the start script prints `df -Pk /tmp`, `df -Pi /tmp` and the tail of
+the daemon log, and the plugin summarizes them. The daemon's own error often
+cannot be logged in this case, because the log is on the same full
+filesystem. Free space (or inodes) in `/tmp` and rerun. The same applies on
+the controller: lock and `ssh -L` failures with `No space left on device`
+report the free space left in the controller's `/tmp`.
+
 **"local socket not available, setting up" on every task**
 
 The SSH forwarding session died between tasks. Check if the SSH ControlMaster

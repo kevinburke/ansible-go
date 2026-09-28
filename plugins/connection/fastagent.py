@@ -147,6 +147,7 @@ import base64
 import contextlib
 import fcntl
 import hashlib
+import errno
 import json
 import os
 import shlex
@@ -195,8 +196,11 @@ def _open_local_socket_lock(path: str) -> t.BinaryIO:
     try:
         fd = os.open(path, flags, 0o600)
     except OSError as e:
+        hint = ""
+        if e.errno in _FS_FULL_ERRNOS:
+            hint = _local_fs_hint(os.path.dirname(path))
         raise AnsibleConnectionFailure(
-            f"fastagent: cannot open local socket setup lock {path}: {e}"
+            f"fastagent: cannot open local socket setup lock {path}: {e}{hint}"
         )
     try:
         st = os.fstat(fd)
@@ -211,6 +215,134 @@ def _open_local_socket_lock(path: str) -> t.BinaryIO:
         os.close(fd)
         raise
     return os.fdopen(fd, "r+b")
+
+
+# Errors meaning a filesystem cannot accept new files. Both ends keep their
+# sockets, locks and logs in /tmp, so when /tmp fills up these surface as
+# low-level failures that do not mention /tmp; the helpers below add the
+# missing context.
+_FS_FULL_ERRNOS = frozenset({errno.ENOSPC, errno.EDQUOT, errno.EROFS})
+_FS_FULL_MESSAGES = (
+    "no space left on device",
+    "disk quota exceeded",
+    "read-only file system",
+)
+
+# Below this many KiB available, treat a remote filesystem as full. The
+# daemon needs only a few small files, but ext4 reserves blocks for root, so
+# "available" may read slightly above zero for a user who cannot write.
+_REMOTE_FS_FULL_KIB = 1024
+
+# Prefix for section headers in the remote startup diagnostics (see
+# _remote_fs_diag_cmd). Chosen so it cannot be confused with df or log
+# output.
+_DIAG_MARKER = "==> fastagent-diag "
+
+
+def _local_fs_hint(directory: str) -> str:
+    """Describe free space in a local directory for an error message."""
+    try:
+        st = os.statvfs(directory)
+    except OSError as e:
+        return f" (could not check free space in {directory}: {e})"
+    free_kib = st.f_bavail * st.f_frsize // 1024
+    return (
+        f". Local {directory} has {free_kib} KiB and {st.f_favail} inodes "
+        f"available; fastagent keeps its forwarding sockets and lock files "
+        f"there, so free space in {directory} and retry"
+    )
+
+
+def _remote_fs_diag_cmd(directory: str, log_path: str) -> str:
+    """Shell fragment that prints startup diagnostics to stderr.
+
+    Runs only after the daemon failed to create its socket, so it adds no
+    round trip on the success path. The daemon's own error usually cannot
+    help when the filesystem is full: its log lives on the same filesystem
+    (and under sudo, stderr is discarded), so gather the evidence from the
+    outside instead. `df -P` keeps each filesystem on one
+    line; _parse_df reads the result.
+    """
+    d = shlex.quote(directory)
+    log = shlex.quote(log_path)
+    m = _DIAG_MARKER
+    return (
+        f"{{ test -w {d} || echo '{m}not-writable';"
+        f" echo '{m}df-k'; df -Pk {d};"
+        f" echo '{m}df-i'; df -Pi {d};"
+        f" echo '{m}log'; tail -n 20 {log}; }} >&2 2>&1;"
+    )
+
+
+def _parse_df(
+    lines: list[str], total_names: tuple[str, ...], free_names: tuple[str, ...],
+) -> tuple[str | None, str | None, str] | None:
+    """Return (total, free, percent used) from `df -P` or `df -Pi` output.
+
+    Columns are looked up by header name rather than position: GNU, busybox
+    and BSD df disagree on the inode layout, and some builds add columns
+    (coreutils on macOS prints two "Capacity" columns). Values are aligned
+    from the right because a filesystem name may contain spaces; the mount
+    point is assumed not to (it is our own socket directory).
+    """
+    rows = [line.split() for line in lines if line.strip()]
+    if len(rows) < 2:
+        return None
+    header, row = rows[0], rows[1]
+    if header[-2:] == ["Mounted", "on"]:
+        header = header[:-2] + ["Mounted on"]
+    if len(header) < 2 or len(row) < len(header):
+        return None
+    cols = dict(zip(header[1:], row[len(row) - len(header) + 1:]))
+    total = next((cols[n] for n in total_names if n in cols), None)
+    free = next((cols[n] for n in free_names if n in cols), None)
+    used = next((v for v in cols.values() if v.endswith("%")), "?")
+    return total, free, used
+
+
+def _remote_fs_hint(directory: str, stderr: str) -> str | None:
+    """Explain a daemon startup failure caused by a full or read-only dir.
+
+    Reads the sections printed by _remote_fs_diag_cmd. Returns None when
+    the evidence does not point at the filesystem, so callers fall back to
+    the raw output.
+    """
+    sections: dict[str, list[str]] = {}
+    current = None
+    for line in stderr.splitlines():
+        if line.startswith(_DIAG_MARKER):
+            current = line[len(_DIAG_MARKER):].strip()
+            sections[current] = []
+        elif current is not None:
+            sections[current].append(line)
+
+    problems = []
+    if "not-writable" in sections:
+        problems.append("is not writable (read-only filesystem or permissions)")
+    blocks = _parse_df(sections.get("df-k", []), ("1024-blocks",), ("Available",))
+    if blocks is not None:
+        _, avail, capacity = blocks
+        if avail is not None and avail.isdigit() and int(avail) < _REMOTE_FS_FULL_KIB:
+            problems.append(f"is full ({avail} KiB available, {capacity} used)")
+    # GNU prints IFree; busybox reuses "Available" for free inodes.
+    inodes = _parse_df(sections.get("df-i", []), ("Inodes",), ("IFree", "Available"))
+    if inodes is not None:
+        total, ifree, iuse = inodes
+        # btrfs and some others report 0 total inodes; skip them.
+        if (total is not None and total.isdigit() and int(total) > 0
+                and ifree == "0"):
+            problems.append(f"has no free inodes ({iuse} used)")
+    if not problems:
+        log = "\n".join(sections.get("log", [])).lower()
+        if any(msg in log for msg in _FS_FULL_MESSAGES):
+            problems.append("cannot accept new files (see the daemon log below)")
+    if not problems:
+        return None
+    return (
+        f"remote {directory} {' and '.join(problems)}. The daemon keeps its "
+        f"socket, lock, PID and log files in {directory}; free space there "
+        f"and retry"
+    )
 
 
 class Connection(ConnectionBase):
@@ -572,6 +704,7 @@ class Connection(ConnectionBase):
         allow_flag = f" --allow-user {shlex.quote(user)}" if user else ""
         daemon_exec_cmd = f"{agent_bin} --daemon --socket {shlex.quote(remote_socket)}{allow_flag}{debug_flag}"
         log_path = remote_socket + ".log"
+        socket_dir = os.path.dirname(remote_socket)
         if wrap_with_sudo:
             # Daemon runs as root so a single instance can sudo to any
             # become_user the play requests (including non-sudoers, where
@@ -603,13 +736,17 @@ class Connection(ConnectionBase):
             f"   test -S {shlex.quote(remote_socket)} && exit 0;"
             f"   sleep 0.1;"
             f" done;"
-            f" echo 'timeout waiting for socket' >&2; exit 1"
+            f" echo 'timeout waiting for socket' >&2;"
+            f" {_remote_fs_diag_cmd(socket_dir, log_path)}"
+            f" exit 1"
         )
         rc, stdout, stderr = self._run_ssh_command(host, user, port, start_cmd)
         if rc != 0:
+            hint = _remote_fs_hint(socket_dir, stderr)
+            summary = f"{hint}\n" if hint else ""
             raise AnsibleConnectionFailure(
-                f"fastagent: failed to start daemon: rc={rc}\n"
-                f"stdout: {stdout}\nstderr: {stderr}"
+                f"fastagent: failed to start daemon on {host}: {summary}"
+                f"rc={rc}\nstdout: {stdout}\nstderr: {stderr}"
             )
         display.vvv(f"FASTAGENT: daemon started at {remote_socket}", host=host)
 
@@ -715,8 +852,11 @@ class Connection(ConnectionBase):
                         return
                     if attempt < 2:
                         time_mod.sleep(0.2)
+            hint = ""
+            if any(msg in stderr.lower() for msg in _FS_FULL_MESSAGES):
+                hint = _local_fs_hint(os.path.dirname(local_socket))
             raise AnsibleConnectionFailure(
-                f"fastagent: SSH forwarding failed: {stderr}"
+                f"fastagent: SSH forwarding failed: {stderr}{hint}"
             )
 
         # Wait for the local socket to appear.

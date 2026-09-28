@@ -29,11 +29,11 @@ const DefaultIdleTimeout = 1 * time.Hour
 // creates a new listener, and serves until interrupted or idle timeout.
 func RunDaemon(socketPath string, allowUser string, idleTimeout time.Duration, logger *slog.Logger) error {
 	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
-		return fmt.Errorf("mkdir for socket: %w", err)
+		return annotateFSError(fmt.Errorf("mkdir for socket: %w", err), socketPath)
 	}
 	lock, err := openDaemonLock(socketPath + ".lock")
 	if err != nil {
-		return fmt.Errorf("daemon lock: %w", err)
+		return annotateFSError(fmt.Errorf("daemon lock: %w", err), socketPath)
 	}
 	defer lock.Close()
 	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
@@ -63,13 +63,25 @@ func RunDaemon(socketPath string, allowUser string, idleTimeout time.Duration, l
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("inspect daemon socket: %w", err)
 	}
+	// Write the PID file before touching the socket. This is the first
+	// write that needs data blocks, so when the filesystem holding the
+	// socket is full, startup fails here, before a socket ever appears
+	// (and before a stale one is replaced). Otherwise the controller's
+	// start script can see the socket briefly, report success, and fail
+	// later with a far less useful error.
+	pidPath := socketPath + ".pid"
+	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
+		return annotateFSError(fmt.Errorf("write daemon pid file: %w", err), pidPath)
+	}
+	defer os.Remove(pidPath)
+
 	if err := os.Remove(socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove stale socket: %w", err)
 	}
 
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
-		return fmt.Errorf("listen %s: %w", socketPath, err)
+		return annotateFSError(fmt.Errorf("listen %s: %w", socketPath, err), socketPath)
 	}
 	defer listener.Close()
 	defer os.Remove(socketPath)
@@ -98,13 +110,6 @@ func RunDaemon(socketPath string, allowUser string, idleTimeout time.Duration, l
 			logger.Debug("socket accessible to user", "user", allowUser, "gid", gid)
 		}
 	}
-
-	// Write PID file.
-	pidPath := socketPath + ".pid"
-	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
-		return fmt.Errorf("write daemon pid file: %w", err)
-	}
-	defer os.Remove(pidPath)
 
 	// Handle shutdown signals.
 	sigCh := make(chan os.Signal, 1)
@@ -218,6 +223,25 @@ func isDaemonRunning(socketPath string) bool {
 		return false
 	}
 	return resp.ID == 1 && resp.Error == nil && resp.Result != nil && resp.Result.Version != ""
+}
+
+// annotateFSError names the likely cause when err means the filesystem
+// holding path cannot accept new files. The daemon's log usually lives on
+// that same filesystem, so the message may never be written; the connection
+// plugin diagnoses the same condition independently from the controller.
+func annotateFSError(err error, path string) error {
+	var cause string
+	switch {
+	case errors.Is(err, unix.ENOSPC):
+		cause = "no free space or inodes"
+	case errors.Is(err, unix.EDQUOT):
+		cause = "disk quota exceeded"
+	case errors.Is(err, unix.EROFS):
+		cause = "read-only filesystem"
+	default:
+		return err
+	}
+	return fmt.Errorf("%w (%s on the filesystem holding %s; the daemon needs it for its socket, lock and PID files)", err, cause, filepath.Dir(path))
 }
 
 // openDaemonLock leaves the inode in place so racing starters always flock the
