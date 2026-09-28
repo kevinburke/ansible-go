@@ -99,7 +99,8 @@ versioned binaries to `~/.ansible/fastagent/`:
 ```
 
 The connection plugin auto-uploads the correct binary to each remote host on
-first connect (via scp). On the remote host, it's placed at
+first connect, streamed over the same `ssh` command (and `ssh_args`) as the
+rest of the bootstrap. On the remote host, it's placed at
 `~/.ansible/fastagent/fastagent-<version>-linux-<arch>`. If the correct version
 is already present on the remote host, the upload is skipped.
 

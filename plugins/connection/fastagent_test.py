@@ -568,6 +568,122 @@ class TestGetBecomeUser(unittest.TestCase):
         )
 
 
+# The upload tests patch subprocess.run and run the remote script for real.
+_REAL_SUBPROCESS_RUN = subprocess.run
+
+
+@unittest.skipIf(
+    _FASTAGENT_IMPORT_ERROR is not None,
+    "ansible is required to run connection plugin tests",
+)
+class TestEnsureAgentDeployed(unittest.TestCase):
+    """The agent binary is uploaded over the same ssh command as every
+    other bootstrap step, so ssh_args (-F, ProxyJump, host key options,
+    ControlPath) apply to it too. It used to go through a separate scp
+    invocation that only got -i and -P.
+    """
+
+    def _conn(self, options):
+        conn = _bare_connection()
+        conn.get_option = lambda key, *a, **kw: options.get(key)
+        return conn
+
+    def _deploy(self, conn, remote_path, run_upload):
+        """Run _ensure_agent_deployed with the version check reporting a
+        missing agent and the upload handled by run_upload(cmd, stdin)."""
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if "--version" in cmd[-1]:
+                return subprocess.CompletedProcess(cmd, 0, b"", b"")
+            return run_upload(cmd, kwargs["stdin"])
+
+        with tempfile.NamedTemporaryFile(delete=False) as binary:
+            binary.write(b"\x7fELF fake agent\n" * 1000)
+        self.addCleanup(os.unlink, binary.name)
+        with mock.patch.object(conn, "_find_local_binary", return_value=binary.name), \
+                mock.patch.object(fastagent_plugin.subprocess, "run", side_effect=fake_run):
+            conn._ensure_agent_deployed("fabench", None, None, remote_path, "arm64")
+        return calls, binary.name
+
+    def test_upload_uses_ssh_command_and_args(self):
+        conn = self._conn({
+            "ssh_executable": "/usr/bin/ssh",
+            "ssh_args": "-F /cfg/ssh_config -o ProxyJump=bastion",
+        })
+        seen = {}
+
+        def upload(cmd, stdin):
+            seen["stdin"] = stdin.read()
+            return subprocess.CompletedProcess(cmd, 0, b"", b"")
+
+        calls, binary = self._deploy(conn, "/home/k/.ansible/fastagent/agent", upload)
+        with open(binary, "rb") as f:
+            self.assertEqual(seen["stdin"], f.read())
+        self.assertEqual(len(calls), 2, calls)
+        upload_cmd = calls[1]
+        self.assertEqual(upload_cmd[0], "/usr/bin/ssh")
+        self.assertEqual(upload_cmd[1:5], ["-F", "/cfg/ssh_config", "-o", "ProxyJump=bastion"])
+        self.assertIn("fabench", upload_cmd)
+        self.assertFalse(any("scp" in part for part in upload_cmd[:-1]), upload_cmd)
+
+    def _run_locally(self, cmd, stdin):
+        # The last argument is what ssh would hand to the remote shell.
+        return _REAL_SUBPROCESS_RUN(["/bin/sh", "-c", cmd[-1]], stdin=stdin, capture_output=True)
+
+    def test_remote_script_installs_atomically(self):
+        with tempfile.TemporaryDirectory() as d:
+            dest = os.path.join(d, "new dir", "fastagent-0.9.0-linux-arm64")
+            _, binary = self._deploy(self._conn({}), dest, self._run_locally)
+            with open(binary, "rb") as a, open(dest, "rb") as b:
+                self.assertEqual(a.read(), b.read())
+            self.assertEqual(stat_module.S_IMODE(os.stat(dest).st_mode), 0o755)
+            self.assertEqual(os.listdir(os.path.dirname(dest)), [os.path.basename(dest)])
+
+    def test_truncated_upload_fails_and_cleans_up(self):
+        def truncated(cmd, stdin):
+            return _REAL_SUBPROCESS_RUN(["/bin/sh", "-c", cmd[-1]], input=stdin.read(10), capture_output=True)
+
+        with tempfile.TemporaryDirectory() as d:
+            dest = os.path.join(d, "agent")
+            with self.assertRaisesRegex(fastagent_plugin.AnsibleConnectionFailure, "received 10 bytes .*expected 16000"):
+                self._deploy(self._conn({}), dest, truncated)
+            self.assertEqual(os.listdir(d), [])
+
+    def test_upload_failure_reports_stderr(self):
+        def fail(cmd, stdin):
+            return subprocess.CompletedProcess(cmd, 255, b"", b"ssh: Could not resolve hostname fabench")
+
+        with self.assertRaisesRegex(fastagent_plugin.AnsibleConnectionFailure, "Could not resolve hostname fabench"):
+            self._deploy(self._conn({}), "/x/agent", fail)
+
+
+@unittest.skipIf(
+    _FASTAGENT_IMPORT_ERROR is not None,
+    "ansible is required to run connection plugin tests",
+)
+class TestPortOption(unittest.TestCase):
+    def test_port_has_no_default(self):
+        # A default would always be passed as -o Port=22 and override a
+        # Port from ~/.ssh/config or an ssh_args -F file, as ansible-core's
+        # ssh connection avoids.
+        import yaml
+
+        options = yaml.safe_load(fastagent_plugin.DOCUMENTATION)["options"]
+        self.assertNotIn("default", options["port"])
+
+    def test_no_port_option_when_unset(self):
+        conn = self._conn()
+        cmd = conn._build_ssh_command("fabench", None, None, "true")
+        self.assertFalse(any(part.startswith("Port=") for part in cmd), cmd)
+
+    def _conn(self):
+        conn = _bare_connection()
+        conn.get_option = lambda key, *a, **kw: None
+        return conn
+
+
 @unittest.skipIf(
     _FASTAGENT_IMPORT_ERROR is not None,
     "ansible is required to run connection plugin tests",

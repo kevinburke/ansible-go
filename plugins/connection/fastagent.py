@@ -30,9 +30,11 @@ options:
             - name: ansible_host
             - name: ansible_ssh_host
     port:
-        description: SSH port
+        description: >
+            SSH port. Unset by default, so ssh takes the port from its own
+            configuration (~/.ssh/config or an ssh_args -F file) and
+            otherwise uses 22.
         type: int
-        default: 22
         ini:
             - section: defaults
               key: remote_port
@@ -61,14 +63,6 @@ options:
             - name: ANSIBLE_SSH_EXECUTABLE
         vars:
             - name: ansible_ssh_executable
-    scp_executable:
-        description: SCP executable to use for uploading the agent binary
-        default: scp
-        ini:
-            - section: ssh_connection
-              key: scp_executable
-        vars:
-            - name: ansible_scp_executable
     ssh_args:
         description: Extra SSH arguments
         default: ""
@@ -169,6 +163,28 @@ from ansible_collections.kevinburke.fastagent.plugins.module_utils.fastagent_cli
 )
 
 display = Display()
+
+# Remote half of the agent upload, run as `sh -c SCRIPT sh DEST SIZE` with
+# the binary on stdin. It writes a temporary file next to DEST, checks the
+# byte count so a dropped connection can't install a truncated binary,
+# and renames it into place so a concurrent bootstrap never execs a
+# partial file. Any failure exits non-zero and removes the temporary file.
+_INSTALL_AGENT_SCRIPT = r'''set -eu
+dest=$1
+size=$2
+mkdir -p -- "$(dirname -- "$dest")"
+tmp="$dest.upload.$$"
+trap 'rm -f -- "$tmp"' EXIT
+cat > "$tmp"
+actual=$(wc -c < "$tmp" | tr -d ' ')
+if [ "$actual" != "$size" ]; then
+    echo "fastagent: received $actual bytes for $dest, expected $size" >&2
+    exit 1
+fi
+chmod 0755 -- "$tmp"
+mv -f -- "$tmp" "$dest"
+trap - EXIT
+'''
 
 # Agent version must match the Go constant.
 AGENT_VERSION = "0.9.0"
@@ -699,9 +715,16 @@ class Connection(ConnectionBase):
             version=AGENT_VERSION, os="linux", arch=remote_arch,
         )
         if remote_agent_path.startswith("~/"):
-            rc, home, _ = self._run_ssh_command(host, user, port, "echo $HOME")
-            if rc == 0 and home.strip():
-                remote_agent_path = home.strip() + remote_agent_path[1:]
+            # Resolve ~ here: the upload and launch commands quote the path,
+            # so a literal ~ would never be expanded remotely.
+            rc, home, stderr = self._run_ssh_command(host, user, port, "echo $HOME")
+            if rc != 0 or not home.strip():
+                raise AnsibleConnectionFailure(
+                    f"fastagent: could not read $HOME on the remote host to "
+                    f"resolve agent_path {agent_path_template!r} "
+                    f"(ssh exit {rc}): {stderr.strip()}"
+                )
+            remote_agent_path = home.strip() + remote_agent_path[1:]
 
         self._ensure_agent_deployed(
             host, user, port, remote_agent_path, remote_arch,
@@ -1132,36 +1155,27 @@ class Connection(ConnectionBase):
 
         display.vvv(f"FASTAGENT: uploading {local_binary} -> {remote_path}", host=host)
 
-        remote_dir = os.path.dirname(remote_path)
-        self._run_ssh_command(host, user, port, f"mkdir -p {shlex.quote(remote_dir)}")
-
-        # Upload via scp.
-        scp_executable = self.get_option("scp_executable") or "scp"
-        scp_cmd = [scp_executable]
-
-        private_key = self.get_option("private_key")
-        if private_key:
-            scp_cmd.extend(["-i", private_key])
-        if port:
-            scp_cmd.extend(["-P", str(port)])
-
-        scp_target = f"{host}:{remote_path}"
-        if user:
-            scp_target = f"{user}@{scp_target}"
-
-        scp_cmd.extend([local_binary, scp_target])
-
-        result = subprocess.run(scp_cmd, capture_output=True, timeout=120)
+        # Stream the binary over the same ssh command every other bootstrap
+        # step uses, so ssh_args (-F, ProxyJump, host key options,
+        # ControlPath) apply to the upload too. A separate scp invocation
+        # would need each option translated for scp, and used to get only
+        # -i and -P.
+        size = os.path.getsize(local_binary)
+        remote_cmd = (
+            f"sh -c {shlex.quote(_INSTALL_AGENT_SCRIPT)} sh "
+            f"{shlex.quote(remote_path)} {size}"
+        )
+        ssh_cmd = self._build_ssh_command(host, user, port, remote_cmd)
+        with open(local_binary, "rb") as stdin:
+            result = subprocess.run(
+                ssh_cmd, stdin=stdin, capture_output=True, timeout=120,
+            )
         if result.returncode != 0:
             raise AnsibleConnectionFailure(
-                f"fastagent: scp upload failed: "
-                f"{result.stderr.decode('utf-8', errors='replace')}"
+                f"fastagent: agent upload to {remote_path} failed "
+                f"(ssh exit {result.returncode}): "
+                f"{result.stderr.decode('utf-8', errors='replace').strip()}"
             )
-
-        # Make executable.
-        self._run_ssh_command(
-            host, user, port, f"chmod +x {shlex.quote(remote_path)}"
-        )
 
         display.vvv("FASTAGENT: agent deployed successfully", host=host)
 

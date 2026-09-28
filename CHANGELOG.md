@@ -29,6 +29,23 @@ All notable changes to fastagent are documented in this file.
 
 ### Bug fixes
 
+- The agent binary upload ignored `ssh_args`/`ansible_ssh_extra_args`: it
+  ran a separate `scp` with only the key and port, so a host reached through
+  `-F`, `ProxyJump`, a host alias or custom host key options connected for
+  every other step but failed to upload (for example `Could not resolve
+  hostname`). The binary is now streamed over the same `ssh` command as the
+  rest of the bootstrap, written to a temporary file, checked for size, and
+  renamed into place. `scp` is no longer needed on the controller, and the
+  `scp_executable` option is removed.
+- `port` defaulted to 22, and fastagent always passed `-o Port=22`,
+  overriding a `Port` from `~/.ssh/config` or an `ssh_args -F` file. It now
+  has no default, like ansible-core's ssh connection. Hosts that relied on
+  the implicit 22 still get it from ssh. The daemon socket name changes once
+  for them, so the first run starts a fresh daemon.
+- A failed `echo $HOME` during bootstrap left `agent_path` as a literal
+  `~/...`, which the quoted upload and launch commands never expanded. It is
+  now an error.
+
 - `template` and `copy` failed under a non-root `become_user` that is not
   the SSH user (for example `become_user: app`), with `Source
   .../.source.conf not found`. Those tasks fall back to ansible-core's copy
