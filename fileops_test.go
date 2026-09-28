@@ -808,3 +808,67 @@ func isLookupError(err error) bool {
 	s := err.Error()
 	return strings.Contains(s, "lookup user") || strings.Contains(s, "lookup group")
 }
+
+func TestWriteFileKeepsExistingMode(t *testing.T) {
+	// Stock copy replaces an existing file's content but keeps its mode
+	// (and, as root, its owner and group) unless mode/owner/group are
+	// given. The atomic write used to leave os.CreateTemp's 0600.
+	for _, mode := range []os.FileMode{0o644, 0o751, 0o600, os.ModeSetuid | 0o755} {
+		t.Run(mode.String(), func(t *testing.T) {
+			dest := filepath.Join(t.TempDir(), "f")
+			if err := os.WriteFile(dest, []byte("old"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(dest, mode); err != nil {
+				t.Fatal(err)
+			}
+			resp := rpcCall(t, newTestServer(), "WriteFile", WriteFileParams{
+				Dest: dest, Content: base64.StdEncoding.EncodeToString([]byte("new")),
+			})
+			if resp.Error != nil {
+				t.Fatal(resp.Error)
+			}
+			st, err := os.Stat(dest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := st.Mode() & (os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky); got != mode {
+				t.Errorf("mode after write = %v, want %v kept", got, mode)
+			}
+		})
+	}
+}
+
+func TestWriteFileNewFileUsesUmask(t *testing.T) {
+	dest := filepath.Join(t.TempDir(), "new")
+	resp := rpcCall(t, newTestServer(), "WriteFile", WriteFileParams{
+		Dest: dest, Content: base64.StdEncoding.EncodeToString([]byte("new")),
+	})
+	if resp.Error != nil {
+		t.Fatal(resp.Error)
+	}
+	st, err := os.Stat(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := os.FileMode(0o666 &^ processUmask)
+	if st.Mode().Perm() != want {
+		t.Errorf("new file mode = %v, want %v (0666 minus the umask, as stock)", st.Mode().Perm(), want)
+	}
+}
+
+func TestWriteFileExplicitModeStillWins(t *testing.T) {
+	dest := filepath.Join(t.TempDir(), "f")
+	if err := os.WriteFile(dest, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resp := rpcCall(t, newTestServer(), "WriteFile", WriteFileParams{
+		Dest: dest, Content: base64.StdEncoding.EncodeToString([]byte("new")), Mode: "0640",
+	})
+	if resp.Error != nil {
+		t.Fatal(resp.Error)
+	}
+	if st, _ := os.Stat(dest); st.Mode().Perm() != 0o640 {
+		t.Errorf("mode = %v, want 0640", st.Mode().Perm())
+	}
+}

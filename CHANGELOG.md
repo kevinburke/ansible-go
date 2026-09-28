@@ -29,6 +29,14 @@ All notable changes to fastagent are documented in this file.
 
 ### Bug fixes
 
+- `copy` and `template` on the fast path left every file they wrote at mode
+  0600 unless the task set `mode`, because the agent's temporary file was
+  renamed into place with `os.CreateTemp`'s mode. That included replacing a
+  0644 or 0755 file. As stock does, a replaced regular file now keeps its
+  mode, including setuid and setgid, and under become as root it also
+  keeps its owner and group. A new file gets 0666 minus the agent's umask.
+  `unsafe_writes` creates new files the same way (it used 0644). A requested
+  `mode`, `owner` or `group` still wins.
 - After a request failed mid-stream, for example because the local `ssh -L`
   forwarder was killed, every later request in the same Ansible worker
   failed with `RPC stream is unusable after an earlier failure`. That

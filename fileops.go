@@ -277,10 +277,27 @@ func (s *Server) handleWriteFile(params json.RawMessage) (any, error) {
 	}
 
 	if p.UnsafeWrites {
-		if err := os.WriteFile(p.Dest, data, 0o644); err != nil {
+		// An existing file keeps its mode; a new one gets 0666 minus the
+		// umask, as on the atomic path.
+		if err := os.WriteFile(p.Dest, data, 0o666); err != nil {
 			return nil, fmt.Errorf("write %s: %w", p.Dest, err)
 		}
 	} else {
+		// The temporary file starts 0600, so content meant for a
+		// restrictive mode is never readable at a wider one. Before the
+		// rename it gets the mode, and as root the owner and group, of the
+		// regular file it replaces, as stock copy keeps them; a new file
+		// gets 0666 minus the umask. Requested mode/owner/group are applied
+		// after the rename, below.
+		mode := os.FileMode(0o666 &^ processUmask)
+		uid, gid := -1, -1
+		var existing unix.Stat_t
+		if err := unix.Lstat(p.Dest, &existing); err == nil && existing.Mode&unix.S_IFMT == unix.S_IFREG {
+			mode = unixModeToFileMode(uint32(existing.Mode))
+			if os.Geteuid() == 0 {
+				uid, gid = int(existing.Uid), int(existing.Gid)
+			}
+		}
 		tmp, err := os.CreateTemp(dir, ".fastagent-*")
 		if err != nil {
 			return nil, fmt.Errorf("create temp: %w", err)
@@ -290,6 +307,19 @@ func (s *Server) handleWriteFile(params json.RawMessage) (any, error) {
 			tmp.Close()
 			os.Remove(tmpName)
 			return nil, fmt.Errorf("write temp: %w", err)
+		}
+		if uid >= 0 {
+			if err := tmp.Chown(uid, gid); err != nil {
+				tmp.Close()
+				os.Remove(tmpName)
+				return nil, fmt.Errorf("chown temp to %d:%d: %w", uid, gid, err)
+			}
+		}
+		// After chown, which clears setuid and setgid.
+		if err := tmp.Chmod(mode); err != nil {
+			tmp.Close()
+			os.Remove(tmpName)
+			return nil, fmt.Errorf("chmod temp to %v: %w", mode, err)
 		}
 		if err := tmp.Close(); err != nil {
 			os.Remove(tmpName)
@@ -785,4 +815,30 @@ func applyOwnershipAndModeWithChown(path, owner, group, mode string, lchown bool
 	}
 
 	return changed, nil
+}
+
+// processUmask is the agent's umask, read once at startup (before any
+// goroutine creates files, since reading it means briefly setting it). A
+// new file written by WriteFile gets 0666 minus this, like a file stock
+// copy creates.
+var processUmask = func() int {
+	m := unix.Umask(0)
+	unix.Umask(m)
+	return m
+}()
+
+// unixModeToFileMode converts st_mode permission bits, including setuid,
+// setgid and sticky, to an os.FileMode for Chmod.
+func unixModeToFileMode(m uint32) os.FileMode {
+	mode := os.FileMode(m & 0o777)
+	if m&unix.S_ISUID != 0 {
+		mode |= os.ModeSetuid
+	}
+	if m&unix.S_ISGID != 0 {
+		mode |= os.ModeSetgid
+	}
+	if m&unix.S_ISVTX != 0 {
+		mode |= os.ModeSticky
+	}
+	return mode
 }
