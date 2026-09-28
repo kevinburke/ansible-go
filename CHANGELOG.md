@@ -4,7 +4,26 @@ All notable changes to fastagent are documented in this file.
 
 ## Unreleased
 
+### Features
+
+- `stat` stays on the fast path with stock's defaults. `get_mime` and
+  `get_attributes` used to force a fallback to `ansible.builtin.stat`, so a
+  plain `stat: path=...` never used the agent. The agent now runs `file` and
+  `lsattr` the way stock does, and the action plugin parses their output with
+  stock's own code. `stat` also accepts stock's aliases (`dest`, `name`,
+  `mime`, `attr`, `checksum_algo`, ...), expands `~` and `$VARS` in `path`,
+  honors the task's `environment:`, and returns the fields stock returns and
+  no others: float timestamps, `blocks`, `block_size`, `device_type`, and
+  `disk_usage_bytes` on ansible-core 2.21+; no `owner`/`group` keys.
+  Dangling-link `lnk_source`, unreadable-file checksums and stat error
+  messages now match stock. A new differential test compares the two
+  directly.
+
 ### Bug fixes
+
+- `stat` and `file` reported `mode` without setuid, setgid and sticky bits
+  (a 4755 file showed as 0755). `file` also printed modes below 0o100 with
+  too few digits.
 
 - Explain daemon startup failures caused by a full, inode-exhausted or
   read-only remote `/tmp`. These used to surface only as "timeout waiting for

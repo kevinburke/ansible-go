@@ -60,12 +60,20 @@ source comparison.
 - `Stat` and `ReadFile` reject `BecomeUser`. The action plugins fall back for
   become tasks, but direct RPC callers cannot match stock module behavior.
 - Checksum support now covers Ansible's stat algorithms (`md5`, `sha1`,
-  `sha224`, `sha256`, `sha384`, and `sha512`). The action plugin falls back to
-  `ansible.builtin.stat` for unsupported algorithms and for stock's default
-  `get_mime`/`get_attributes` probes unless callers opt out.
-- `stat` result coverage is intentionally close for the fast subset, but should
-  still be diffed against stock output for special files, inaccessible paths,
-  uid/gid lookup failures, and mount option effects.
+  `sha224`, `sha256`, `sha384`, and `sha512`).
+- `get_mime` and `get_attributes` (on by default) run on the fast path: the
+  agent finds and runs `file` and `lsattr` the way stock does, and the action
+  plugin parses their output with stock's own Python. Only
+  `get_selinux_context` and become tasks fall back.
+- `tests/test_stat_differential.py` compares the fast path with the installed
+  `ansible.builtin.stat` for regular, empty, binary, setuid and unreadable
+  files, directories, FIFOs, relative, chained, dangling and looping symlinks,
+  missing paths, ENOTDIR, path expansion, and task `environment:`. It found
+  that `mode` dropped setuid/setgid/sticky bits, now fixed.
+- Known remaining differences: user and group names come from
+  `/etc/passwd` and `/etc/group` without NSS; relative paths resolve against
+  the agent's working directory; `lsattr` has only been exercised through
+  the differential test where the test host provides it.
 
 ### copy/template
 

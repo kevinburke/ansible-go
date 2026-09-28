@@ -220,6 +220,10 @@ class FastAgentClient:
         follow: bool = False,
         checksum: bool = False,
         checksum_algorithm: str | None = None,
+        builtin: bool = False,
+        mime: bool = False,
+        attributes: bool = False,
+        env: dict | None = None,
     ) -> dict:
         """Stat a file on the remote host.
 
@@ -227,6 +231,10 @@ class FastAgentClient:
         (typically root), which could leak metadata the become_user
         couldn't otherwise see. Callers that need become-user stat
         semantics must fall back to the builtin stat module.
+
+        builtin=True asks for ansible.builtin.stat semantics (see
+        StatParams.Builtin in fastagent.go); mime, attributes and env
+        only apply then.
         """
         params = {
             "path": path,
@@ -235,6 +243,12 @@ class FastAgentClient:
         }
         if checksum_algorithm is not None:
             params["checksum_algorithm"] = checksum_algorithm
+        if builtin:
+            params["builtin"] = True
+            params["mime"] = mime
+            params["attributes"] = attributes
+            if env:
+                params["env"] = env
         return self.call("Stat", params)
 
     def read_file(self, path: str) -> dict:

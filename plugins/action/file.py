@@ -261,7 +261,8 @@ class ActionModule(ActionBase):
             result["gid"] = stat_result.get("gid", 0)
             result["owner"] = stat_result.get("owner", "")
             result["group"] = stat_result.get("group", "")
-            result["mode"] = stat_result.get("mode", "")
+            # Stock file's add_path_info: '0%03o' % stat.S_IMODE(mode).
+            result["mode"] = "0%03o" % int(stat_result.get("mode") or "0", 8)
             result["size"] = stat_result.get("size", 0)
         except Exception as e:
             result["failed"] = True

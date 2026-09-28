@@ -39,6 +39,12 @@ func (s *Server) handleStat(params json.RawMessage) (any, error) {
 		return nil, fmt.Errorf("stat: BecomeUser is not yet implemented (use Exec with `stat`/`test` to run as a specific user)")
 	}
 
+	var env statEnv
+	if p.Builtin {
+		env = newStatEnv(p.Env)
+		p.Path = expandModulePath(p.Path, env)
+	}
+
 	var st unix.Stat_t
 	statFn := unix.Lstat
 	if p.Follow {
@@ -48,10 +54,18 @@ func (s *Server) handleStat(params json.RawMessage) (any, error) {
 		if errors.Is(err, unix.ENOENT) {
 			return StatResult{Exists: false, Path: p.Path}, nil
 		}
+		// Stock stat fails with msg=ex.strerror; report it as a result so
+		// the action plugin can reproduce that message exactly.
+		var errno unix.Errno
+		if p.Builtin && errors.As(err, &errno) {
+			return StatResult{Path: p.Path, Strerror: libcStrerror(errno)}, nil
+		}
 		return nil, fmt.Errorf("stat %s: %w", p.Path, err)
 	}
 
-	mode := fs.FileMode(st.Mode & 0o7777)
+	// Only the rwx bits map directly onto fs.FileMode; setuid and setgid
+	// are Go flag bits, translated below.
+	mode := fs.FileMode(st.Mode) & fs.ModePerm
 	// Translate the type bits from the raw st_mode into Go's
 	// fs.FileMode convention so we can reuse IsDir/IsRegular/etc.
 	switch st.Mode & unix.S_IFMT {
@@ -86,16 +100,22 @@ func (s *Server) handleStat(params json.RawMessage) (any, error) {
 		IsChar:   mode&fs.ModeCharDevice != 0,
 		IsFIFO:   mode&fs.ModeNamedPipe != 0,
 		IsSocket: mode&fs.ModeSocket != 0,
-		Mode:     fmt.Sprintf("0%o", perm),
-		Size:     st.Size,
-		UID:      int(st.Uid),
-		GID:      int(st.Gid),
-		Inode:    uint64(st.Ino),
-		Dev:      uint64(st.Dev),
-		Nlink:    uint64(st.Nlink),
-		Atime:    statAtime(&st),
-		Mtime:    statMtime(&st),
-		Ctime:    statCtime(&st),
+		// S_IMODE: permission bits plus setuid, setgid and sticky.
+		Mode:  fmt.Sprintf("0%o", st.Mode&sIMODE),
+		Size:  st.Size,
+		UID:   int(st.Uid),
+		GID:   int(st.Gid),
+		Inode: uint64(st.Ino),
+		Dev:   uint64(st.Dev),
+		Nlink: uint64(st.Nlink),
+		Atime: statAtime(&st),
+		Mtime: statMtime(&st),
+		Ctime: statCtime(&st),
+
+		AtimeNsec: st.Atim.Nsec,
+		MtimeNsec: st.Mtim.Nsec,
+		CtimeNsec: st.Ctim.Nsec,
+		Platform:  platformStat(&st),
 
 		IsUID: mode&fs.ModeSetuid != 0,
 		IsGID: mode&fs.ModeSetgid != 0,
@@ -128,12 +148,15 @@ func (s *Server) handleStat(params json.RawMessage) (any, error) {
 		if target, err := os.Readlink(p.Path); err == nil {
 			result.LnkTarget = target
 		}
-		if src, err := filepath.EvalSymlinks(p.Path); err == nil {
+		if p.Builtin {
+			result.LnkSource = pyRealpath(p.Path)
+		} else if src, err := filepath.EvalSymlinks(p.Path); err == nil {
 			result.LnkSource = src
 		}
 	}
 
-	if p.Checksum && mode.IsRegular() {
+	// ansible.builtin.stat only checksums files it can read.
+	if p.Checksum && mode.IsRegular() && (!p.Builtin || result.Readable) {
 		algorithm := p.ChecksumAlgorithm
 		if algorithm == "" {
 			algorithm = "sha256"
@@ -143,6 +166,26 @@ func (s *Server) handleStat(params json.RawMessage) (any, error) {
 			return nil, fmt.Errorf("checksum %s: %w", p.Path, err)
 		}
 		result.Checksum = checksum
+	}
+
+	if p.Builtin && p.Mime {
+		if bin := getBinPath("file", env); bin != "" {
+			out, err := runModuleCommand([]string{bin, "--mime-type", "--mime-encoding", p.Path}, env)
+			if err != nil {
+				return nil, fmt.Errorf("stat: run file: %w", err)
+			}
+			result.FileCmd = out
+		}
+	}
+	if p.Builtin && p.Attributes {
+		// AnsibleModule.get_file_attributes(path, include_version=True)
+		if bin := getBinPath("lsattr", env); bin != "" {
+			out, err := runModuleCommand([]string{bin, "-vd", p.Path}, env)
+			if err != nil {
+				return nil, fmt.Errorf("stat: run lsattr: %w", err)
+			}
+			result.LsattrCmd = out
+		}
 	}
 
 	return result, nil

@@ -171,6 +171,26 @@ type StatParams struct {
 	Checksum          bool   `json:"checksum,omitempty"`
 	ChecksumAlgorithm string `json:"checksum_algorithm,omitempty"`
 	BecomeUser        string `json:"become_user,omitempty"`
+
+	// Builtin asks for ansible.builtin.stat semantics, for the stat
+	// action plugin. Without it, Stat keeps the behavior other plugins
+	// (copy, file) rely on. With it: Path is expanded like Ansible's
+	// type='path' (~ and $VARS, using Env); the checksum is skipped
+	// instead of failing when the file is unreadable; lnk_source uses
+	// Python's non-strict realpath, so dangling links resolve; and Mime
+	// and Attributes run `file` and `lsattr` as stock does.
+	Builtin    bool              `json:"builtin,omitempty"`
+	Mime       bool              `json:"mime,omitempty"`
+	Attributes bool              `json:"attributes,omitempty"`
+	Env        map[string]string `json:"env,omitempty"`
+}
+
+// StatCommandOutput is the result of a helper command run for Stat.
+// Parsing is left to the action plugin, which applies the same Python
+// ansible.builtin.stat does.
+type StatCommandOutput struct {
+	RC     int    `json:"rc"`
+	Stdout string `json:"stdout"`
 }
 
 // StatResult contains file status information.
@@ -233,6 +253,28 @@ type StatResult struct {
 	// and `lnk_source` from os.path.realpath.
 	LnkTarget string `json:"lnk_target,omitempty"`
 	LnkSource string `json:"lnk_source,omitempty"`
+
+	// Sub-second parts of the timestamps. Python's float st_mtime and
+	// friends are sec + nsec*1e-9; the action plugin rebuilds them.
+	AtimeNsec int64 `json:"atime_nsec,omitempty"`
+	MtimeNsec int64 `json:"mtime_nsec,omitempty"`
+	CtimeNsec int64 `json:"ctime_nsec,omitempty"`
+
+	// Platform holds the platform-dependent os.stat_result fields that
+	// ansible.builtin.stat copies through (st_blocks, st_blksize,
+	// st_rdev, and on BSD-derived systems st_flags, st_gen and
+	// st_birthtime), keyed by stat's output names. See platformStat.
+	Platform map[string]int64 `json:"platform,omitempty"`
+
+	// Strerror is set, and everything else is zero, when a Builtin
+	// request's stat call failed with something other than ENOENT. It is
+	// the C library's strerror text, which stock stat returns as msg.
+	Strerror string `json:"strerror,omitempty"`
+
+	// Set for Builtin requests with Mime or Attributes when `file` or
+	// `lsattr` was found; nil means stock would not have run it.
+	FileCmd   *StatCommandOutput `json:"file_cmd,omitempty"`
+	LsattrCmd *StatCommandOutput `json:"lsattr_cmd,omitempty"`
 }
 
 // ReadFileParams requests file content.
