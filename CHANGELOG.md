@@ -4,6 +4,21 @@ All notable changes to fastagent are documented in this file.
 
 ## Unreleased
 
+### Changes
+
+- `stat` has a new action plugin, written from the module's documentation and
+  observed behavior rather than its source. Results match
+  `ansible.builtin.stat` key for key on the fast path, including
+  `mimetype`/`charset`, `attributes`/`version`, stat error messages, and
+  `disk_usage_bytes` only on ansible-core 2.21 and newer. Arguments are
+  validated with ansible-core's own validator, so stock reports invalid
+  arguments and alias warnings itself. New fallbacks to
+  `ansible.builtin.stat`: async tasks, relative paths, non-sudo become
+  methods, `file`/`lsattr` output that is not UTF-8, agent errors, and
+  ansible-core older than 2.20. `tests/test_stat_differential.py` compares the
+  two on the controller against a local agent and, when
+  `FASTAGENT_TEST_SSH_HOST` is set, on a test host through both connections.
+
 ## 0.9.0 — September 28, 2026
 
 ### Features

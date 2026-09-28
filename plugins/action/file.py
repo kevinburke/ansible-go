@@ -49,7 +49,7 @@ class ActionModule(ActionBase):
 
         # The file override uses Stat RPCs internally, which the agent
         # rejects when running as root on behalf of a become_user
-        # (see plugins/action/stat.py for the rationale). Additionally,
+        # (the stat action override does the same). Additionally,
         # running the File RPC as root would create files owned by
         # root, not by the become_user, diverging from the builtin
         # module's semantics. Fall back for become tasks.

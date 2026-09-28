@@ -35,6 +35,27 @@ included in ansible-core.
 When updating the pins, run the CI format, lint, test, build, python-test, and
 check-versions commands with the pipeline's environment values.
 
+### Differential tests
+
+`tests/test_stat_differential.py` runs the same `stat` tasks through
+fastagent and through `ansible.builtin.stat` and requires identical results.
+One half always runs (it needs Go and `ansible-playbook`): it drives the
+action plugin against a local agent started with `--serve` and runs stock
+with `-c local`. The other half compares a fastagent connection and a plain
+SSH connection to the same disposable host, and runs when these are set:
+
+```bash
+export FASTAGENT_TEST_SSH_HOST=testhost      # required
+export FASTAGENT_TEST_SSH_PORT=22            # optional
+export FASTAGENT_TEST_SSH_USER=deploy        # optional
+export FASTAGENT_TEST_SSH_KEY=~/.ssh/test    # optional
+export FASTAGENT_TEST_BECOME_USER=app        # optional, a non-root user
+python3 -m unittest -v tests.test_stat_differential
+```
+
+The host needs Python 3 and passwordless sudo, and the agent binary must be
+available the way the connection plugin finds it (see Step 1 below).
+
 ### Setup
 
 The fastagent plugins are discovered via `ansible.cfg` in the repo root. If

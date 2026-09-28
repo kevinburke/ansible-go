@@ -61,19 +61,30 @@ source comparison.
   become tasks, but direct RPC callers cannot match stock module behavior.
 - Checksum support now covers Ansible's stat algorithms (`md5`, `sha1`,
   `sha224`, `sha256`, `sha384`, and `sha512`).
-- `get_mime` and `get_attributes` (on by default) run on the fast path: the
-  agent finds and runs `file` and `lsattr` the way stock does, and the action
-  plugin parses their output with stock's own Python. Only
-  `get_selinux_context` and become tasks fall back.
-- `tests/test_stat_differential.py` compares the fast path with the installed
+- `plugins/action/stat.py` was rewritten from the module's documented
+  interface and its observed behavior. Arguments go through ansible-core's
+  `ArgumentSpecValidator` with stock's spec (checked against
+  `ansible-doc --json` by `tests/test_stat_action.py`); anything stock would
+  reject or warn about runs stock. `get_mime` and `get_attributes` run on the
+  fast path: the agent runs `file` and `lsattr` as stock does, `lsattr` output
+  goes through ansible-core's own `AnsibleModule.get_file_attributes`, and
+  `file` output is parsed by rules established by running stock with
+  stand-in `file` programs. Only `get_selinux_context`, non-root
+  `become_user`, async and relative paths fall back.
+- `tests/test_stat_differential.py` compares the fast path with
   `ansible.builtin.stat` for regular, empty, binary, setuid and unreadable
-  files, directories, FIFOs, relative, chained, dangling and looping symlinks,
-  missing paths, ENOTDIR, path expansion, and task `environment:`. It found
-  that `mode` dropped setuid/setgid/sticky bits, now fixed.
+  files, oddly named files, directories, FIFOs, sockets, devices, relative,
+  absolute, chained, dangling and looping symlinks with and without
+  `follow`, missing paths, ENOTDIR, ELOOP, EACCES, every checksum
+  algorithm, aliases, path expansion, task `environment:`, check mode,
+  missing `file`/`lsattr`, and many `file`/`lsattr` outputs. It runs on the
+  controller against a local agent, and against a test host through both
+  connections when `FASTAGENT_TEST_SSH_HOST` is set. Compared with
+  ansible-core 2.20.4 and 2.21.4 on Debian 12 (Python 3.11) and macOS
+  (Python 3.14): no differences.
 - Known remaining differences: user and group names come from
-  `/etc/passwd` and `/etc/group` without NSS; relative paths resolve against
-  the agent's working directory; `lsattr` has only been exercised through
-  the differential test where the test host provides it.
+  `/etc/passwd` and `/etc/group` without NSS; `~` and `$VAR` use the
+  daemon's environment from when it started.
 
 ### copy/template
 
