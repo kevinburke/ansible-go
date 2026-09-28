@@ -37,9 +37,10 @@ from ansible.utils.vars import merge_hash
 try:
     from ansible_collections.kevinburke.fastagent.plugins.module_utils.fastagent_client import (
         FastAgentError,
+        ansible_applies_become,
     )
 except ImportError:
-    from plugins.module_utils.fastagent_client import FastAgentError
+    from plugins.module_utils.fastagent_client import FastAgentError, ansible_applies_become
 
 display = Display()
 
@@ -320,7 +321,8 @@ class ActionModule(ActionBase):
             return f"ansible-core {_ANSIBLE_VERSION} is older than the fast path supports"
         # A become method the agent does not implement stays attached to
         # the connection for Ansible's own wrapping (see set_become_plugin).
-        if getattr(self._connection, "become", None) is not None:
+        # Sudo is attached too, as a wrapper the agent handles.
+        if ansible_applies_become(self._connection):
             return "become method handled by Ansible"
         # The agent stats as its own uid, the SSH user or root. Stat as
         # another user would see different permissions and access bits.

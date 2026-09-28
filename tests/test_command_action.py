@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import sys
+import types
 import unittest
 from unittest.mock import patch
 
@@ -150,6 +151,15 @@ class TestCommandActionBecomeUser(unittest.TestCase):
             action.run(task_vars={})
         self.assertEqual(conn._agent_client.last_kwargs["creates"], "marker")
         self.assertEqual(conn._agent_client.last_kwargs["removes"], "input.*")
+
+    def test_agent_handled_sudo_stays_on_fast_path(self) -> None:
+        # The connection attaches its sudo plugin wrapped with this marker
+        # so ansible-core still sees become as active. That must not be
+        # mistaken for an unsupported become method.
+        conn = _FakeConnection(become_user="returns")
+        conn.become = types.SimpleNamespace(fastagent_handles_become=True)
+        self._run_with_mocked_base(conn)
+        self.assertEqual(conn._agent_client.last_kwargs["become_user"], "returns")
 
     def test_unsupported_become_method_falls_back_to_builtin(self) -> None:
         conn = _FakeConnection(become_user=None)

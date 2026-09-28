@@ -345,6 +345,37 @@ def _remote_fs_hint(directory: str, stderr: str) -> str | None:
     )
 
 
+class _AgentHandledBecome:
+    """Wrap ansible's sudo become plugin so it never builds a sudo command.
+
+    The agent performs become itself (the Exec RPC's become_user field),
+    so ActionBase must not prefix commands with `sudo -u <user> …`. But
+    ansible-core also reads `connection.become` to decide whether become
+    is in effect at all — most importantly ActionBase._is_become_unprivileged,
+    which gates the _fixup_perms2 step that grants an unprivileged
+    become_user access to files uploaded into the remote tmpdir. So the
+    plugin stays attached, and only build_become_command is neutralized.
+    Every other attribute (options, name, prompt, ...) is forwarded to
+    the real plugin.
+    """
+
+    # Marker for fastagent's action plugins: become is handled by the
+    # agent, as opposed to an unsupported become method that ansible
+    # must apply itself. Its name is AGENT_HANDLES_BECOME_ATTR in
+    # module_utils/fastagent_client.py; plugins read it through
+    # ansible_applies_become() there.
+    fastagent_handles_become = True
+
+    def __init__(self, plugin) -> None:
+        self._plugin = plugin
+
+    def build_become_command(self, cmd, shell):
+        return cmd
+
+    def __getattr__(self, name):
+        return getattr(self._plugin, name)
+
+
 class Connection(ConnectionBase):
     """fastagent connection plugin."""
 
@@ -367,7 +398,7 @@ class Connection(ConnectionBase):
         self._socket_identity: str | None = None
 
     def set_become_plugin(self, plugin) -> None:
-        """Swallow Ansible's become plugin so it doesn't wrap commands.
+        """Attach Ansible's sudo plugin without its command wrap.
 
         Ansible's default `set_become_plugin` attaches the become plugin
         to `self.become`, and `ActionBase._low_level_execute_command`
@@ -381,25 +412,28 @@ class Connection(ConnectionBase):
         Fastagent handles become itself: the connection passes
         `become_user` to the Exec RPC, and the agent wraps with sudo at
         dispatch (running as root, so sudoers policy never applies).
-        To suppress Ansible's redundant wrap, we leave `self.become` as
-        None regardless of what Ansible hands us, and read the target
-        user from `self._play_context.become_user` at exec_command time.
+        To suppress Ansible's redundant wrap, `self.become` is an
+        _AgentHandledBecome whose build_become_command returns the
+        command unchanged.
 
-        Why not read `become_user` off the plugin here? TaskExecutor
-        only populates `plugin.get_option('become_user')` via
-        `_set_plugin_options('become', ...)` when `connection.become is
-        not None` (task_executor.py:1085). Leaving `self.become = None`
-        is exactly what suppresses the ActionBase wrap — but it also
-        skips that populate step, so the plugin returns the *default*
-        become_user ("root") rather than the task's templated value.
-        Reading from play_context sidesteps this: ansible templates
-        `play_context.become_user` from the task (play_context.py:189)
-        before handing the play_context to the connection.
+        An earlier version suppressed the wrap by leaving `self.become`
+        as None. That also hid become from the rest of ansible-core:
+        ActionBase._is_become_unprivileged() returned False, so
+        _fixup_perms2 never gave an unprivileged become_user access to
+        files uploaded into the remote tmpdir, and builtin copy/template
+        (and unarchive, script, ...) under `become_user: <app user>`
+        failed with "Source ... not found".
+
+        The target user is still read from
+        `self._play_context.become_user` at exec_command time (see
+        get_become_user), which ansible templates from the task
+        (play_context.py:189) before handing it to the connection.
 
         Called once per task by ansible-core's TaskExecutor before the
         action plugin runs.
         """
         if plugin is None:
+            self.become = None
             self._use_become = False
             return
         if plugin.name != "sudo":
@@ -413,8 +447,7 @@ class Connection(ConnectionBase):
             self._use_become = False
             return
         self._use_become = True
-        # Deliberately do NOT set self.become — that's what suppresses
-        # the ActionBase wrap.
+        self.become = _AgentHandledBecome(plugin)
 
     def get_become_user(self) -> str | None:
         """Return the task's effective non-root become_user, or None.
@@ -882,9 +915,10 @@ class Connection(ConnectionBase):
         # recorded that the task is using become, we ask the agent to
         # run the command as the task's become_user via the Exec RPC's
         # become_user field. Ansible's own ActionBase wrap is
-        # suppressed by our set_become_plugin override (which leaves
-        # self.become as None), so `cmd` here is the raw module
-        # invocation with no `sudo -u X` prefix.
+        # suppressed by our set_become_plugin override (self.become is
+        # an _AgentHandledBecome whose build_become_command is a no-op),
+        # so `cmd` here is the raw module invocation with no `sudo -u X`
+        # prefix.
         #
         # become_user is read from self._play_context.become_user,
         # which ansible templates from the task before handing the

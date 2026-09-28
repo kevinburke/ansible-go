@@ -19,6 +19,19 @@ All notable changes to fastagent are documented in this file.
   two on the controller against a local agent and, when
   `FASTAGENT_TEST_SSH_HOST` is set, on a test host through both connections.
 
+### Bug fixes
+
+- `template` and `copy` failed under a non-root `become_user` that is not
+  the SSH user (for example `become_user: app`), with `Source
+  .../.source.conf not found`. Those tasks fall back to ansible-core's copy
+  action, which uploads the file into the SSH user's private tmpdir and then
+  relies on ansible-core to grant the become_user access to it. The
+  connection hid become from ansible-core to stop it prefixing commands with
+  `sudo`, so that grant never happened. The sudo plugin is now attached with
+  its command prefix disabled, and the agent still does the sudo. This also
+  fixes `unarchive`, `script`, `assemble` and `uri` uploads under the same
+  kind of `become_user`.
+
 ## 0.9.0 — September 28, 2026
 
 ### Features

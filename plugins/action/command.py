@@ -19,6 +19,13 @@ from ansible.plugins.action import ActionBase
 from ansible.module_utils.common.text.converters import to_text
 from ansible.utils.vars import merge_hash
 
+try:
+    from ansible_collections.kevinburke.fastagent.plugins.module_utils.fastagent_client import (
+        ansible_applies_become,
+    )
+except ImportError:
+    from plugins.module_utils.fastagent_client import ansible_applies_become
+
 
 class ActionModule(ActionBase):
     def _run_builtin_command(self, result, task_vars):
@@ -123,11 +130,11 @@ class ActionModule(ActionBase):
         else:
             r["cmd"] = cmd_string
 
-        # If the connection left a become plugin attached, it is a become
-        # method the agent-side sudo wrapper does not implement. Let Ansible's
-        # normal module path apply that plugin rather than silently running
-        # with the wrong privilege model.
-        if getattr(self._connection, "become", None) is not None:
+        # If the connection attached a become plugin that the agent does not
+        # handle itself, it is a become method the agent-side sudo wrapper
+        # does not implement. Let Ansible's normal module path apply that
+        # plugin rather than silently running with the wrong privilege model.
+        if ansible_applies_become(self._connection):
             return self._run_builtin_command(result, task_vars)
 
         if executable:

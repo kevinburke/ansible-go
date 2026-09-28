@@ -14,6 +14,7 @@ import os
 import shutil
 import subprocess
 import sys
+import types
 import unittest
 from unittest.mock import patch
 
@@ -461,6 +462,17 @@ class TestRun(unittest.TestCase):
             "checksum_algorithm": "sha1", "builtin": True, "mime": True,
             "attributes": True, "env": {},
         }])
+
+    def test_agent_handled_sudo_stays_on_fast_path(self):
+        # The connection attaches sudo (become_user root) as a wrapper the
+        # agent handles; that must not count as a become Ansible applies.
+        client = _FakeClient()
+        become = types.SimpleNamespace(fastagent_handles_become=True)
+        action = _make_action(_FakeConnection(client, become=become), dict(self.ARGS))
+        with patch.object(stat_action, "_ANSIBLE_VERSION", "2.21.4"):
+            result = action.run(task_vars={})
+        self.assertEqual(action.builtin_calls, [])
+        self.assertEqual(result, {"changed": False, "stat": STOCK_FILE})
 
     def test_rpc_params_follow_task_args_and_environment(self):
         client = _FakeClient(dict(RPC_FILE, path="/home/u/x"))

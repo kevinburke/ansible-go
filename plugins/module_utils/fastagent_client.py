@@ -49,6 +49,26 @@ def _trace(method: str, duration_ns: int, hint: str) -> None:
         pass
 
 
+# Set on the become wrapper the fastagent connection attaches for a method
+# the agent implements itself (sudo). See set_become_plugin in
+# plugins/connection/fastagent.py.
+AGENT_HANDLES_BECOME_ATTR = "fastagent_handles_become"
+
+
+def ansible_applies_become(connection) -> bool:
+    """Report whether Ansible, not the agent, must apply this task's become.
+
+    The fastagent connection always exposes become on `connection.become` so
+    ansible-core's ActionBase sees an unprivileged become_user and grants it
+    access to uploaded files. For sudo the attached plugin is a wrapper the
+    agent handles; only another become method needs Ansible's own module
+    path. Action overrides must use this rather than testing
+    `connection.become is not None`, which is true for sudo too.
+    """
+    become = getattr(connection, "become", None)
+    return become is not None and not getattr(become, AGENT_HANDLES_BECOME_ATTR, False)
+
+
 class FastAgentError(Exception):
     """Raised when the agent returns an error response."""
 

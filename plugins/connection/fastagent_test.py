@@ -299,28 +299,39 @@ class TestTryLocalSocket(unittest.TestCase):
     "ansible is required to run connection plugin tests",
 )
 class TestSetBecomePlugin(unittest.TestCase):
-    """Regression tests for the `self.become` swallowing behavior.
+    """Regression tests for how set_become_plugin attaches sudo.
 
     ActionBase._low_level_execute_command wraps module invocations
     with `sudo -u <user> sh -c …` whenever `self._connection.become`
     is truthy. The fastagent connection handles become itself via the
-    Exec RPC's become_user field, so set_become_plugin must leave
-    self.become as None to suppress the redundant wrap. Without this,
-    non-sudoer become_users hit "<user> is not in the sudoers file"
-    because the inner sudo runs as the target user.
+    Exec RPC's become_user field, so that wrap must be a no-op.
+    Otherwise non-sudoer become_users hit "<user> is not in the sudoers
+    file" because the inner sudo runs as the target user.
 
-    The actual become_user is *not* captured off the plugin here —
-    see set_become_plugin for the explanation. These tests only
-    verify the `_use_become` flag and `self.become` state.
+    An earlier version suppressed the wrap by leaving self.become as
+    None. That also told ActionBase._is_become_unprivileged() that no
+    become was in effect, so _fixup_perms2 never granted the
+    become_user access to files uploaded into the remote tmpdir, and
+    every builtin copy/template fallback under a non-root become_user
+    failed with "Source ... not found". The sudo plugin must therefore
+    stay attached, wrapped so it doesn't build a sudo command.
     """
 
-    def test_sudo_plugin_is_swallowed(self) -> None:
+    def test_sudo_plugin_is_attached_without_command_wrap(self) -> None:
         conn = _bare_connection()
         plugin = _FakeBecomePlugin("sudo", {"become_user": "returns"})
         conn.set_become_plugin(plugin)
-        self.assertIsNone(
+        self.assertIsNotNone(
             conn.become,
-            "self.become must stay None so ActionBase doesn't wrap the command",
+            "self.become must be set so ActionBase knows become is in effect",
+        )
+        self.assertEqual(conn.become.name, "sudo")
+        self.assertEqual(conn.become.get_option("become_user"), "returns")
+        self.assertTrue(conn.become.fastagent_handles_become)
+        self.assertEqual(
+            conn.become.build_become_command("/bin/sh -c 'echo hi'", None),
+            "/bin/sh -c 'echo hi'",
+            "the agent does the sudo; ActionBase must not wrap the command",
         )
         self.assertTrue(conn._use_become)
 
@@ -332,7 +343,7 @@ class TestSetBecomePlugin(unittest.TestCase):
         conn = _bare_connection()
         plugin = _FakeBecomePlugin("sudo", {"become_user": "root"})
         conn.set_become_plugin(plugin)
-        self.assertIsNone(conn.become)
+        self.assertTrue(conn.become.fastagent_handles_become)
         self.assertTrue(conn._use_become)
 
     def test_none_plugin_clears_state(self) -> None:
@@ -351,6 +362,80 @@ class TestSetBecomePlugin(unittest.TestCase):
         # Ansible's own wrap handles non-sudo methods.
         self.assertIs(conn.become, plugin)
         self.assertFalse(conn._use_become)
+
+
+@unittest.skipIf(
+    _FASTAGENT_IMPORT_ERROR is not None,
+    "ansible is required to run connection plugin tests",
+)
+class TestActionBaseSeesBecome(unittest.TestCase):
+    """Check the attached become plugin against ansible-core's ActionBase.
+
+    Uses the real sudo become plugin and the real ActionBase methods, so
+    a change in how either side reads `connection.become` shows up here.
+    """
+
+    def _action(self, become_user: str):
+        from ansible.plugins.action import ActionBase
+        from ansible.plugins.loader import become_loader
+
+        plugin = become_loader.get("sudo")
+        # TaskExecutor populates the options on connection.become; do the
+        # same after attaching.
+        conn = _bare_connection()
+        conn.set_become_plugin(plugin)
+        conn.become.set_options(direct={"become_user": become_user})
+
+        class _Action(ActionBase):
+            def run(self, tmp=None, task_vars=None):
+                raise NotImplementedError
+
+        action = _Action.__new__(_Action)
+        action._connection = conn
+        action._get_admin_users = lambda: ["root", "toor"]
+        action._get_remote_user = lambda: "deploy"
+        return action
+
+    def test_unprivileged_become_user_is_detected(self) -> None:
+        # This is what makes ActionBase._fixup_perms2 grant the
+        # become_user access to files uploaded into the remote tmpdir.
+        action = self._action("app")
+        self.assertTrue(action._is_become_unprivileged())
+        self.assertEqual(action.get_become_option("become_user"), "app")
+
+    def test_root_become_user_is_not_unprivileged(self) -> None:
+        action = self._action("root")
+        self.assertFalse(action._is_become_unprivileged())
+
+    def test_real_sudo_plugin_command_is_not_wrapped(self) -> None:
+        action = self._action("app")
+        cmd = "/bin/sh -c 'echo hi'"
+        self.assertEqual(
+            action._connection.become.build_become_command(cmd, None), cmd
+        )
+
+    def test_action_overrides_see_sudo_as_agent_handled(self) -> None:
+        # The action overrides decide fast path vs. fallback with
+        # ansible_applies_become; sudo must stay on the fast path.
+        for user in ("root", "app"):
+            with self.subTest(become_user=user):
+                conn = self._action(user)._connection
+                self.assertFalse(fastagent_client.ansible_applies_become(conn))
+
+    def test_action_overrides_see_unsupported_method(self) -> None:
+        from ansible.plugins.loader import become_loader
+
+        conn = _bare_connection()
+        conn.set_become_plugin(become_loader.get("su"))
+        self.assertTrue(fastagent_client.ansible_applies_become(conn))
+
+    def test_marker_name_matches_helper(self) -> None:
+        self.assertTrue(
+            getattr(
+                fastagent_plugin._AgentHandledBecome,
+                fastagent_client.AGENT_HANDLES_BECOME_ATTR,
+            )
+        )
 
 
 class _RecordingAgentClient:
@@ -378,8 +463,8 @@ class TestExecCommandBecomeUser(unittest.TestCase):
 
     A previous iteration read it off `plugin.get_option("become_user")`
     during set_become_plugin, which returned the default "root" because
-    ansible only populates plugin options when `connection.become is
-    not None` — and we deliberately keep it None to suppress the
+    ansible only populated plugin options when `connection.become is
+    not None` — and at the time we kept it None to suppress the
     ActionBase wrap. The resulting command ran as root on the remote,
     which git rejected with `dubious ownership` on app-user-owned
     repos. exec_command must instead read the templated value from
