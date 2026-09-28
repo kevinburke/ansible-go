@@ -161,6 +161,10 @@ class TestTarballContents(unittest.TestCase):
         """The MIT license text ships with the collection."""
         self.assertIn("LICENSE", self.members)
 
+    def test_third_party_notices_present(self):
+        """Licenses for upstream code the agent translates ship too."""
+        self.assertIn("THIRD_PARTY_NOTICES", self.members)
+
     def test_makefile_excluded(self):
         self.assertNotIn("Makefile", self.members)
 

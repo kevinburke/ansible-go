@@ -6,6 +6,14 @@ All notable changes to fastagent are documented in this file.
 
 ### Changes
 
+- fastagent is MIT licensed. The agent's `stat` helpers in `statcompat.go`
+  are Go translations of CPython 3.14.3 (`posixpath`, `stat.S_IMODE`) and
+  ansible-core (`get_bin_path`, `is_executable`, `check_type_path`,
+  `run_command`) code, and now say so: each names its upstream source and
+  what was changed, and `THIRD_PARTY_NOTICES` carries the PSF and
+  BSD-2-Clause license texts. The notices ship in the collection tarball and
+  are attached to each GitHub release next to the agent binaries.
+
 - `stat` has a new action plugin, written from the module's documentation and
   observed behavior rather than its source. Results match
   `ansible.builtin.stat` key for key on the fast path, including

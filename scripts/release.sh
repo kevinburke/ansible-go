@@ -152,7 +152,7 @@ run make release
 TARBALL="tmp/kevinburke-fastagent-${VERSION}.tar.gz"
 AMD64_BIN="tmp/fastagent-linux-amd64"
 ARM64_BIN="tmp/fastagent-linux-arm64"
-for artifact in "$TARBALL" "$AMD64_BIN" "$ARM64_BIN"; do
+for artifact in "$TARBALL" "$AMD64_BIN" "$ARM64_BIN" LICENSE THIRD_PARTY_NOTICES; do
     if [ "$DRY_RUN" -eq 0 ] && [ ! -f "$artifact" ]; then
         err "expected release artifact missing: $artifact"
         exit 1
@@ -184,9 +184,14 @@ if [ "$DRY_RUN" -eq 0 ]; then
     cp "$ARM64_BIN" "$ARM64_ASSET"
 fi
 
+# The binaries contain code under ansible-core's BSD-2-Clause and CPython's
+# PSF licenses, which require their notices to accompany binary
+# distributions; attach them next to the binaries.
 run gh release create "$TAG" \
     "$AMD64_ASSET" \
     "$ARM64_ASSET" \
+    LICENSE \
+    THIRD_PARTY_NOTICES \
     --title "$TAG" \
     --generate-notes
 

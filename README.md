@@ -553,3 +553,12 @@ The daemon auto-exits after 1 hour of inactivity (configurable via
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+A few functions in the agent (`statcompat.go`) are Go translations of
+CPython and ansible-core code, so that `stat` results match stock byte for
+byte. Those stay under their upstream licenses, CPython's PSF License and
+ansible-core's BSD-2-Clause; see
+[THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) for the sources, versions and
+license texts. Code copied or translated from another project must be
+listed there, and each translated function's doc comment must name its
+source and say what was changed; `notices_test.go` enforces this.
