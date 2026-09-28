@@ -549,3 +549,7 @@ mode `0770`). Other users on the remote host cannot connect to it.
 
 The daemon auto-exits after 1 hour of inactivity (configurable via
 `--idle-timeout`).
+
+## License
+
+MIT. See [LICENSE](LICENSE).

@@ -157,6 +157,10 @@ class TestTarballContents(unittest.TestCase):
             "plugins/module_utils/fastagent_client_test.py", self.members
         )
 
+    def test_license_present(self):
+        """The MIT license text ships with the collection."""
+        self.assertIn("LICENSE", self.members)
+
     def test_makefile_excluded(self):
         self.assertNotIn("Makefile", self.members)
 
