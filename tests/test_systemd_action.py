@@ -15,7 +15,12 @@ try:
     from ansible.plugins.action import ActionBase  # type: ignore[import-untyped]
     from plugins.action.systemd import ActionModule  # type: ignore[import-untyped]
     _ANSIBLE_IMPORT_ERROR = None
-except Exception as exc:  # pragma: no cover
+except ModuleNotFoundError as exc:  # pragma: no cover
+    # Skip only when ansible-core itself is not installed. Any other import
+    # failure, such as a syntax error in the plugin, must fail the run
+    # rather than silently skip every test.
+    if exc.name is None or exc.name.split(".")[0] != "ansible":
+        raise
     _ANSIBLE_IMPORT_ERROR = exc
 
 
