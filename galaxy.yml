@@ -24,6 +24,8 @@ build_ignore:
   - 'go.sum'
   - 'cmd'
   - 'tmp'
+  - 'venv'
+  - '.python-venv'
   - 'worktrees'
   - 'docs'
   - '.buildkite'

@@ -136,7 +136,13 @@ class TestTarballContents(unittest.TestCase):
 
     def test_no_go_sources_leaked(self):
         """Go source and build artifacts must not ship in the collection."""
-        forbidden_prefixes = ("cmd/", "tmp/", "worktrees/", "docs/", ".buildkite/", "scripts/")
+        # venv/ and .python-venv/ hold a local or CI ansible-core install;
+        # ansible-galaxy does not read .gitignore, so they must be listed in
+        # galaxy.yml's build_ignore.
+        forbidden_prefixes = (
+            "cmd/", "tmp/", "worktrees/", "docs/", ".buildkite/", "scripts/",
+            "venv/", ".python-venv/",
+        )
         forbidden_exts = (".go", "go.mod", "go.sum")
         leaked = [
             m for m in self.members
