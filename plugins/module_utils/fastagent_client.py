@@ -116,6 +116,15 @@ class FastAgentClient:
         self._lock = threading.Lock()
         self._broken = False
 
+    @property
+    def broken(self) -> bool:
+        """True once a call failed mid-request.
+
+        The stream may hold a late response to that request, so no later
+        request can be sent on it. The caller needs a new stream.
+        """
+        return self._broken
+
     def call(self, method: str, params: dict | None = None) -> dict:
         """Send a JSON-RPC request and return the result.
 

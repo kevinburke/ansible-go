@@ -529,7 +529,13 @@ class Connection(ConnectionBase):
         }
         digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:32]
         if self._connected and getattr(self, "_socket_identity", None) == digest:
-            return self
+            if self._agent_client is None or not self._agent_client.broken:
+                return self
+            # An earlier request failed mid-stream (for example, the ssh -L
+            # forwarder died). That request is reported as "outcome
+            # unknown" and never replayed, but later requests get a new
+            # stream; setup below replaces a dead forwarder or daemon.
+            display.vvv("FASTAGENT: RPC stream broke, reconnecting", host=host)
         self.close()
         self._socket_identity = digest
         mode = "root-" if use_become else ""
@@ -967,7 +973,7 @@ class Connection(ConnectionBase):
             stdin_data = in_data.decode("utf-8", errors="surrogateescape")
 
         try:
-            result = self._agent_client.exec(
+            result = self._usable_agent_client().exec(
                 cmd_string=cmd,
                 use_shell=True,
                 stdin=stdin_data,
@@ -1006,7 +1012,7 @@ class Connection(ConnectionBase):
         remote_user = self.get_option("remote_user")
 
         try:
-            self._agent_client.write_file(
+            self._usable_agent_client().write_file(
                 dest=out_path,
                 content=content_b64,
                 owner=remote_user,
@@ -1021,7 +1027,7 @@ class Connection(ConnectionBase):
         display.vvv(f"FASTAGENT: fetch_file {in_path} -> {out_path}", host=self.get_option("host"))
 
         try:
-            result = self._agent_client.read_file(in_path)
+            result = self._usable_agent_client().read_file(in_path)
         except (FastAgentError, IOError) as e:
             raise AnsibleConnectionFailure(f"fastagent fetch_file failed: {e}")
 
@@ -1031,6 +1037,19 @@ class Connection(ConnectionBase):
             os.makedirs(out_dir)
         with open(out_path, "wb") as f:
             f.write(data)
+
+    def _usable_agent_client(self) -> FastAgentClient:
+        """Return the agent client, reconnecting first if its stream broke.
+
+        ansible-core's ensure_connect (run by super().exec_command() and
+        friends) only reconnects when _connected is False, which a broken
+        stream leaves True. Without this, one failed request, such as a
+        loop item interrupted by a dead forwarder, would fail every later
+        request in the same worker with "RPC stream is unusable".
+        """
+        if self._agent_client is None or self._agent_client.broken:
+            self._connect()
+        return self._agent_client
 
     def close(self) -> None:
         # Close the local socket connection. The SSH forwarding session and

@@ -33,8 +33,11 @@ class TestRPCFailures(unittest.TestCase):
             with self.subTest(response=response):
                 output = io.BytesIO()
                 client = FastAgentClient(output, io.BytesIO(response))
+                self.assertFalse(client.broken)
                 with self.assertRaisesRegex(OSError, "outcome unknown"):
                     client.call("Exec", {"argv": ["a-mutation"]})
+                # The connection plugin reconnects when it sees this.
+                self.assertTrue(client.broken)
                 sent = output.getvalue()
                 with self.assertRaisesRegex(OSError, "unusable"):
                     client.call("Exec", {"argv": ["a-mutation"]})
@@ -45,6 +48,7 @@ class TestRPCFailures(unittest.TestCase):
         client = FastAgentClient(io.BytesIO(), io.BytesIO(responses))
         with self.assertRaises(FastAgentError):
             client.call("Exec")
+        self.assertFalse(client.broken)
         self.assertEqual(client.call("Stat"), {"ok": True})
 
     def test_serialization_failure_does_not_poison_stream(self):

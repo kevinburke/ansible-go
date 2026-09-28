@@ -443,6 +443,7 @@ class _RecordingAgentClient:
 
     def __init__(self):
         self.last_kwargs: dict | None = None
+        self.broken = False
 
     def exec(self, **kwargs):
         self.last_kwargs = kwargs
@@ -1001,6 +1002,130 @@ class TestConnectionIsolation(unittest.TestCase):
             conn._connect()
             self.assertEqual(probe.call_count, 2)
             self.assertNotEqual(probe.call_args_list[0].args[0], probe.call_args_list[1].args[0])
+
+
+class _HangUpServer:
+    """Answers Hello, then records requests and optionally hangs up.
+
+    With hang_up=True it closes the stream after reading the first request
+    that follows Hello, without answering, the way a connection looks when
+    its `ssh -L` forwarder is killed mid-request. Otherwise it answers every
+    request. `methods` records each request received after Hello.
+    """
+
+    def __init__(self, server_r, server_w, *, hang_up):
+        self._server_r = server_r
+        self._server_w = server_w
+        self._hang_up = hang_up
+        self.methods = []
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        try:
+            while True:
+                line = self._server_r.readline()
+                if not line:
+                    return
+                req = json.loads(line)
+                if req["method"] == "Hello":
+                    result = {"version": req["params"]["version"], "capabilities": []}
+                else:
+                    self.methods.append((req["method"], req["params"].get("cmd_string")))
+                    if self._hang_up:
+                        self._server_w.close()
+                        return
+                    result = {"rc": 0, "stdout": "ok\n", "stderr": ""}
+                self._server_w.write((json.dumps({"id": req["id"], "result": result}) + "\n").encode())
+                self._server_w.flush()
+        except Exception:
+            pass
+
+    def join(self):
+        self._thread.join(timeout=5)
+
+    def close(self):
+        for f in (self._server_r, self._server_w):
+            try:
+                f.close()
+            except Exception:
+                pass
+
+
+@unittest.skipIf(
+    _FASTAGENT_IMPORT_ERROR is not None,
+    "ansible is required to run connection plugin tests",
+)
+class TestReconnectAfterBrokenStream(unittest.TestCase):
+    """A stream that breaks mid-request must not poison later requests.
+
+    Seen 2026-09-28: the local `ssh -L` forwarder was killed while a ufw
+    loop item was running. That item correctly failed with "execution
+    outcome unknown", but every remaining item of the loop then failed with
+    "RPC stream is unusable after an earlier failure", because the
+    connection kept handing out the broken client. The failed request must
+    still never be replayed; only the next request gets a new stream.
+    """
+
+    def _connection(self):
+        conn = _bare_connection()
+        conn._play_context = _FakePlayContext(None)
+        options = {"host": "serval", "remote_user": "deploy", "port": 22}
+        conn.get_option = lambda key, *a, **kw: options.get(key)
+        servers, sockets = [], []
+        for hang_up in (True, False):
+            client_r, client_w, server_r, server_w = _make_pipe_pair()
+            server = _HangUpServer(server_r, server_w, hang_up=hang_up)
+            self.addCleanup(server.close)
+            sock = _MockSocket(client_r, client_w)
+            self.addCleanup(sock.close)
+            servers.append(server)
+            sockets.append(sock)
+        patches = [
+            mock.patch.object(fastagent_plugin.socket_mod, "socket", side_effect=sockets),
+            mock.patch.object(fastagent_plugin.os.path, "exists", return_value=True),
+            # Reaching setup would mean the probe of the new stream failed.
+            mock.patch.object(conn, "_setup_local_socket", side_effect=AssertionError("setup")),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        conn._connect()
+        return conn, servers
+
+    def test_exec_command_reconnects_without_replaying(self) -> None:
+        conn, (dying, fresh) = self._connection()
+        rc, _, stderr = conn.exec_command("ufw allow 1")
+        self.assertEqual(rc, 1)
+        self.assertIn(b"execution outcome unknown", stderr)
+
+        rc, stdout, stderr = conn.exec_command("ufw allow 2")
+        self.assertEqual((rc, stdout, stderr), (0, b"ok\n", b""))
+        dying.join()
+        self.assertEqual(dying.methods, [("Exec", "ufw allow 1")])
+        self.assertEqual(fresh.methods, [("Exec", "ufw allow 2")])
+
+    def test_connect_replaces_a_broken_client(self) -> None:
+        # Action plugin overrides call _connect() and then use
+        # _agent_client directly, so _connect itself must not return early
+        # while the client is broken.
+        conn, (dying, fresh) = self._connection()
+        broken = conn._agent_client
+        with self.assertRaisesRegex(IOError, "execution outcome unknown"):
+            broken.exec(cmd_string="ufw allow 1")
+        conn._connect()
+        self.assertIsNot(conn._agent_client, broken)
+        self.assertEqual(conn._agent_client.exec(cmd_string="ufw allow 2")["rc"], 0)
+        self.assertEqual(fresh.methods, [("Exec", "ufw allow 2")])
+
+    def test_put_file_reconnects(self) -> None:
+        conn, (dying, fresh) = self._connection()
+        conn.exec_command("ufw allow 1")
+        with tempfile.NamedTemporaryFile() as f:
+            f.write(b"x")
+            f.flush()
+            conn.put_file(f.name, "/tmp/dest")
+        self.assertEqual(fresh.methods, [("WriteFile", None)])
 
 
 @unittest.skipIf(

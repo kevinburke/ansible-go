@@ -29,6 +29,13 @@ All notable changes to fastagent are documented in this file.
 
 ### Bug fixes
 
+- After a request failed mid-stream, for example because the local `ssh -L`
+  forwarder was killed, every later request in the same Ansible worker
+  failed with `RPC stream is unusable after an earlier failure`. That
+  covers the remaining items of a loop and each later connection call
+  within the task. The failed request still fails with `execution outcome
+  unknown` and is never replayed. The next request now opens a new stream,
+  and replaces a dead forwarder or daemon if needed.
 - The agent binary upload ignored `ssh_args`/`ansible_ssh_extra_args`: it
   ran a separate `scp` with only the key and port, so a host reached through
   `-F`, `ProxyJump`, a host alias or custom host key options connected for
