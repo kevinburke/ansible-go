@@ -20,6 +20,21 @@ The user-facing compatibility matrix lives in `docs/compatibility.md`. The test
 suite checks that README and testing docs keep pointing at that matrix and that
 the module summary table does not drift.
 
+### CI dependencies
+
+Buildkite pins ansible-core, goimports, differ, and Staticcheck in
+`.buildkite/pipeline.yml`. CI tests the pinned Ansible release independently of
+the compatibility audit above; updating CI does not redo that audit.
+
+Go and Python are supplied by the Buildkite host. The current ansible-core pin
+requires Python 3.12 or newer. The Python setup script creates a standard-library
+venv and upgrades pip when provisioning it; no separate virtualenv package or
+ansible-lint is used. ansible-galaxy, ansible-doc, and ansible-playbook are
+included in ansible-core.
+
+When updating the pins, run the CI format, lint, test, build, python-test, and
+check-versions commands with the pipeline's environment values.
+
 ### Setup
 
 The fastagent plugins are discovered via `ansible.cfg` in the repo root. If
