@@ -8,11 +8,16 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestStatExistingFile(t *testing.T) {
@@ -727,6 +732,139 @@ func TestFileTouch(t *testing.T) {
 
 	if _, err := os.Stat(path); err != nil {
 		t.Errorf("expected file to exist: %v", err)
+	}
+}
+
+// touchFile runs a state=touch File RPC and returns its result.
+func touchFile(t *testing.T, s *Server, p FileParams) FileResult {
+	t.Helper()
+	p.State = "touch"
+	resp := rpcCall(t, s, "File", p)
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+	resultJSON, err := json.Marshal(resp.Result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result FileResult
+	if err := json.Unmarshal(resultJSON, &result); err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+// fileTimes returns path's access and modification times.
+func fileTimes(t *testing.T, path string) (atime, mtime time.Time) {
+	t.Helper()
+	var st unix.Stat_t
+	if err := unix.Stat(path, &st); err != nil {
+		t.Fatal(err)
+	}
+	return time.Unix(st.Atim.Unix()), time.Unix(st.Mtim.Unix())
+}
+
+// TestFileTouchPreserve covers the "Pre-create log file" pattern:
+// state=touch with access_time and modification_time set to preserve. It
+// must create a missing file, and otherwise leave the times alone and report
+// changed only when owner, group or mode changed, like ansible.builtin.file.
+func TestFileTouchPreserve(t *testing.T) {
+	s := newTestServer()
+	tmp := t.TempDir()
+	old := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
+
+	missing := filepath.Join(tmp, "missing.log")
+	result := touchFile(t, s, FileParams{Path: missing, Mode: "0640", Atime: "preserve", Mtime: "preserve"})
+	if !result.Changed {
+		t.Error("creating a missing file: expected changed=true")
+	}
+	info, err := os.Stat(missing)
+	if err != nil {
+		t.Fatalf("expected file to exist: %v", err)
+	}
+	if info.Mode().Perm() != 0o640 {
+		t.Errorf("mode = %o, want 0640", info.Mode().Perm())
+	}
+
+	existing := filepath.Join(tmp, "existing.log")
+	if err := os.WriteFile(existing, []byte("keep me"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(existing, old, old); err != nil {
+		t.Fatal(err)
+	}
+	result = touchFile(t, s, FileParams{Path: existing, Mode: "0640", Atime: "preserve", Mtime: "preserve"})
+	if result.Changed {
+		t.Error("existing file with matching mode: expected changed=false")
+	}
+	if atime, mtime := fileTimes(t, existing); !atime.Equal(old) || !mtime.Equal(old) {
+		t.Errorf("times = %v, %v; want both %v", atime, mtime, old)
+	}
+	if data, err := os.ReadFile(existing); err != nil || string(data) != "keep me" {
+		t.Errorf("contents = %q, %v; want unchanged", data, err)
+	}
+	// Reading the file above may have bumped its atime (relatime).
+	if err := os.Chtimes(existing, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	result = touchFile(t, s, FileParams{Path: existing, Mode: "0600", Atime: "preserve", Mtime: "preserve"})
+	if !result.Changed {
+		t.Error("existing file with different mode: expected changed=true")
+	}
+	if atime, mtime := fileTimes(t, existing); !atime.Equal(old) || !mtime.Equal(old) {
+		t.Errorf("times after chmod = %v, %v; want both %v", atime, mtime, old)
+	}
+}
+
+func TestFileTouchMixedTimes(t *testing.T) {
+	s := newTestServer()
+	path := filepath.Join(t.TempDir(), "mixed.log")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	result := touchFile(t, s, FileParams{Path: path, Atime: "now", Mtime: "preserve"})
+	if !result.Changed {
+		t.Error("access_time=now: expected changed=true")
+	}
+	atime, mtime := fileTimes(t, path)
+	if !atime.After(old) {
+		t.Errorf("atime = %v, want updated past %v", atime, old)
+	}
+	if !mtime.Equal(old) {
+		t.Errorf("mtime = %v, want preserved %v", mtime, old)
+	}
+
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	// Empty is "now" for both, for controllers that do not send the times.
+	result = touchFile(t, s, FileParams{Path: path})
+	if !result.Changed {
+		t.Error("default times: expected changed=true")
+	}
+	if atime, mtime := fileTimes(t, path); !atime.After(old) || !mtime.After(old) {
+		t.Errorf("times = %v, %v; want both updated past %v", atime, mtime, old)
+	}
+}
+
+func TestFileTouchRejectsExplicitTime(t *testing.T) {
+	s := newTestServer()
+	path := filepath.Join(t.TempDir(), "explicit.log")
+	resp := rpcCall(t, s, "File", FileParams{Path: path, State: "touch", Mtime: "202001020304.05"})
+	if resp.Error == nil {
+		t.Fatal("expected an error for an explicit modification time")
+	}
+	if !strings.Contains(resp.Error.Message, "unsupported mtime") {
+		t.Errorf("error = %q, want it to mention the unsupported mtime", resp.Error.Message)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("rejected touch must not create the file: stat err = %v", err)
 	}
 }
 

@@ -358,8 +358,10 @@ type FileParams struct {
 	Recurse bool   `json:"recurse,omitempty"`
 	Follow  bool   `json:"follow,omitempty"`
 	Src     string `json:"src,omitempty"` // for link/hard
-	Mtime   string `json:"mtime,omitempty"`
-	Atime   string `json:"atime,omitempty"`
+	// Mtime and Atime are "now" or "preserve", and are only used by
+	// state=touch. Empty means "now", ansible's default for touch.
+	Mtime string `json:"mtime,omitempty"`
+	Atime string `json:"atime,omitempty"`
 }
 
 // FileResult is the result of a file state operation.

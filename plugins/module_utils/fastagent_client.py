@@ -346,8 +346,14 @@ class FastAgentClient:
         recurse: bool = False,
         follow: bool = True,
         src: str | None = None,
+        mtime: str | None = None,
+        atime: str | None = None,
     ) -> dict:
-        """Manage file/directory/link state."""
+        """Manage file/directory/link state.
+
+        mtime and atime are "now" or "preserve" and only apply to
+        state=touch; the agent treats None as "now".
+        """
         params: dict = {"path": path, "state": state}
         if owner is not None:
             params["owner"] = owner
@@ -361,6 +367,10 @@ class FastAgentClient:
             params["follow"] = False
         if src is not None:
             params["src"] = src
+        if mtime is not None:
+            params["mtime"] = mtime
+        if atime is not None:
+            params["atime"] = atime
         return self.call("File", params)
 
     def package(

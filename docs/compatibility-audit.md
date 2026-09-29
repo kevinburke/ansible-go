@@ -101,12 +101,18 @@ source comparison.
 ### file
 
 - The file fast path now falls back to `ansible.builtin.file` before connecting
-  to the agent for symbolic modes, explicit access/modification time controls,
-  `follow=false` attribute operations, and `state=link`/`state=hard` semantics.
-  Those cases still need parity coverage before they can be accelerated.
-- `state=touch` always changes timestamps for existing files and does not
-  implement Ansible's time formatting knobs unless the user sets explicit time
-  options, in which case it falls back to `ansible.builtin.file`.
+  to the agent for symbolic modes, explicit access/modification timestamps,
+  `access_time`/`modification_time` set to `now` outside `state=touch`,
+  `follow=false` attribute operations, and `state=link`/`state=hard`
+  semantics. Those cases still need parity coverage before they can be
+  accelerated.
+- `state=touch` applies `access_time`/`modification_time` keywords in the
+  agent: `now` (the default) updates that time and reports changed; `preserve`
+  keeps it. With both preserved, an existing file reports changed only when
+  owner, group or mode change, in normal and check mode.
+  `tests/test_file_touch_differential.py` compares these cases with
+  `ansible.builtin.file`. `*_time_format` is ignored for the keywords, as
+  stock ignores it.
 - `state=absent` returns a minimal result and does not expose the same
   `path_contents`/diff behavior stock Ansible can produce.
 

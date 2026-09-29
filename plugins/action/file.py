@@ -14,15 +14,19 @@ from ansible.utils.vars import merge_hash
 
 try:
     from ansible_collections.kevinburke.fastagent.plugins.module_utils.file_state import (
+        attributes_differ,
         format_octal_mode,
         infer_file_state,
         requires_builtin_file,
+        touch_preserves_times,
     )
 except ImportError:
     from plugins.module_utils.file_state import (
+        attributes_differ,
         format_octal_mode,
         infer_file_state,
         requires_builtin_file,
+        touch_preserves_times,
     )
 
 
@@ -166,12 +170,25 @@ class ActionModule(ActionBase):
                 result["msg"] = f"fastagent file directory failed: {e}"
             return result
 
-        # For state=touch.
+        # For state=touch. Stock always reports changed when it sets a time
+        # to "now" (the default); with both times preserved, an existing
+        # file changes only if its owner, group or mode does.
         if state == "touch":
             if check_mode:
-                result["changed"] = True
                 result["path"] = path
                 result["state"] = "file"
+                if not touch_preserves_times(args):
+                    result["changed"] = True
+                    return result
+                try:
+                    stat_result = client.stat(path, follow=follow, checksum=False)
+                except Exception as e:
+                    result["failed"] = True
+                    result["msg"] = f"fastagent stat failed: {e}"
+                    return result
+                result["changed"] = not stat_result.get("exists") or attributes_differ(
+                    stat_result, owner, group, format_octal_mode(mode)
+                )
                 return result
 
             try:
@@ -181,6 +198,8 @@ class ActionModule(ActionBase):
                     owner=owner,
                     group=group,
                     mode=format_octal_mode(mode),
+                    mtime=modification_time,
+                    atime=access_time,
                 )
                 result.update(file_result)
                 result["path"] = path

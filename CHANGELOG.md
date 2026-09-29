@@ -4,6 +4,19 @@ All notable changes to fastagent are documented in this file.
 
 ## Unreleased
 
+### Changes
+
+- `file` with `state=touch` and `access_time`/`modification_time` set to
+  `preserve` or `now` now runs on the fast path instead of falling back to
+  `ansible.builtin.file`. This is the common "pre-create a log file" pattern:
+  create the file if it is missing, set owner/group/mode, and leave the
+  timestamps of an existing file alone. As in stock, an existing file with
+  both times preserved reports changed only when its owner, group or mode
+  change, including in check mode. `preserve` on other states also runs on the
+  fast path, since those states never change timestamps. Explicit timestamps,
+  and `now` outside `state=touch`, still fall back. The agent rejects time
+  values other than `now` and `preserve` instead of ignoring them.
+
 ## 0.10.0 — September 28, 2026
 
 ### Changes

@@ -643,21 +643,50 @@ func (s *Server) handleFileLink(p FileParams) (any, error) {
 	return FileResult{Changed: changed, Path: p.Path, State: p.State}, nil
 }
 
+// touchTimePreserved reports whether a state=touch time argument
+// (access_time or modification_time) asks to keep the file's current time.
+// Only ansible's keywords are accepted: "now" (the default for touch, sent
+// as "" by older controllers) and "preserve". The action plugin falls back to
+// ansible.builtin.file for explicit timestamps, so anything else is a
+// controller bug and fails loudly instead of silently bumping the time.
+func touchTimePreserved(name, value string) (bool, error) {
+	switch value {
+	case "", "now":
+		return false, nil
+	case "preserve":
+		return true, nil
+	default:
+		return false, fmt.Errorf("unsupported %s %q for state=touch: want \"now\" or \"preserve\"", name, value)
+	}
+}
+
+// handleFileTouch matches ansible.builtin.file's state=touch: create the
+// file if it is missing, apply owner/group/mode, then update the access and
+// modification times unless they are "preserve". Setting a time to "now"
+// always reports changed, as stock does; with both times preserved, an
+// existing file reports changed only when its owner, group or mode changed.
 func (s *Server) handleFileTouch(p FileParams) (any, error) {
+	preserveAtime, err := touchTimePreserved("atime", p.Atime)
+	if err != nil {
+		return nil, err
+	}
+	preserveMtime, err := touchTimePreserved("mtime", p.Mtime)
+	if err != nil {
+		return nil, err
+	}
+
 	changed := false
-	if _, err := os.Stat(p.Path); os.IsNotExist(err) {
+	if _, err := os.Stat(p.Path); errors.Is(err, fs.ErrNotExist) {
 		f, err := os.Create(p.Path)
 		if err != nil {
 			return nil, fmt.Errorf("touch %s: %w", p.Path, err)
 		}
-		f.Close()
-		changed = true
-	} else {
-		now := time.Now()
-		if err := os.Chtimes(p.Path, now, now); err != nil {
+		if err := f.Close(); err != nil {
 			return nil, fmt.Errorf("touch %s: %w", p.Path, err)
 		}
 		changed = true
+	} else if err != nil {
+		return nil, fmt.Errorf("stat %s: %w", p.Path, err)
 	}
 
 	ch, err := applyOwnershipAndMode(p.Path, p.Owner, p.Group, p.Mode)
@@ -665,6 +694,22 @@ func (s *Server) handleFileTouch(p FileParams) (any, error) {
 		return nil, err
 	}
 	changed = changed || ch
+
+	if !preserveAtime || !preserveMtime {
+		// A zero time.Time leaves that timestamp unchanged.
+		var atime, mtime time.Time
+		now := time.Now()
+		if !preserveAtime {
+			atime = now
+		}
+		if !preserveMtime {
+			mtime = now
+		}
+		if err := os.Chtimes(p.Path, atime, mtime); err != nil {
+			return nil, fmt.Errorf("touch %s: %w", p.Path, err)
+		}
+		changed = true
+	}
 
 	return FileResult{Changed: changed, Path: p.Path, State: "file"}, nil
 }
