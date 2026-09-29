@@ -161,6 +161,9 @@ func RunDaemon(socketPath string, allowUser string, idleTimeout time.Duration, l
 		"idle_timeout", idleTimeout.String())
 	fmt.Println(socketPath)
 
+	// Shared by every connection: the controller sends the second copy of a
+	// request on a new connection.
+	tokens := NewOnceTokens()
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -186,7 +189,7 @@ func RunDaemon(socketPath string, allowUser string, idleTimeout time.Duration, l
 				mu.Unlock()
 				logger.Debug("connection closed", "active", activeConns.Load())
 			}()
-			s := &Server{Logger: logger}
+			s := &Server{Logger: logger, Tokens: tokens}
 			if err := s.Serve(conn, conn); err != nil {
 				logger.Error("connection serve error", "error", err)
 			}

@@ -269,6 +269,25 @@ class TestTryLocalSocket(unittest.TestCase):
             result = conn._agent_client.call("Exec", {})
             self.assertEqual(result, {"ok": True})
 
+    def test_deferred_hello_keeps_probe_timeout_until_answered(self) -> None:
+        # The fast path sends the Hello with the first request, so the probe
+        # timeout must cover the Hello's answer and then be cleared before
+        # the request's answer, which can take longer than 2s.
+        client_r, client_w, server_r, server_w = _make_pipe_pair()
+        server = _PipeEchoServer(delay_s=2.2, server_r=server_r, server_w=server_w)
+        self.addCleanup(server.close)
+        mock_sock = _MockSocket(client_r, client_w)
+        self.addCleanup(mock_sock.close)
+
+        conn = _bare_connection()
+        with mock.patch.object(fastagent_plugin.socket_mod, "socket", return_value=mock_sock), \
+             mock.patch.object(fastagent_plugin.os.path, "exists", return_value=True):
+            self.assertTrue(conn._try_local_socket("/fake/socket.sock", "test-host", verify=False))
+        self.assertTrue(conn._connected)
+        self.assertEqual(conn._socket.gettimeout(), 2)
+        self.assertEqual(conn._agent_client.call("Exec", {}), {"ok": True})
+        self.assertIsNone(conn._socket.gettimeout())
+
     def test_missing_socket_file_returns_false(self) -> None:
         conn = _bare_connection()
         missing = os.path.join(tempfile.gettempdir(), "fastagent-nonexistent.sock")
@@ -1010,7 +1029,7 @@ class TestConnectionIsolation(unittest.TestCase):
         conn = _bare_connection()
         options = {"host": "serval", "remote_user": "deploy", "port": 22}
         conn.get_option = lambda key, *a, **kw: options.get(key)
-        def connected(*args):
+        def connected(*args, **kwargs):
             conn._connected = True
             return True
         with mock.patch.object(conn, "_try_local_socket", side_effect=connected) as probe:
@@ -1145,6 +1164,92 @@ class TestReconnectAfterBrokenStream(unittest.TestCase):
             f.flush()
             conn.put_file(f.name, "/tmp/dest")
         self.assertEqual(fresh.methods, [("WriteFile", None)])
+
+
+@unittest.skipIf(
+    _FASTAGENT_IMPORT_ERROR is not None,
+    "ansible is required to run connection plugin tests",
+)
+class TestDeferredHello(unittest.TestCase):
+    """The fast path sends Hello with the task's first request.
+
+    A stale local socket (the daemon idle-timed out, or the host rebooted)
+    used to be caught by a Hello at connect time, before any request went
+    out. Now it is caught by the first request's Hello, and the connection
+    must still set up a new daemon and forwarder and run the request there.
+    """
+
+    def _connection(self, first_server_cls):
+        conn = _bare_connection()
+        conn._play_context = _FakePlayContext(None)
+        options = {"host": "serval", "remote_user": "deploy", "port": 22}
+        conn.get_option = lambda key, *a, **kw: options.get(key)
+
+        client_r, client_w, server_r, server_w = _make_pipe_pair()
+        first = first_server_cls(server_r, server_w)
+        self.addCleanup(first.close)
+        first_sock = _MockSocket(client_r, client_w)
+        self.addCleanup(first_sock.close)
+
+        client_r, client_w, server_r, server_w = _make_pipe_pair()
+        fresh = _HangUpServer(server_r, server_w, hang_up=False)
+        self.addCleanup(fresh.close)
+        fresh_sock = _MockSocket(client_r, client_w)
+        self.addCleanup(fresh_sock.close)
+
+        setups = []
+
+        def setup(*args):
+            # What _setup_local_socket leaves behind once a new
+            # forwarder answers a Hello.
+            setups.append(args)
+            self.assertTrue(conn._try_local_socket(args[3], args[0]))
+
+        patches = [
+            mock.patch.object(fastagent_plugin.socket_mod, "socket",
+                              side_effect=[first_sock, fresh_sock]),
+            mock.patch.object(fastagent_plugin.os.path, "exists", return_value=True),
+            mock.patch.object(conn, "_setup_local_socket", side_effect=setup),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        conn._connect()
+        self.assertEqual(setups, [], "the fast path must not probe before the first request")
+        return conn, first, fresh, setups
+
+    def test_stale_socket_runs_first_request_on_new_connection(self) -> None:
+        conn, _, fresh, setups = self._connection(_SilentServer)
+        client = conn._agent_client
+        rc, stdout, stderr = conn.exec_command("ufw allow 1")
+        self.assertEqual((rc, stdout, stderr), (0, b"ok\n", b""))
+        self.assertEqual(len(setups), 1)
+        self.assertEqual(fresh.methods, [("Exec", "ufw allow 1")])
+        # Action plugins hold the client object across calls.
+        self.assertIs(conn._agent_client, client)
+        self.assertFalse(client.broken)
+        self.assertEqual(client.exec(cmd_string="ufw allow 2")["rc"], 0)
+        self.assertEqual(fresh.methods, [("Exec", "ufw allow 1"), ("Exec", "ufw allow 2")])
+
+    def test_live_socket_needs_no_setup(self) -> None:
+        def answering(server_r, server_w):
+            return _HangUpServer(server_r, server_w, hang_up=False)
+
+        conn, first, fresh, setups = self._connection(answering)
+        rc, stdout, _ = conn.exec_command("ufw allow 1")
+        self.assertEqual((rc, stdout), (0, b"ok\n"))
+        self.assertEqual(setups, [])
+        self.assertEqual(first.methods, [("Exec", "ufw allow 1")])
+        self.assertEqual(fresh.methods, [])
+
+    def test_failed_setup_reports_outcome_unknown(self) -> None:
+        conn, _, _, _ = self._connection(_SilentServer)
+        conn._setup_local_socket.side_effect = fastagent_plugin.AnsibleConnectionFailure("no route")
+        rc, _, stderr = conn.exec_command("ufw allow 1")
+        self.assertEqual(rc, 1)
+        self.assertIn(b"execution outcome unknown", stderr)
+        self.assertIn(b"no route", stderr)
+        self.assertTrue(conn._agent_client.broken)
 
 
 @unittest.skipIf(

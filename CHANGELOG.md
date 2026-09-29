@@ -6,6 +6,22 @@ All notable changes to fastagent are documented in this file.
 
 ### Changes
 
+- Each task saves a round trip. Ansible opens a new connection to the local
+  forwarding socket for every task, and the connection sent a Hello and
+  waited for its answer before the task's first request. It now sends the
+  Hello in the same write as that request and reads the two answers in
+  order. A stale socket is still caught by the Hello, and the connection then
+  sets up a new daemon and forwarder and sends the request again. The request
+  carries a random `once` token, and a daemon runs a given token at most once
+  across all its connections, so a request that did arrive on the old
+  connection is refused rather than run twice, and the task fails with an
+  unknown execution outcome. The daemon also refuses every request on a
+  connection after a Hello that names another version, since the controller
+  sends its first request before it has checked the version. A first request
+  larger than 1 MiB still waits for the Hello's answer. The protocol change
+  needs a version bump before release: the socket path includes the version,
+  and a daemon from before this change would ignore the token.
+
 - `command`/`shell` tasks with a non-root `become_user` now see their
   `environment:`. The agent had set the variables on the `sudo` process, and
   sudo's `env_reset` dropped them before the command ran, silently. For

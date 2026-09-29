@@ -15,6 +15,7 @@ import (
 func newTestServer() *Server {
 	return &Server{
 		Logger: slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
+		Tokens: NewOnceTokens(),
 	}
 }
 

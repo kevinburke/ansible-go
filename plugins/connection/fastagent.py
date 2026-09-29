@@ -412,6 +412,9 @@ class Connection(ConnectionBase):
         # isn't a reliable source here.
         self._use_become: bool = False
         self._socket_identity: str | None = None
+        # Arguments to _setup_local_socket for the current identity, kept
+        # for _recover_deferred_hello.
+        self._setup_args: tuple | None = None
 
     def set_become_plugin(self, plugin) -> None:
         """Attach Ansible's sudo plugin without its command wrap.
@@ -547,17 +550,48 @@ class Connection(ConnectionBase):
             # warning once per run.
             display.warning(f"fastagent: using development build {AGENT_VERSION}")
 
+        self._setup_args = (host, user, port, local_socket, remote_socket, wrap_with_sudo)
+
         # Fast path: try connecting to the local forwarding socket directly.
-        # This is a local Unix socket connect (~1ms), no SSH involved.
-        if self._try_local_socket(local_socket, host):
+        # This is a local Unix socket connect (~1ms), no SSH involved. The
+        # Hello that proves the daemon is live goes out with the task's
+        # first request instead of costing a round trip of its own; if it
+        # fails, _recover_deferred_hello runs the setup below then.
+        if self._try_local_socket(local_socket, host, verify=False):
             return self
 
         display.vvv(f"FASTAGENT: local socket not available, setting up", host=host)
 
-        self._setup_local_socket(
-            host, user, port, local_socket, remote_socket, wrap_with_sudo,
-        )
+        self._setup_local_socket(*self._setup_args)
         return self
+
+    def _recover_deferred_hello(self):
+        """Reconnect after the fast path's deferred Hello failed.
+
+        Called by FastAgentClient (see defer_hello) from inside the task's
+        first request, with the Hello and maybe that request already sent
+        on the old socket. Runs the setup the fast path skipped, which
+        bootstraps the daemon or forwarder if needed and proves the new
+        connection with a Hello of its own, and returns the new
+        connection's streams for the client to adopt. The client object
+        stays the same because action plugins hold a reference to it.
+        """
+        client = self._agent_client
+        host = self._setup_args[0]
+        display.vvv("FASTAGENT: deferred Hello failed, setting up", host=host)
+        if self._socket is not None:
+            try:
+                self._socket.close()
+            except Exception:
+                pass
+        self._socket = None
+        self._connected = False
+        try:
+            self._setup_local_socket(*self._setup_args)
+            streams = self._agent_client.streams()
+        finally:
+            self._agent_client = client
+        return streams
 
     @contextlib.contextmanager
     def _local_socket_setup_lock(self, local_socket: str, host: str):
@@ -668,7 +702,7 @@ class Connection(ConnectionBase):
                 f"fastagent: failed to connect to local forwarding socket {local_socket}"
             )
 
-    def _try_local_socket(self, local_socket: str, host: str) -> bool:
+    def _try_local_socket(self, local_socket: str, host: str, verify: bool = True) -> bool:
         """Try connecting to the local forwarding socket and probe the daemon.
 
         A stale SSH -L forwarder pointing at a dead remote socket will accept
@@ -678,6 +712,12 @@ class Connection(ConnectionBase):
         (including version mismatch) we tear down the socket so the caller
         falls through to bootstrap. The daemon's startup lock protects its
         stale-socket cleanup; the controller never kills a remote daemon.
+
+        With verify=False only the connect happens here: the client sends
+        the Hello with the first request (FastAgentClient.defer_hello), and
+        a failed Hello runs the fallthrough then, via
+        _recover_deferred_hello. The probe timeout stays on the socket
+        until the Hello is answered.
         """
         if not os.path.exists(local_socket):
             return False
@@ -692,9 +732,17 @@ class Connection(ConnectionBase):
             sock.settimeout(2)
             sock.connect(local_socket)
             client = FastAgentClient(sock.makefile("wb"), sock.makefile("rb"))
-            client.hello(AGENT_VERSION)
-            sock.settimeout(None)
-            display.vvv(f"FASTAGENT: connected via local socket", host=host)
+            if verify:
+                client.hello(AGENT_VERSION)
+                sock.settimeout(None)
+                display.vvv(f"FASTAGENT: connected via local socket", host=host)
+            else:
+                client.defer_hello(
+                    AGENT_VERSION,
+                    on_verified=lambda: sock.settimeout(None),
+                    recover=self._recover_deferred_hello,
+                )
+                display.vvv(f"FASTAGENT: connected via local socket, Hello deferred", host=host)
             self._socket = sock
             self._agent_client = client
             self._connected = True

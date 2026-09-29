@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import threading
 import time as _time
 
@@ -47,6 +48,18 @@ def _trace(method: str, duration_ns: int, hint: str) -> None:
     except OSError:
         # Never let tracing break the deploy.
         pass
+
+
+# The agent refused a request whose once token it had already received,
+# without running it (ErrCodeDuplicate in fastagent.go).
+ERR_CODE_DUPLICATE = -32002
+
+# A deferred Hello goes out in the same write as the first request only when
+# that request's line is at most this long. The probe timeout covers the
+# write, and a line this size fits in the local socket and ssh buffers, so
+# the write never waits on the network. A longer request waits for the Hello
+# answer before it is sent.
+PIPELINE_MAX_BYTES = 1 << 20
 
 
 # Set on the become wrapper the fastagent connection attaches for a method
@@ -101,6 +114,9 @@ class FastAgentClient:
 
     Communicates over the stdin/stdout of a subprocess. Thread-safe via a lock
     on the request ID counter and I/O.
+
+    See defer_hello for the handshake the connection plugin uses on its fast
+    path, which saves a round trip per task.
     """
 
     def __init__(self, stdin, stdout):
@@ -115,6 +131,39 @@ class FastAgentClient:
         self._next_id = 1
         self._lock = threading.Lock()
         self._broken = False
+        # Set by defer_hello until the first call sends the Hello.
+        self._deferred_hello: str | None = None
+        self._on_verified = None
+        self._recover = None
+
+    def defer_hello(self, version: str, on_verified, recover) -> None:
+        """Send the Hello handshake with the first request, not on its own.
+
+        The Hello goes out in the same write as the first request, which
+        carries a random "once" token, and the client reads the Hello's
+        answer before the request's. This saves the Hello's round trip,
+        which Ansible pays once per task because each task opens a new
+        connection.
+
+        on_verified() runs once a matching Hello answer arrives, before the
+        request's answer is read; the connection plugin clears the probe
+        timeout there. If the Hello gets no valid answer, or a version
+        mismatch, recover() must set up a new connection whose daemon has
+        answered a Hello, and return that connection's (stdin, stdout). The
+        client sends the request again on it, with the same token. Nothing
+        about the first connection says whether its copy of the request
+        arrived: a stale socket delivers nothing, but a connection lost in
+        flight may deliver it, now or later. The daemon runs a token at
+        most once, so the second copy runs only if the first did not, and
+        otherwise fails loudly as a duplicate.
+        """
+        self._deferred_hello = version
+        self._on_verified = on_verified
+        self._recover = recover
+
+    def streams(self):
+        """Return the (stdin, stdout) pair this client talks over."""
+        return self._stdin, self._stdout
 
     @property
     def broken(self) -> bool:
@@ -148,42 +197,138 @@ class FastAgentClient:
                 "method": method,
                 "params": params or {},
             }
+            if self._deferred_hello is not None:
+                return self._call_with_hello(request)
 
-            start_ns = _time.monotonic_ns() if _TRACE_PATH else 0
-            line = (json.dumps(request, separators=(",", ":")) + "\n").encode("utf-8")
+            line = self._encode(request)
             if self._broken:
                 raise IOError("fastagent: RPC stream is unusable after an earlier failure")
-            try:
+            return self._roundtrip(request, line)
+
+    @staticmethod
+    def _encode(request: dict) -> bytes:
+        return (json.dumps(request, separators=(",", ":")) + "\n").encode("utf-8")
+
+    def _roundtrip(self, request: dict, line: bytes, write: bool = True) -> dict:
+        """Send line (unless write is False) and read request's answer.
+
+        Any failure marks the stream broken: it may hold a late answer.
+        """
+        method = request["method"]
+        start_ns = _time.monotonic_ns() if _TRACE_PATH else 0
+        try:
+            if write:
                 self._stdin.write(line)
                 self._stdin.flush()
-                response_line = self._stdout.readline()
-                if not response_line:
-                    raise IOError("no response (agent process may have exited)")
-                response = json.loads(response_line)
-                if not isinstance(response, dict) or type(response.get("id")) is not int or response["id"] != req_id:
-                    raise IOError("response id mismatch or invalid response")
-                if response.get("error") is not None and (
-                    not isinstance(response["error"], dict)
-                    or type(response["error"].get("code")) is not int
-                    or not isinstance(response["error"].get("message"), str)
-                ):
-                    raise IOError("invalid agent error response")
-                if response.get("error") is None and not isinstance(response.get("result"), dict):
-                    raise IOError("missing or invalid agent result")
-            except BaseException as exc:
-                self._broken = True
-                if not isinstance(exc, Exception):
-                    raise
-                raise IOError(f"fastagent: execution outcome unknown; request was not replayed: {exc}") from exc
-            finally:
-                if _TRACE_PATH:
-                    _trace(method, _time.monotonic_ns() - start_ns, _trace_hint(method, params))
+            response = self._read_response(request["id"])
+        except BaseException as exc:
+            self._broken = True
+            if not isinstance(exc, Exception):
+                raise
+            raise IOError(f"fastagent: execution outcome unknown; request was not replayed: {exc}") from exc
+        finally:
+            if _TRACE_PATH:
+                _trace(method, _time.monotonic_ns() - start_ns, _trace_hint(method, request["params"]))
 
-            if "error" in response and response["error"] is not None:
-                err = response["error"]
-                raise FastAgentError(err.get("code", 1), err.get("message", "unknown error"))
+        if "error" in response and response["error"] is not None:
+            err = response["error"]
+            raise FastAgentError(err.get("code", 1), err.get("message", "unknown error"))
 
-            return response.get("result", {})
+        return response.get("result", {})
+
+    def _read_response(self, req_id: int) -> dict:
+        response_line = self._stdout.readline()
+        if not response_line:
+            raise IOError("no response (agent process may have exited)")
+        response = json.loads(response_line)
+        if not isinstance(response, dict) or type(response.get("id")) is not int or response["id"] != req_id:
+            raise IOError("response id mismatch or invalid response")
+        if response.get("error") is not None and (
+            not isinstance(response["error"], dict)
+            or type(response["error"].get("code")) is not int
+            or not isinstance(response["error"].get("message"), str)
+        ):
+            raise IOError("invalid agent error response")
+        if response.get("error") is None and not isinstance(response.get("result"), dict):
+            raise IOError("missing or invalid agent result")
+        return response
+
+    def _call_with_hello(self, request: dict) -> dict:
+        """Send the deferred Hello and request together; see defer_hello."""
+        version = self._deferred_hello
+        on_verified, recover = self._on_verified, self._recover
+
+        # The Hello takes the request's id and the request the next one, so
+        # the ids on the stream still increase in the order sent.
+        hello = {"id": request["id"], "method": "Hello", "params": {"version": version}}
+        request["id"] = self._next_id
+        self._next_id += 1
+        request["once"] = secrets.token_hex(16)
+        # Encode before giving up the deferred Hello: params that do not
+        # serialize fail here with nothing sent, and the next call must
+        # still send the Hello.
+        line = self._encode(request)
+        pipelined = len(line) <= PIPELINE_MAX_BYTES
+        self._deferred_hello = self._on_verified = self._recover = None
+
+        start_ns = _time.monotonic_ns() if _TRACE_PATH else 0
+        try:
+            self._stdin.write(self._encode(hello) + (line if pipelined else b""))
+            self._stdin.flush()
+            response = self._read_response(hello["id"])
+            if response.get("error") is not None:
+                raise IOError(f"Hello failed: {response['error'].get('message')}")
+            daemon_version = response["result"].get("version", "")
+            if daemon_version != version:
+                raise FastAgentVersionMismatch(version, daemon_version)
+        except Exception as exc:
+            if not pipelined:
+                # Nothing but the Hello was sent; this is the old
+                # connect-time probe failing.
+                self._recover_stream(recover, exc, sent_request=False)
+                return self._roundtrip(request, line)
+            self._recover_stream(recover, exc, sent_request=True)
+            # A second copy of the request. The daemon runs it only if
+            # the first copy never arrived.
+            try:
+                return self._roundtrip(request, line)
+            except FastAgentError as err:
+                if err.code == ERR_CODE_DUPLICATE:
+                    raise IOError(
+                        f"fastagent: execution outcome unknown; the connection "
+                        f"failed ({exc}) after the request was sent, and the "
+                        f"agent received that copy, so it was not run again: "
+                        f"{err.message}"
+                    ) from err
+                raise
+        except BaseException:
+            self._broken = True
+            raise
+        finally:
+            if _TRACE_PATH:
+                _trace("Hello", _time.monotonic_ns() - start_ns, "deferred")
+
+        if on_verified is not None:
+            on_verified()
+        return self._roundtrip(request, line, write=not pipelined)
+
+    def _recover_stream(self, recover, exc: Exception, sent_request: bool) -> None:
+        """Replace the stream after a deferred Hello failed; see defer_hello."""
+        if recover is None:
+            self._broken = True
+            raise IOError(f"fastagent: Hello failed and no reconnect is available: {exc}") from exc
+        try:
+            self._stdin, self._stdout = recover()
+        except Exception as rexc:
+            self._broken = True
+            if sent_request:
+                raise IOError(
+                    f"fastagent: execution outcome unknown; request was not "
+                    f"replayed: the connection failed ({exc}) after the "
+                    f"request was sent, and reconnecting failed: {rexc}"
+                ) from rexc
+            raise
+        self._broken = False
 
     def hello(self, version: str = "0.1.0") -> dict:
         """Send Hello handshake and verify the daemon's version matches.

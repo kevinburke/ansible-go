@@ -12,11 +12,31 @@ import (
 const Version = "0.10.1"
 
 // Request is a JSON-RPC request from the controller.
+//
+// Once, if set, is a token unique to one logical request. The agent runs a
+// request with a given token at most once per daemon (see OnceTokens). The
+// controller sets it on the request it sends in the same write as a
+// connection's Hello, because that is the one request it may have to send
+// again on a new connection: when the Hello goes unanswered it cannot tell a
+// stale socket, where nothing arrived, from a lost connection, where the
+// request may arrive or already have run.
 type Request struct {
 	ID     int64           `json:"id"`
 	Method string          `json:"method"`
 	Params json.RawMessage `json:"params"`
+	Once   string          `json:"once,omitempty"`
 }
+
+// Error codes the agent returns in ErrorInfo.Code besides a handler's 1 and
+// the JSON-RPC parse (-32700) and unknown method (-32601) codes. In both of
+// these the agent did not run the request.
+const (
+	// ErrCodeDuplicate: the request's Once token was already received.
+	ErrCodeDuplicate = -32002
+	// ErrCodeVersionMismatch: an earlier Hello on this connection named a
+	// different version, so the agent refuses the connection's requests.
+	ErrCodeVersionMismatch = -32003
+)
 
 // Response is a JSON-RPC response to the controller.
 type Response struct {

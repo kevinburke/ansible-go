@@ -391,6 +391,16 @@ If an RPC response is lost or malformed, fastagent reports an unknown execution
 outcome and stops using that stream. It does not retry the submitted operation;
 check the remote state before retrying a mutation yourself.
 
+There is one exception. Each Ansible task opens a new connection to the local
+socket, and the Hello that proves the daemon is live goes out in the same
+write as the task's first request, which saves a round trip per task. If that
+Hello gets no answer, the socket may be stale (the daemon idle-timed out, or
+the host rebooted), and the connection sets up a new daemon and forwarder and
+sends the request again. The request carries a random token, and a daemon runs
+a given token at most once, so if the first copy did arrive, the second is
+refused and the task fails with an unknown execution outcome. A daemon also
+refuses every request on a connection whose Hello named another version.
+
 ## Updating
 
 ```bash
@@ -400,7 +410,8 @@ ansible-galaxy collection install --upgrade -r requirements.yml
 Daemon socket names are versioned. After an upgrade the connection plugin
 uploads the matching binary if needed and uses a separate daemon socket.
 Older daemons expire when idle; bootstrap does not terminate them. Every new
-connection verifies the remote version with Hello before running tasks.
+connection verifies the remote version with Hello, and the daemon runs nothing
+on a connection whose Hello named another version.
 
 ## Disabling fastagent
 

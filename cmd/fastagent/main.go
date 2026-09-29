@@ -50,7 +50,7 @@ func main() {
 
 	switch {
 	case *serve:
-		s := &fastagent.Server{Logger: logger}
+		s := &fastagent.Server{Logger: logger, Tokens: fastagent.NewOnceTokens()}
 		if err := s.Serve(os.Stdin, os.Stdout); err != nil {
 			logger.Error("serve failed", "error", err)
 			os.Exit(1)

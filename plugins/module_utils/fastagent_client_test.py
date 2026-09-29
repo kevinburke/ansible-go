@@ -8,11 +8,14 @@ import base64
 import io
 import json
 import os
+import socket
 import subprocess
 import tempfile
+import time
 import unittest
 
 from fastagent_client import (
+    PIPELINE_MAX_BYTES,
     FastAgentClient,
     FastAgentError,
     FastAgentVersionMismatch,
@@ -58,6 +61,122 @@ class TestRPCFailures(unittest.TestCase):
             client.call("Exec", {"bad": object()})
         self.assertEqual(output.getvalue(), b"")
         self.assertEqual(client.call("Stat"), {})
+
+
+class _RecordingWriter(io.BytesIO):
+    """Records each flushed write, to check what went out together."""
+
+    def __init__(self):
+        super().__init__()
+        self.flushes = []
+        self._pending = b""
+
+    def write(self, data):
+        self._pending += data
+        return super().write(data)
+
+    def flush(self):
+        self.flushes.append(self._pending)
+        self._pending = b""
+
+
+def _lines(data: bytes) -> list[dict]:
+    return [json.loads(line) for line in data.splitlines()]
+
+
+def _answers(*responses: dict) -> io.BytesIO:
+    return io.BytesIO(b"".join((json.dumps(r) + "\n").encode() for r in responses))
+
+
+class TestDeferredHelloScripted(unittest.TestCase):
+    def test_hello_goes_out_with_the_first_request(self):
+        events = []
+        output = _RecordingWriter()
+        answers = _answers(
+            {"id": 1, "result": {"version": "1.2.3", "capabilities": []}},
+            {"id": 2, "result": {"rc": 0}},
+            {"id": 3, "result": {"rc": 0}},
+        )
+
+        class Reader:
+            def readline(self):
+                events.append("read")
+                return answers.readline()
+
+        client = FastAgentClient(output, Reader())
+        client.defer_hello("1.2.3", on_verified=lambda: events.append("verified"),
+                           recover=lambda: self.fail("recover called"))
+        self.assertEqual(output.flushes, [])
+        self.assertEqual(client.call("Exec", {"argv": ["true"]}), {"rc": 0})
+        # One write, Hello first, and the timeout clears between the
+        # Hello's answer and the request's.
+        self.assertEqual(len(output.flushes), 1)
+        hello, request = _lines(output.flushes[0])
+        self.assertEqual((hello["id"], hello["method"], hello["params"]), (1, "Hello", {"version": "1.2.3"}))
+        self.assertEqual((request["id"], request["method"]), (2, "Exec"))
+        self.assertEqual(len(request["once"]), 32)
+        self.assertEqual(events, ["read", "verified", "read"])
+        # Later requests go alone, without a token.
+        self.assertEqual(client.call("Stat", {}), {"rc": 0})
+        self.assertEqual(_lines(output.flushes[1]), [{"id": 3, "method": "Stat", "params": {}}])
+
+    def test_unserializable_first_request_keeps_the_hello(self):
+        output = _RecordingWriter()
+        client = FastAgentClient(output, _answers(
+            # The failed call used ids 1 and 2.
+            {"id": 3, "result": {"version": "1.2.3", "capabilities": []}},
+            {"id": 4, "result": {}},
+        ))
+        client.defer_hello("1.2.3", on_verified=lambda: None, recover=lambda: self.fail("recover called"))
+        with self.assertRaises(TypeError):
+            client.call("Exec", {"bad": object()})
+        self.assertEqual(output.flushes, [])
+        client.call("Stat", {})
+        self.assertEqual([m["method"] for m in _lines(output.flushes[0])], ["Hello", "Stat"])
+
+    def test_large_first_request_waits_for_the_hello(self):
+        output = _RecordingWriter()
+        client = FastAgentClient(output, _answers(
+            {"id": 1, "result": {"version": "1.2.3", "capabilities": []}},
+            {"id": 2, "result": {}},
+        ))
+        client.defer_hello("1.2.3", on_verified=lambda: None, recover=lambda: self.fail("recover called"))
+        client.call("WriteFile", {"content": "x" * PIPELINE_MAX_BYTES})
+        self.assertEqual([m["method"] for m in _lines(output.flushes[0])], ["Hello"])
+        self.assertEqual([m["method"] for m in _lines(output.flushes[1])], ["WriteFile"])
+
+    def test_unanswered_hello_sends_request_again_on_recovered_stream(self):
+        first = _RecordingWriter()
+        second = _RecordingWriter()
+        client = FastAgentClient(first, io.BytesIO(b""))
+        client.defer_hello("1.2.3", on_verified=lambda: self.fail("verified"),
+                           recover=lambda: (second, _answers({"id": 2, "result": {"rc": 0}})))
+        self.assertEqual(client.call("Exec", {"argv": ["true"]}), {"rc": 0})
+        _, sent = _lines(first.flushes[0])
+        (replayed,) = _lines(second.flushes[0])
+        self.assertEqual(replayed, sent, "the second copy must carry the same once token")
+        self.assertFalse(client.broken)
+
+    def test_failed_recovery_reports_outcome_unknown(self):
+        def recover():
+            raise ConnectionError("no route to host")
+
+        client = FastAgentClient(_RecordingWriter(), io.BytesIO(b""))
+        client.defer_hello("1.2.3", on_verified=lambda: None, recover=recover)
+        with self.assertRaisesRegex(OSError, "outcome unknown.*no route to host"):
+            client.call("Exec", {"argv": ["true"]})
+        self.assertTrue(client.broken)
+
+    def test_answered_hello_then_lost_answer_is_not_replayed(self):
+        # Once the daemon answered the Hello the connection was live, so a
+        # failure after that is the usual outcome-unknown case.
+        client = FastAgentClient(_RecordingWriter(), _answers(
+            {"id": 1, "result": {"version": "1.2.3", "capabilities": []}},
+        ))
+        client.defer_hello("1.2.3", on_verified=lambda: None, recover=lambda: self.fail("recover called"))
+        with self.assertRaisesRegex(OSError, "outcome unknown"):
+            client.call("Exec", {"argv": ["true"]})
+        self.assertTrue(client.broken)
 
 
 # Build once for all tests.
@@ -147,6 +266,107 @@ class TestHello(unittest.TestCase):
                 client.hello("0.0.0-not-a-real-version")
             self.assertEqual(cm.exception.expected, "0.0.0-not-a-real-version")
             self.assertEqual(cm.exception.actual, _get_agent_version())
+
+
+class DaemonSession:
+    """Context manager that runs the agent as a daemon on a Unix socket."""
+
+    def __enter__(self):
+        self._dir = tempfile.TemporaryDirectory(prefix="fa-")
+        self.path = os.path.join(self._dir.name, "d.sock")
+        self.proc = subprocess.Popen(
+            [_get_agent_binary(), "--daemon", "--socket", self.path],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        deadline = time.monotonic() + 10
+        while not os.path.exists(self.path):
+            if self.proc.poll() is not None or time.monotonic() > deadline:
+                raise RuntimeError("fastagent daemon did not start")
+            time.sleep(0.01)
+        self._socks = []
+        return self
+
+    def connect(self):
+        """Return (stdin, stdout) for a new connection to the daemon."""
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(self.path)
+        self._socks.append(sock)
+        return sock.makefile("wb"), sock.makefile("rb")
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        for sock in self._socks:
+            sock.close()
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+        self._dir.cleanup()
+        return False
+
+
+def _append_argv(path):
+    return ["sh", "-c", 'printf x >> "$1"', "sh", path]
+
+
+def _verified(daemon):
+    """What the connection plugin's recovery returns: a proven stream."""
+    stdin, stdout = daemon.connect()
+    FastAgentClient(stdin, stdout).hello(_get_agent_version())
+    return stdin, stdout
+
+
+class TestDeferredHelloAgainstDaemon(unittest.TestCase):
+    def test_first_request_runs(self):
+        with tempfile.TemporaryDirectory() as directory, DaemonSession() as daemon:
+            path = os.path.join(directory, "counter")
+            client = FastAgentClient(*daemon.connect())
+            client.defer_hello(_get_agent_version(), on_verified=lambda: None,
+                               recover=lambda: self.fail("recover called"))
+            self.assertEqual(client.exec(argv=_append_argv(path))["rc"], 0)
+            self.assertEqual(client.exec(argv=_append_argv(path))["rc"], 0)
+            with open(path) as f:
+                self.assertEqual(f.read(), "xx")
+
+    def test_lost_hello_answer_never_runs_the_request_twice(self):
+        # The Hello's answer is lost after the daemon received the
+        # request, the way a connection that dies in flight looks. The
+        # controller cannot tell this from a stale socket and sends the
+        # request again; the daemon must refuse the second copy.
+        with tempfile.TemporaryDirectory() as directory, DaemonSession() as daemon:
+            path = os.path.join(directory, "counter")
+            stdin, stdout = daemon.connect()
+
+            class LostHelloAnswer:
+                def readline(self):
+                    stdout.readline()  # the Hello's answer, dropped
+                    deadline = time.monotonic() + 10
+                    while not os.path.exists(path) and time.monotonic() < deadline:
+                        time.sleep(0.01)  # the first copy has run
+                    raise OSError("injected connection loss")
+
+            client = FastAgentClient(stdin, LostHelloAnswer())
+            client.defer_hello(_get_agent_version(), on_verified=lambda: None,
+                               recover=lambda: _verified(daemon))
+            with self.assertRaisesRegex(OSError, "outcome unknown.*already received"):
+                client.exec(argv=_append_argv(path))
+            with open(path) as f:
+                self.assertEqual(f.read(), "x")
+
+    def test_version_mismatch_refuses_the_pipelined_request(self):
+        # The agent must refuse the request that came in the same write as
+        # a mismatched Hello; the request then runs once, on the recovered
+        # connection.
+        with tempfile.TemporaryDirectory() as directory, DaemonSession() as daemon:
+            path = os.path.join(directory, "counter")
+            client = FastAgentClient(*daemon.connect())
+            client.defer_hello("0.0.0-not-a-real-version", on_verified=lambda: None,
+                               recover=lambda: _verified(daemon))
+            self.assertEqual(client.exec(argv=_append_argv(path))["rc"], 0)
+            with open(path) as f:
+                self.assertEqual(f.read(), "x")
 
 
 class TestExec(unittest.TestCase):
