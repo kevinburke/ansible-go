@@ -9,7 +9,7 @@ import (
 )
 
 // Version is the agent version. Bump this when the protocol or behavior changes.
-const Version = "0.10.1"
+const Version = "0.11.0"
 
 // Request is a JSON-RPC request from the controller.
 //

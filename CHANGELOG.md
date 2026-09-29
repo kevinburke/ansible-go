@@ -2,7 +2,7 @@
 
 All notable changes to fastagent are documented in this file.
 
-## Unreleased
+## 0.11.0 — September 29, 2026
 
 ### Changes
 
