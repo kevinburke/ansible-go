@@ -296,9 +296,10 @@ find roles/ -name '*.yml' -exec \
 Modules without an override (e.g. `git`, `user`, `cron`, `lineinfile`,
 `community.general.ufw`) still work normally — they go through the standard
 Ansible module path. Pipelining keeps the per-task overhead low for those,
-but no Go RPC fast path exists. `template:` benefits indirectly because
+but no Go RPC fast path exists. `template:` has its own small override:
 Ansible's builtin template action renders locally and then invokes the
-`copy` action plugin (which is overridden).
+`copy` action plugin (which is overridden), and fastagent's template
+action skips the remote tmp dir the builtin one makes but never uses.
 
 ## How it works
 
@@ -322,7 +323,7 @@ plain SSH.
 | `command`, `shell` | Action plugin | Exec RPC, no module transfer |
 | `file` | Action plugin | File/Stat RPC |
 | `stat` | Action plugin | Stat RPC |
-| `copy`, `template` | Action plugin | WriteFile RPC with checksum |
+| `copy`, `template` | Action plugin | One WriteFile RPC; the agent compares checksums |
 | `apt` | Action plugin | Package RPC with dpkg cache |
 | `systemd` | Action plugin | Service RPC |
 | Everything else | Connection plugin | Persistent daemon + SSH forwarding |

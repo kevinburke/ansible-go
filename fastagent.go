@@ -332,6 +332,11 @@ type WriteFileParams struct {
 	// environment for the Validate command.
 	Env      map[string]string `json:"env,omitempty"`
 	Checksum string            `json:"checksum,omitempty"` // expected checksum of existing file; skip write if matches
+	// ReportDir asks for a directory at Dest to come back as a
+	// WriteFileResult with DestIsDir set, instead of as an error. Either
+	// way nothing is written. The copy action sets it when it writes
+	// without a Stat first, and resolves the directory case itself.
+	ReportDir bool `json:"report_dir,omitempty"`
 }
 
 // WriteValidate is copy/template's `validate` option, already split into
@@ -353,6 +358,9 @@ type WriteFileResult struct {
 	// ValidateFailed is set, and Dest left untouched, when the Validate
 	// command could not be started or exited non-zero.
 	ValidateFailed *ValidateFailure `json:"validate_failed,omitempty"`
+	// DestIsDir is set, and nothing written, when Dest is a directory
+	// (following symlinks) and the request set ReportDir.
+	DestIsDir bool `json:"dest_is_dir,omitempty"`
 }
 
 // ValidateFailure describes a failed WriteFile validation.

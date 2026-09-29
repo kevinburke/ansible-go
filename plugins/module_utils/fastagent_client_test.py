@@ -495,6 +495,17 @@ class TestWriteAndReadFile(unittest.TestCase):
                 result2 = client.write_file(dest=dest, content=b64)
                 self.assertFalse(result2["changed"])
 
+    def test_write_directory_dest(self):
+        with AgentSession() as client:
+            with tempfile.TemporaryDirectory() as d:
+                b64 = base64.b64encode(b"x").decode("ascii")
+                result = client.write_file(dest=d, content=b64, report_dir=True)
+                self.assertTrue(result["dest_is_dir"])
+                self.assertFalse(result["changed"])
+                with self.assertRaisesRegex(FastAgentError, "is a directory"):
+                    client.write_file(dest=d, content=b64)
+                self.assertEqual(os.listdir(d), [])
+
     def test_write_then_read(self):
         with AgentSession() as client:
             with tempfile.TemporaryDirectory() as d:

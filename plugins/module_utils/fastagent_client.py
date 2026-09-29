@@ -444,8 +444,13 @@ class FastAgentClient:
         checksum: str | None = None,
         validate: dict | None = None,
         env: dict | None = None,
+        report_dir: bool = False,
     ) -> dict:
         """Write a file to the remote host.
+
+        When dest already holds this content, nothing is written, backed
+        up or validated; only owner/group/mode are applied, and "changed"
+        says whether they were.
 
         Args:
             dest: destination path
@@ -461,6 +466,9 @@ class FastAgentClient:
                 failure dest is left alone and the result has
                 "validate_failed" (see WriteValidate in fastagent.go).
             env: the task's environment, for the validate command
+            report_dir: when dest is a directory, return
+                {"dest_is_dir": True} instead of raising. Either way
+                nothing is written.
         """
         params: dict = {"dest": dest, "content": content}
         if owner is not None:
@@ -479,6 +487,8 @@ class FastAgentClient:
             params["validate"] = validate
         if env:
             params["env"] = env
+        if report_dir:
+            params["report_dir"] = True
         return self.call("WriteFile", params)
 
     def file(

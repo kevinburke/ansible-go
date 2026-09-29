@@ -21,6 +21,27 @@ All notable changes to fastagent are documented in this file.
   larger than 1 MiB still waits for the Hello's answer. The protocol change
   needs a version bump before release: the socket path includes the version,
   and a daemon from before this change would ignore the token.
+- An unchanged `template` or `copy` is now one RPC instead of five (template)
+  or two (copy). Stock template makes a remote tmp dir before handing off to
+  copy, costing an Exec to expand `~`, an Exec to mkdir and an Exec to remove
+  it, and fastagent's copy never used the dir. A new `template` action
+  override, which otherwise runs ansible-core's template action, skips it on
+  fastagent connections. Copy then sent a Stat for the checksum before a File
+  (unchanged) or WriteFile (changed); it now sends only the WriteFile, which
+  already compared checksums in the agent and, for matching content, wrote,
+  backed up and validated nothing and only applied owner, group and mode.
+  Check mode, diff, `force=false`, content over 64 KiB and a directory `dest`
+  still Stat first. On a deploy where every template item is unchanged, this
+  saves four round trips per item. `kevinburke.fastagent.template` is also
+  available by name, for the `collections:` routing setup.
+- WriteFile checks for a directory `dest` before doing anything else. It
+  used to fail partway: with `backup`, after leaving an empty backup file
+  next to the directory, and otherwise after running `validate` and writing
+  a temp file, at the rename. Now it fails first, or with the new
+  `report_dir` parameter returns `dest_is_dir` so the copy action can
+  resolve the directory itself. WriteFile also hashes only a regular-file
+  `dest`: opening a FIFO to hash it blocked the agent until a writer
+  appeared. A non-regular `dest` is replaced.
 
 - `command`/`shell` tasks with a non-root `become_user` now see their
   `environment:`. The agent had set the variables on the `sudo` process, and

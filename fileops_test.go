@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -1008,5 +1009,147 @@ func TestWriteFileExplicitModeStillWins(t *testing.T) {
 	}
 	if st, _ := os.Stat(dest); st.Mode().Perm() != 0o640 {
 		t.Errorf("mode = %v, want 0640", st.Mode().Perm())
+	}
+}
+
+func writeFileResult(t *testing.T, resp Response) WriteFileResult {
+	t.Helper()
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+	resultJSON, err := json.Marshal(resp.Result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result WriteFileResult
+	if err := json.Unmarshal(resultJSON, &result); err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func TestWriteFileUnchangedOnlyFixesMode(t *testing.T) {
+	// The copy action sends WriteFile without a Stat first, relying on
+	// the agent to leave matching content alone: same inode, no backup,
+	// no validation, with only the requested mode applied.
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "f")
+	if err := os.WriteFile(dest, []byte("same"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := writeFileResult(t, rpcCall(t, newTestServer(), "WriteFile", WriteFileParams{
+		Dest:     dest,
+		Content:  base64.StdEncoding.EncodeToString([]byte("same")),
+		Mode:     "0644",
+		Backup:   true,
+		Validate: &WriteValidate{Argv: []string{"false", "@@P@@"}, Placeholder: "@@P@@"},
+	}))
+	if !result.Changed {
+		t.Error("changed = false, want true for a mode change")
+	}
+	if result.BackupFile != "" || result.ValidateFailed != nil {
+		t.Errorf("unchanged content made a backup or ran validate: %+v", result)
+	}
+	after, err := os.Stat(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) {
+		t.Error("unchanged content was rewritten to a new inode")
+	}
+	if after.Mode().Perm() != 0o644 {
+		t.Errorf("mode = %v, want 0644", after.Mode().Perm())
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("directory has %d entries, want only dest", len(entries))
+	}
+
+	// Again, with nothing left to fix.
+	result = writeFileResult(t, rpcCall(t, newTestServer(), "WriteFile", WriteFileParams{
+		Dest:    dest,
+		Content: base64.StdEncoding.EncodeToString([]byte("same")),
+		Mode:    "0644",
+	}))
+	if result.Changed {
+		t.Error("changed = true, want false when content and mode match")
+	}
+}
+
+func TestWriteFileDirectoryDest(t *testing.T) {
+	// A directory dest is copy's "write into this directory" case, which
+	// the action plugin resolves. The agent must say so before creating
+	// a backup, running validate, or leaving a temp file behind.
+	for _, reportDir := range []bool{false, true} {
+		t.Run(fmt.Sprintf("report_dir=%t", reportDir), func(t *testing.T) {
+			dest := t.TempDir()
+			resp := rpcCall(t, newTestServer(), "WriteFile", WriteFileParams{
+				Dest:      dest,
+				Content:   base64.StdEncoding.EncodeToString([]byte("x")),
+				Backup:    true,
+				Validate:  &WriteValidate{Argv: []string{"true", "@@P@@"}, Placeholder: "@@P@@"},
+				ReportDir: reportDir,
+			})
+			if reportDir {
+				result := writeFileResult(t, resp)
+				if !result.DestIsDir || result.Changed {
+					t.Errorf("result = %+v, want dest_is_dir and unchanged", result)
+				}
+			} else if resp.Error == nil || !strings.Contains(resp.Error.Message, "is a directory") {
+				t.Errorf("error = %v, want an \"is a directory\" error", resp.Error)
+			}
+			entries, err := os.ReadDir(dest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 0 {
+				t.Errorf("directory dest gained entries: %v", entries)
+			}
+			if matches, _ := filepath.Glob(dest + ".*~"); len(matches) != 0 {
+				t.Errorf("backup made of a directory dest: %v", matches)
+			}
+		})
+	}
+}
+
+func TestWriteFileFIFODestDoesNotBlock(t *testing.T) {
+	// Hashing the existing dest must not open a FIFO, which blocks until
+	// a writer appears. Stock copy replaces the FIFO with the file.
+	dest := filepath.Join(t.TempDir(), "fifo")
+	if err := unix.Mkfifo(dest, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	params, err := json.Marshal(WriteFileParams{
+		Dest: dest, Content: base64.StdEncoding.EncodeToString([]byte("x")),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Not rpcCall: its t.Fatal must not run off the test goroutine.
+	done := make(chan Response, 1)
+	go func() {
+		done <- newTestServer().dispatch(Request{ID: 1, Method: "WriteFile", Params: params})
+	}()
+	select {
+	case resp := <-done:
+		if result := writeFileResult(t, resp); !result.Changed {
+			t.Error("changed = false, want true")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("WriteFile blocked opening a FIFO dest")
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "x" {
+		t.Errorf("content = %q, want %q", got, "x")
 	}
 }

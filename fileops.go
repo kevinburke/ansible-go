@@ -238,15 +238,29 @@ func (s *Server) handleWriteFile(params json.RawMessage) (any, error) {
 	h := sha256.Sum256(data)
 	newChecksum := hex.EncodeToString(h[:])
 
-	// If the caller already knows the existing file's checksum, use it to
-	// skip the disk read. Otherwise read the file to check.
+	// Look at Dest before anything else. A directory is copy's "write
+	// into this directory" case, which the action plugin resolves, so
+	// report it (or fail) before a backup, validation or temp file. If
+	// the caller already knows the existing file's checksum, use it to
+	// skip the disk read. Otherwise hash Dest, but only a regular file:
+	// opening a FIFO blocks until a writer appears.
 	existingChecksum := p.Checksum
-	if existingChecksum == "" {
-		existingChecksum, _ = sha256File(p.Dest)
+	if info, err := os.Stat(p.Dest); err == nil {
+		if info.IsDir() {
+			if p.ReportDir {
+				return WriteFileResult{Dest: p.Dest, DestIsDir: true}, nil
+			}
+			return nil, fmt.Errorf("write %s: is a directory", p.Dest)
+		}
+		if existingChecksum == "" && info.Mode().IsRegular() {
+			existingChecksum, _ = sha256File(p.Dest)
+		}
 	}
 
 	if existingChecksum == newChecksum {
-		// File already has the correct content; still apply ownership/mode if needed.
+		// File already has the correct content; still apply ownership/mode
+		// if needed. This is the whole of an unchanged copy or template:
+		// the action plugin sends WriteFile without a Stat first.
 		changed, err := applyOwnershipAndMode(p.Dest, p.Owner, p.Group, p.Mode)
 		if err != nil {
 			return nil, err

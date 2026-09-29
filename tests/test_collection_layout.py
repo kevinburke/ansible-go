@@ -122,7 +122,7 @@ class TestTarballContents(unittest.TestCase):
         self.assertIn("plugins/connection/fastagent.py", self.members)
 
     def test_action_plugins_present(self):
-        for name in ("command", "copy", "file", "stat", "apt", "systemd"):
+        for name in ("command", "copy", "template", "file", "stat", "apt", "systemd"):
             self.assertIn(f"plugins/action/{name}.py", self.members)
 
     def test_library_modules_present(self):
@@ -130,9 +130,8 @@ class TestTarballContents(unittest.TestCase):
             self.assertIn(f"plugins/modules/{name}.py", self.members)
 
     def test_module_utils_present(self):
-        self.assertIn(
-            "plugins/module_utils/fastagent_client.py", self.members
-        )
+        for name in ("fastagent_client", "builtin_action", "file_state"):
+            self.assertIn(f"plugins/module_utils/{name}.py", self.members)
 
     def test_no_go_sources_leaked(self):
         """Go source and build artifacts must not ship in the collection."""
@@ -299,6 +298,76 @@ for name, collections, should_fastagent in cases:
             f"{name} resolved to {path}, fastagent={is_fastagent}, "
             f"want {should_fastagent}"
         )
+print("ok")
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            result.returncode, 0,
+            f"routing check failed:\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}",
+        )
+        self.assertEqual(result.stdout.strip(), "ok")
+
+    def test_template_action_routing_and_loading(self):
+        """Verify template resolves to fastagent's action and loads.
+
+        Routing is as for systemd above. Loading matters too: on the legacy
+        action_plugins path, ansible registers our template.py where
+        ansible-core's would be imported from, so the builtin class it
+        extends must come from ansible-core's file, not from ourselves.
+        """
+        env = os.environ.copy()
+        action_dir = os.path.join(self.collection_dir, "plugins", "action")
+        env["ANSIBLE_ACTION_PLUGINS"] = action_dir
+        env["ANSIBLE_COLLECTIONS_PATH"] = self.install_path
+        code = r"""
+import os
+
+import ansible
+from ansible.plugins.loader import action_loader, init_plugin_loader
+
+init_plugin_loader()
+
+# ansible-core's own file ends in plugins/action/template.py too.
+expected = os.path.realpath(
+    os.path.join(os.environ["ANSIBLE_ACTION_PLUGINS"], "template.py"))
+cases = [
+    ("template", None, True),
+    ("template", ["kevinburke.fastagent"], True),
+    ("ansible.legacy.template", None, True),
+    ("kevinburke.fastagent.template", None, True),
+    ("ansible.builtin.template", None, False),
+]
+for name, collections, should_fastagent in cases:
+    ctx = action_loader.find_plugin_with_context(
+        name,
+        collection_list=collections,
+    )
+    if not ctx.resolved and should_fastagent:
+        raise SystemExit(f"{name} did not resolve")
+    path = ctx.plugin_resolved_path or ""
+    is_fastagent = os.path.realpath(path) == expected
+    if is_fastagent != should_fastagent:
+        raise SystemExit(
+            f"{name} resolved to {path}, fastagent={is_fastagent}, "
+            f"want {should_fastagent}"
+        )
+
+cls = action_loader.get("template", class_only=True)
+if not cls.__module__.startswith(("ansible.plugins.action", "ansible_collections.kevinburke")):
+    raise SystemExit(f"template loaded from {cls.__module__}")
+builtin = os.path.realpath(os.path.join(
+    os.path.dirname(ansible.__file__), "plugins", "action", "template.py"))
+bases = [os.path.realpath(b.run.__code__.co_filename) for b in cls.__mro__[1:] if "run" in vars(b)]
+if not bases or bases[0] != builtin:
+    raise SystemExit(f"template extends {bases}, want {builtin}")
+if os.path.realpath(cls.run.__code__.co_filename) != expected:
+    raise SystemExit(f"template run is {cls.run.__code__.co_filename}")
 print("ok")
 """
         result = subprocess.run(

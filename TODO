@@ -33,8 +33,9 @@ Action plugin discipline
 
 Coverage
 - Add action overrides for the highest-frequency non-overridden modules.
-  In the plex deploy these were template (~7), lineinfile (~3), sysctl
-  (~2). Each call still goes through ansible's pipelined python path.
+  In the plex deploy these were lineinfile (~3) and sysctl (~2). Each call
+  still goes through ansible's pipelined python path. (template has an
+  override now; an unchanged template is one WriteFile RPC.)
 - Verify systemd override actually fires. Trace from the 37s run
   showed 0 Service RPCs despite systemd tasks being present — the
   module shim exists and the action plugin is wired up, so something

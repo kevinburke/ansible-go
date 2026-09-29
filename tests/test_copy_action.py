@@ -38,26 +38,41 @@ except ModuleNotFoundError as exc:  # pragma: no cover
 
 class _RecordingAgentClient:
     def __init__(self):
+        # Every RPC, as (method, path), in order.
+        self.calls: list[tuple[str, str]] = []
+        # The last WriteFile that wrote (not one answered with dest_is_dir).
         self.write_kwargs: dict | None = None
+        self.write_result: dict = {"changed": True, "checksum": ""}
         self.file_calls: list[dict] = []
         self.stat_results: list[dict] = []
+        # Remote directories, which WriteFile with report_dir reports as
+        # the agent does.
+        self.dirs: set[str] = set()
         self.read_file_error: Exception | None = None
 
     def stat(self, path, follow, checksum, checksum_algorithm=None):
+        self.calls.append(("Stat", path))
         if self.stat_results:
             return self.stat_results.pop(0)
         return {"exists": False, "isdir": False}
 
     def read_file(self, path):
+        self.calls.append(("ReadFile", path))
         if self.read_file_error is not None:
             raise self.read_file_error
         return {"content": base64.b64encode(b"old").decode("ascii")}
 
     def write_file(self, **kwargs):
+        self.calls.append(("WriteFile", kwargs["dest"]))
+        if kwargs["dest"] in self.dirs:
+            if not kwargs.get("report_dir"):
+                raise AssertionError(f"WriteFile to directory {kwargs['dest']}")
+            return {"changed": False, "dest": kwargs["dest"], "dest_is_dir": True}
         self.write_kwargs = kwargs
-        return {"changed": True, "checksum": ""}
+        return self.write_result
 
     def file(self, **kwargs):
+        self.calls.append(("File", kwargs["path"]))
         self.file_calls.append(kwargs)
         return {"changed": True}
 
@@ -429,9 +444,9 @@ class TestCopyActionVaultDecrypt(unittest.TestCase):
         # ActionModule` resolved back into our own partially-loaded
         # module. Exercise the loader directly here so CI catches it
         # before any real play does.
-        from plugins.action.copy import _load_builtin_copy_action_class
+        from plugins.module_utils.builtin_action import load_builtin_action_class
 
-        cls = _load_builtin_copy_action_class()
+        cls = load_builtin_action_class("copy")
         self.assertTrue(
             issubclass(cls, ActionBase),
             msg=f"loaded class {cls!r} is not an ActionBase",
@@ -590,6 +605,7 @@ class TestCopyActionVaultDecrypt(unittest.TestCase):
             loader=_RecordingLoader(resolved_path="/unused"),
         )
         client = action._connection._agent_client
+        client.dirs = {"/tmp/destdir"}
         client.stat_results = [{"exists": True, "isdir": True}]
 
         with patch.object(ActionBase, "run", return_value={}):
@@ -674,6 +690,133 @@ class TestCopyActionVaultDecrypt(unittest.TestCase):
         self.assertTrue(result.get("failed"), msg=result)
         self.assertIn("fastagent read for diff failed", result.get("msg", ""))
         self.assertIsNone(client.write_kwargs)
+
+
+
+@unittest.skipIf(
+    _ANSIBLE_IMPORT_ERROR is not None,
+    "ansible is required to run action plugin tests",
+)
+class TestCopyActionRoundTrips(unittest.TestCase):
+    """The RPCs each copy (and so each template) sends.
+
+    WriteFile compares checksums itself and, when the content already
+    matches, only applies owner/group/mode, so the common case is one RPC.
+    A Stat goes first only when the action must decide before writing.
+    """
+
+    def _run(self, task_args, *, check_mode=False, diff=False, client_setup=None):
+        action = _make_action(
+            task_args=task_args,
+            loader=_RecordingLoader(resolved_path="/unused"),
+        )
+        action._play_context = type(
+            "PlayContext", (), {"check_mode": check_mode, "diff": diff}
+        )()
+        client = action._connection._agent_client
+        if client_setup is not None:
+            client_setup(client)
+        with patch.object(ActionBase, "run", return_value={}):
+            result = action.run(task_vars={})
+        return result, client
+
+    def test_unchanged_content_is_one_write_file(self) -> None:
+        data = b"rendered template\n"
+
+        def setup(client):
+            client.write_result = {
+                "changed": False,
+                "dest": "/etc/app.conf",
+                "checksum": hashlib.sha256(data).hexdigest(),
+            }
+
+        result, client = self._run(
+            {"content": data.decode(), "dest": "/etc/app.conf",
+             "owner": "root", "group": "root", "mode": "0644"},
+            client_setup=setup,
+        )
+        self.assertEqual(client.calls, [("WriteFile", "/etc/app.conf")])
+        self.assertFalse(result.get("failed"), msg=result)
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["dest"], "/etc/app.conf")
+        self.assertEqual(result["checksum"], hashlib.sha256(data).hexdigest())
+        kwargs = client.write_kwargs
+        self.assertTrue(kwargs["report_dir"])
+        self.assertEqual(
+            (kwargs["owner"], kwargs["group"], kwargs["mode"]),
+            ("root", "root", "0644"),
+        )
+
+    def test_attribute_fix_on_unchanged_content_reports_changed(self) -> None:
+        def setup(client):
+            client.write_result = {"changed": True, "checksum": "c"}
+
+        result, client = self._run(
+            {"content": "x", "dest": "/etc/app.conf", "mode": "0600"},
+            client_setup=setup,
+        )
+        self.assertEqual(client.calls, [("WriteFile", "/etc/app.conf")])
+        self.assertTrue(result["changed"])
+
+    def test_directory_dest_resolves_basename_with_stat(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "app.conf")
+            with open(source, "wb") as f:
+                f.write(b"payload")
+
+            def setup(client):
+                client.dirs = {"/etc/app"}
+                client.stat_results = [
+                    {"exists": True, "isdir": True},
+                    {"exists": False},
+                ]
+
+            action = _make_action(
+                task_args={"src": source, "dest": "/etc/app"},
+                loader=_RecordingLoader(resolved_path=source),
+            )
+            client = action._connection._agent_client
+            setup(client)
+            with patch.object(ActionBase, "run", return_value={}):
+                result = action.run(task_vars={})
+
+        self.assertFalse(result.get("failed"), msg=result)
+        self.assertEqual(result["dest"], "/etc/app/app.conf")
+        self.assertEqual(client.calls, [
+            ("WriteFile", "/etc/app"),
+            ("Stat", "/etc/app"),
+            ("Stat", "/etc/app/app.conf"),
+            ("WriteFile", "/etc/app/app.conf"),
+        ])
+        self.assertEqual(base64.b64decode(client.write_kwargs["content"]), b"payload")
+        self.assertFalse(client.write_kwargs.get("report_dir"))
+
+    def test_decisions_before_writing_stat_first(self) -> None:
+        # Check mode and diff must not write before knowing the current
+        # state; force=no must not compare contents; large content would
+        # cost more to ship unchanged than the extra Stat round trip.
+        from plugins.action import copy as copy_action
+
+        large = "x" * (copy_action._WRITE_WITHOUT_STAT_MAX_BYTES + 1)
+        cases = {
+            "check_mode": ({"content": "x", "dest": "/d"}, {"check_mode": True}),
+            "diff": ({"content": "x", "dest": "/d"}, {"diff": True}),
+            "force_no": ({"content": "x", "dest": "/d", "force": False}, {}),
+            "large": ({"content": large, "dest": "/d"}, {}),
+        }
+        for name, (task_args, mode) in cases.items():
+            with self.subTest(name):
+                _, client = self._run(task_args, **mode)
+                self.assertEqual(client.calls[0], ("Stat", "/d"))
+                if client.write_kwargs is not None:
+                    self.assertFalse(client.write_kwargs.get("report_dir"))
+
+    def test_largest_content_without_stat(self) -> None:
+        from plugins.action import copy as copy_action
+
+        content = "x" * copy_action._WRITE_WITHOUT_STAT_MAX_BYTES
+        _, client = self._run({"content": content, "dest": "/d"})
+        self.assertEqual(client.calls, [("WriteFile", "/d")])
 
 
 if __name__ == "__main__":

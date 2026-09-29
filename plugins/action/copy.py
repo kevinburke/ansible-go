@@ -13,19 +13,29 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import importlib.util
 import json
 import os
 import secrets
 import shlex
 import stat
 
-import ansible.plugins.action as _ansible_action_pkg
-from ansible.errors import AnsibleActionFail, AnsibleFileNotFound
 from ansible.module_utils.common.text.converters import to_bytes, to_text
 from ansible.module_utils.parsing.convert_bool import boolean
 from ansible.plugins.action import ActionBase
-from ansible.utils.hashing import checksum
+
+try:
+    from ansible_collections.kevinburke.fastagent.plugins.module_utils.builtin_action import (
+        load_builtin_action_class,
+    )
+except ImportError:
+    from plugins.module_utils.builtin_action import load_builtin_action_class
+
+
+# The largest content sent in a WriteFile without a Stat first. WriteFile
+# compares checksums itself, so an unchanged file costs one round trip
+# instead of two, but the content crosses the wire either way. Past this
+# size, sending bytes the remote already has costs more than the Stat.
+_WRITE_WITHOUT_STAT_MAX_BYTES = 64 * 1024
 
 
 def _validate_spec(validate):
@@ -86,43 +96,6 @@ def _validate_failed_result(result, failure, validate, data):
     return result
 
 
-def _load_builtin_copy_action_class():
-    """Return ansible-core's builtin `copy` ActionModule class.
-
-    We can't use `from ansible.plugins.action.copy import ActionModule`:
-    callers that put this plugin on the legacy `action_plugins` search
-    path (e.g. caracal-server's `ansible.cfg`, to shadow unqualified
-    `copy:`) cause ansible's PluginLoader to register *this file* under
-    `sys.modules["ansible.plugins.action.copy"]`, aliasing over the
-    real builtin. The import then resolves back into this partially-
-    loaded module and fails with `ImportError: cannot import name
-    'ActionModule' from 'ansible.plugins.action.copy' (…/kevinburke/…/copy.py)`.
-
-    We can't use `action_loader.get("ansible.legacy.copy")` either: under
-    the same legacy-path shadowing, `ansible.legacy.copy` resolves to
-    this class, so the fallback recurses until CPython raises
-    `RecursionError: maximum recursion depth exceeded`.
-
-    Instead, find the real file on disk via the parent package's
-    `__path__` (which is not mutated by legacy-plugin registration) and
-    load it with `importlib.util.spec_from_file_location` under a name
-    that can't clash with anything in `sys.modules`.
-    """
-    for base in _ansible_action_pkg.__path__:
-        candidate = os.path.join(base, "copy.py")
-        if os.path.isfile(candidate):
-            spec = importlib.util.spec_from_file_location(
-                "kevinburke.fastagent._builtin_copy_action", candidate
-            )
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            return mod.ActionModule
-    raise AnsibleActionFail(
-        "fastagent: could not locate ansible-core's builtin copy "
-        f"action plugin under {list(_ansible_action_pkg.__path__)}"
-    )
-
-
 _BUILTIN_COPY_ACTION_CLASS: type | None = None
 
 
@@ -169,7 +142,7 @@ class ActionModule(ActionBase):
         ships our controller path (e.g. `/Users/.../migrations/`) to the
         remote and fails with `Source ... not found`.
 
-        See `_load_builtin_copy_action_class` for why we can't reach the
+        See `load_builtin_action_class` for why we can't reach the
         builtin via `ansible.legacy.copy` or a plain import when callers
         expose this plugin on the legacy action_plugins search path.
 
@@ -185,7 +158,7 @@ class ActionModule(ActionBase):
         """
         global _BUILTIN_COPY_ACTION_CLASS
         if _BUILTIN_COPY_ACTION_CLASS is None:
-            _BUILTIN_COPY_ACTION_CLASS = _load_builtin_copy_action_class()
+            _BUILTIN_COPY_ACTION_CLASS = load_builtin_action_class("copy")
         builtin = _BUILTIN_COPY_ACTION_CLASS(
             task=self._task,
             connection=self._connection,
@@ -307,18 +280,37 @@ class ActionModule(ActionBase):
 
         check_mode = self._play_context.check_mode
         diff = self._play_context.diff
-        backup = boolean(args.get("backup", False), strict=False)
         force = boolean(args.get("force", True), strict=False)
         owner = args.get("owner")
         group = args.get("group")
         mode = args.get("mode")
-        unsafe_writes = boolean(args.get("unsafe_writes", False), strict=False)
 
         # Compute local checksum.
         local_checksum = hashlib.sha256(data).hexdigest()
 
-        # Remote stat to check current state.
         client = self._connection._agent_client
+
+        # One RPC for the common case. WriteFile compares checksums itself:
+        # matching content is not written, backed up or validated, and only
+        # owner/group/mode are applied. A Stat comes first when the action
+        # must decide before writing (check mode, diff, force=no), for
+        # content over _WRITE_WITHOUT_STAT_MAX_BYTES, and for a directory
+        # dest, which the agent reports without writing.
+        if (force and not check_mode and not diff
+                and len(data) <= _WRITE_WITHOUT_STAT_MAX_BYTES):
+            try:
+                write_result = self._write_file(
+                    client, data, dest, args, validate_spec, report_dir=True
+                )
+            except Exception as e:
+                result["failed"] = True
+                result["msg"] = f"fastagent write failed: {e}"
+                return result
+            if not write_result.get("dest_is_dir"):
+                return self._write_file_result(
+                    result, write_result, dest, data, args, local_checksum
+                )
+            # dest is a directory; the Stat path resolves it.
 
         try:
             remote_stat = client.stat(dest, follow=True, checksum=True)
@@ -403,26 +395,33 @@ class ActionModule(ActionBase):
             result["dest"] = dest
             return result
 
-        # Write the file.
-        content_b64 = base64.b64encode(data).decode("ascii")
-
         try:
-            write_result = client.write_file(
-                dest=dest,
-                content=content_b64,
-                owner=owner,
-                group=group,
-                mode=self._format_mode(mode),
-                backup=backup,
-                unsafe_writes=unsafe_writes,
-                validate=validate_spec,
-                env=self._task_environment() if validate_spec else None,
-            )
+            write_result = self._write_file(client, data, dest, args, validate_spec)
         except Exception as e:
             result["failed"] = True
             result["msg"] = f"fastagent write failed: {e}"
             return result
+        return self._write_file_result(
+            result, write_result, dest, data, args, local_checksum
+        )
 
+    def _write_file(self, client, data, dest, args, validate_spec, report_dir=False):
+        """Send data to dest in a WriteFile RPC, with the task's options."""
+        return client.write_file(
+            dest=dest,
+            content=base64.b64encode(data).decode("ascii"),
+            owner=args.get("owner"),
+            group=args.get("group"),
+            mode=self._format_mode(args.get("mode")),
+            backup=boolean(args.get("backup", False), strict=False),
+            unsafe_writes=boolean(args.get("unsafe_writes", False), strict=False),
+            validate=validate_spec,
+            env=self._task_environment() if validate_spec else None,
+            report_dir=report_dir,
+        )
+
+    def _write_file_result(self, result, write_result, dest, data, args, local_checksum):
+        """Fill in the task result from a WriteFile result."""
         failure = write_result.get("validate_failed")
         if failure:
             return _validate_failed_result(result, failure, args["validate"], data)
