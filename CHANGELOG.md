@@ -4,6 +4,8 @@ All notable changes to fastagent are documented in this file.
 
 ## Unreleased
 
+## 0.10.0 — September 28, 2026
+
 ### Changes
 
 - fastagent is MIT licensed. The agent's `stat` helpers in `statcompat.go`
