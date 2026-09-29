@@ -187,7 +187,7 @@ trap - EXIT
 '''
 
 # Agent version must match the Go constant.
-AGENT_VERSION = "0.10.0"
+AGENT_VERSION = "0.10.1"
 
 # Bound on how long a controller process waits for another process's
 # local-socket setup lock (see _local_socket_setup_lock) before giving up.
