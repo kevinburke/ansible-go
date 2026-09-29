@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 )
@@ -100,54 +101,9 @@ func (s *Server) handleExec(params json.RawMessage) (any, error) {
 		defer cancel()
 	}
 
-	// Build the final argv. This mirrors roughly what ansible's classic
-	// SSH path does: resolve the command (either as an argv or via
-	// `/bin/sh -c` when use_shell is set), then wrap it with
-	// `sudo --user <user>` when a become_user is requested. The
-	// difference is that ansible builds the wrapped command on the
-	// controller and ships it over SSH, whereas we build it here on the
-	// target after receiving the Exec RPC.
-	//
-	// Resolve UseShell/Argv/CmdString first, then (if BecomeUser is
-	// set) wrap the result with sudo so the invocation runs as that
-	// user. The flags are:
-	//   --set-home        set HOME to the target user's home directory,
-	//                     matching ansible's classic become path.
-	//   --non-interactive fail rather than prompt for a password. A
-	//                     prompt would deadlock the RPC; the caller is
-	//                     expected to ensure the agent has passwordless
-	//                     root-level sudo (true whenever ansible
-	//                     invoked us with `become: true`).
-	//   --user <user>     run as <user>.
-	//   --                end of sudo options; everything after is the
-	//                     command argv, so a command that starts with
-	//                     `-` isn't mis-parsed as a sudo flag.
-	var finalArgv []string
-	switch {
-	case p.UseShell:
-		shellCmd := p.CmdString
-		if shellCmd == "" && len(p.Argv) > 0 {
-			shellCmd = strings.Join(p.Argv, " ")
-		}
-		finalArgv = []string{"/bin/sh", "-c", shellCmd}
-	case len(p.Argv) > 0:
-		finalArgv = p.Argv
-	case p.CmdString != "":
-		return nil, fmt.Errorf("exec: cmd_string without use_shell is not supported; send argv")
-	default:
-		return nil, fmt.Errorf("no command specified: set argv or cmd_string")
-	}
-	if p.BecomeUser != "" {
-		finalArgv = append(
-			[]string{
-				"sudo",
-				"--set-home",
-				"--non-interactive",
-				"--user", p.BecomeUser,
-				"--",
-			},
-			finalArgv...,
-		)
+	finalArgv, err := execArgv(p)
+	if err != nil {
+		return nil, err
 	}
 	cmd := exec.CommandContext(ctx, finalArgv[0], finalArgv[1:]...)
 
@@ -156,7 +112,9 @@ func (s *Server) handleExec(params json.RawMessage) (any, error) {
 	} else if p.BecomeUser != "" {
 		cmd.Dir = becomeUserCwd(p.BecomeUser)
 	}
-	if len(p.Env) > 0 {
+	// With BecomeUser the task environment is already in finalArgv; see
+	// execArgv for why it can't ride on the sudo process.
+	if len(p.Env) > 0 && p.BecomeUser == "" {
 		cmd.Env = os.Environ()
 		for k, v := range p.Env {
 			cmd.Env = append(cmd.Env, k+"="+v)
@@ -175,7 +133,7 @@ func (s *Server) handleExec(params json.RawMessage) (any, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	err := cmd.Run()
+	err = cmd.Run()
 	rc := 0
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
@@ -200,4 +158,80 @@ func (s *Server) handleExec(params json.RawMessage) (any, error) {
 		Stderr:  stderrStr,
 		Changed: true,
 	}, nil
+}
+
+// execArgv builds the argv handleExec runs. This mirrors roughly what
+// ansible's classic SSH path does: resolve the command (either as an argv or
+// via `/bin/sh -c` when use_shell is set), then wrap it with
+// `sudo --user <user>` when a become_user is requested. The difference is
+// that ansible builds the wrapped command on the controller and ships it over
+// SSH, whereas we build it here on the target after receiving the Exec RPC.
+//
+// The sudo flags are:
+//
+//	--set-home        set HOME to the target user's home directory,
+//	                  matching ansible's classic become path.
+//	--non-interactive fail rather than prompt for a password. A
+//	                  prompt would deadlock the RPC; the caller is
+//	                  expected to ensure the agent has passwordless
+//	                  root-level sudo (true whenever ansible
+//	                  invoked us with `become: true`).
+//	--user <user>     run as <user>.
+//	--                end of sudo options; everything after is the
+//	                  command argv, so a command that starts with
+//	                  `-` isn't mis-parsed as a sudo flag.
+//
+// The task environment has to go inside the sudo, as
+// `/usr/bin/env -- K=V ... <argv>`. Set on the sudo process itself, sudo's
+// env_reset (the Debian default) drops everything outside env_keep, so a
+// task's `environment:` silently vanished: `go install` with GOPATH set
+// through `environment:` wrote to ~/go/bin instead. Ansible's classic path
+// has the same shape, since it puts the variables in the command string sudo
+// runs.
+func execArgv(p ExecParams) ([]string, error) {
+	var argv []string
+	switch {
+	case p.UseShell:
+		shellCmd := p.CmdString
+		if shellCmd == "" && len(p.Argv) > 0 {
+			shellCmd = strings.Join(p.Argv, " ")
+		}
+		argv = []string{"/bin/sh", "-c", shellCmd}
+	case len(p.Argv) > 0:
+		argv = p.Argv
+	case p.CmdString != "":
+		return nil, fmt.Errorf("exec: cmd_string without use_shell is not supported; send argv")
+	default:
+		return nil, fmt.Errorf("no command specified: set argv or cmd_string")
+	}
+	if p.BecomeUser == "" {
+		return argv, nil
+	}
+	wrapped := []string{
+		"sudo",
+		"--set-home",
+		"--non-interactive",
+		"--user", p.BecomeUser,
+		"--",
+	}
+	if len(p.Env) > 0 {
+		// env reads leading NAME=VALUE words as assignments, so a command
+		// whose own name contains "=" would be swallowed as one.
+		if strings.Contains(argv[0], "=") {
+			return nil, fmt.Errorf("exec: command %q contains '=' and cannot be run with environment and become_user", argv[0])
+		}
+		keys := make([]string, 0, len(p.Env))
+		for k := range p.Env {
+			if k == "" || strings.Contains(k, "=") {
+				return nil, fmt.Errorf("exec: invalid environment variable name %q", k)
+			}
+			keys = append(keys, k)
+		}
+		slices.Sort(keys)
+		wrapped = append(wrapped, "/usr/bin/env", "--")
+		for _, k := range keys {
+			wrapped = append(wrapped, k+"="+p.Env[k])
+		}
+	}
+	return append(wrapped, argv...), nil
 }

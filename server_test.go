@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"log/slog"
 	"os"
+	"os/exec"
 	"os/user"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -347,5 +349,76 @@ func TestMultipleRequests(t *testing.T) {
 		if resp.Error != nil {
 			t.Errorf("line %d: unexpected error: %v", i, resp.Error)
 		}
+	}
+}
+
+func TestExecArgvPutsBecomeEnvInsideSudo(t *testing.T) {
+	got, err := execArgv(ExecParams{
+		Argv:       []string{"/usr/local/go/bin/go", "install", "example.com/x@latest"},
+		Env:        map[string]string{"GOPATH": "/home/kevin", "GO111MODULE": "on"},
+		BecomeUser: "kevin",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"sudo", "--set-home", "--non-interactive", "--user", "kevin", "--",
+		"/usr/bin/env", "--", "GO111MODULE=on", "GOPATH=/home/kevin",
+		"/usr/local/go/bin/go", "install", "example.com/x@latest",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("execArgv =\n  %q\nwant\n  %q", got, want)
+	}
+}
+
+func TestExecArgvWithoutEnvOrBecome(t *testing.T) {
+	got, err := execArgv(ExecParams{Argv: []string{"true"}, Env: map[string]string{"A": "1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, []string{"true"}) {
+		t.Errorf("no become: execArgv = %q, want the bare argv (env goes on cmd.Env)", got)
+	}
+	got, err = execArgv(ExecParams{UseShell: true, CmdString: "echo hi", BecomeUser: "nobody"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"sudo", "--set-home", "--non-interactive", "--user", "nobody", "--", "/bin/sh", "-c", "echo hi"}
+	if !slices.Equal(got, want) {
+		t.Errorf("become without env: execArgv = %q, want %q", got, want)
+	}
+}
+
+func TestExecArgvRejectsAmbiguousBecomeEnv(t *testing.T) {
+	for _, p := range []ExecParams{
+		{Argv: []string{"true"}, Env: map[string]string{"A=B": "1"}, BecomeUser: "nobody"},
+		{Argv: []string{"true"}, Env: map[string]string{"": "1"}, BecomeUser: "nobody"},
+		{Argv: []string{"X=1"}, Env: map[string]string{"A": "1"}, BecomeUser: "nobody"},
+	} {
+		if _, err := execArgv(p); err == nil {
+			t.Errorf("execArgv(%+v) succeeded, want an error", p)
+		}
+	}
+}
+
+// The part of the become argv after sudo's `--` must set the task
+// environment for the command it runs.
+func TestExecArgvBecomeEnvTailSetsEnvironment(t *testing.T) {
+	argv, err := execArgv(ExecParams{
+		UseShell:   true,
+		CmdString:  `printf '%s|%s' "$GOPATH" "$SPACED"`,
+		Env:        map[string]string{"GOPATH": "/home/kevin", "SPACED": "a b"},
+		BecomeUser: "nobody",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tail := argv[slices.Index(argv, "--")+1:]
+	out, err := exec.Command(tail[0], tail[1:]...).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(out), "/home/kevin|a b"; got != want {
+		t.Errorf("env tail printed %q, want %q", got, want)
 	}
 }

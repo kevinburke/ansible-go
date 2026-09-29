@@ -2,6 +2,20 @@
 
 All notable changes to fastagent are documented in this file.
 
+## Unreleased
+
+### Changes
+
+- `command`/`shell` tasks with a non-root `become_user` now see their
+  `environment:`. The agent had set the variables on the `sudo` process, and
+  sudo's `env_reset` dropped them before the command ran, silently. For
+  example, a `go install` with `GOPATH` set through `environment:` wrote to
+  `~/go/bin` instead. The agent now passes them inside the sudo, as
+  `/usr/bin/env -- NAME=VALUE ... <argv>`, which is also how Ansible's
+  classic become path does it. An environment variable name that is empty or
+  contains `=`, or a command whose name contains `=`, is now an error on this
+  path, since `env` would misread it.
+
 ## 0.10.1 — September 28, 2026
 
 ### Changes

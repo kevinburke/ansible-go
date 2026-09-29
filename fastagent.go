@@ -45,7 +45,8 @@ type HelloResult struct {
 // ExecParams describes a command to execute.
 //
 // BecomeUser, if set, asks the agent to run the command as that user.
-// The agent wraps the invocation with `sudo -H -n -u <BecomeUser> --`;
+// The agent wraps the invocation with `sudo -H -n -u <BecomeUser> --`,
+// passing Env through `/usr/bin/env` inside the sudo (see execArgv);
 // this only works when the agent itself runs as root, which is the
 // case whenever Ansible's `become: true` is in effect.
 type ExecParams struct {
