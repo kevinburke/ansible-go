@@ -373,7 +373,7 @@ func TestWriteFileValidateKeepsExtension(t *testing.T) {
 			}); rpcErr != nil {
 				t.Fatal(rpcErr)
 			}
-			first := strings.SplitN(f.readLog(t), "\n", 2)[0]
+			first, _, _ := strings.Cut(f.readLog(t), "\n")
 			if filepath.Base(strings.TrimPrefix(first, "arg=")) != want {
 				t.Errorf("validated %q, want basename %q", first, want)
 			}

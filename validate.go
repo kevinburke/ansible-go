@@ -148,8 +148,7 @@ func splitextExt(name string) string {
 }
 
 func errnoOf(err error) int {
-	var errno unix.Errno
-	if errors.As(err, &errno) {
+	if errno, ok := errors.AsType[unix.Errno](err); ok {
 		return int(errno)
 	}
 	return int(unix.ENOENT)
