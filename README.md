@@ -356,9 +356,10 @@ Controller                          Remote Host
 - **Daemon**: persistent Go process on the remote host. Accepts JSON-RPC over
   a Unix socket. Handles Exec, Stat, ReadFile, WriteFile, File, Package,
   Service RPCs. Auto-exits after 1 hour idle.
-- **SSH forwarding**: `ssh -fN -L local.sock:remote.sock` runs once per connection
-  configuration and bridges the local and remote sockets. Persists across tasks
-  and forks.
+- **SSH forwarding**: a dedicated `ssh -fN -L local.sock:remote.sock` master
+  runs once per connection configuration and bridges the local and remote
+  sockets. It persists across tasks and forks, with its own `<local socket>.ctl`
+  control socket instead of the user's shared SSH ControlMaster.
 - **Connection plugin**: on each task, connects to the local socket, sends
   RPCs, disconnects. First task bootstraps the daemon and SSH forwarding.
 - **Action plugins**: intercept common modules and send RPCs directly instead
@@ -387,6 +388,40 @@ socket by a `<local socket>.lock` file, so two Ansible forks that
 bind. The loser waits on the lock (bounded, so a wedged holder can't hang
 every fork forever) and then reuses the winner's connection. Keep this file
 in place too, for the same reason.
+
+### SSH tunnel cleanup
+
+A failed local Hello triggers tunnel retirement under the socket setup lock.
+Fastagent sends `ssh -F none -S <local socket>.ctl -O stop <host>` to its dedicated
+master, then removes the forwarding socket pathname and starts a replacement.
+OpenSSH stops accepting control requests and exits after existing forwarded
+connections finish. Active RPCs retain their existing streams. Cleanup uses
+OpenSSH itself and does not require `lsof`. A failed control request is a visible
+connection error: fastagent preserves the socket and refuses to replace it.
+
+Tunnels started by older plugins have no `.ctl` socket. A healthy legacy tunnel
+is still reused. If it fails its Hello but still accepts local connections,
+fastagent reports an unmanaged listener and preserves it; retire that tunnel
+only after active tasks finish. A dead legacy socket (connect returns ENOENT or
+ECONNREFUSED) can be replaced safely. A stale `.ctl` file whose master cannot
+answer must also be inspected before removing it.
+
+On Linux, audit accumulated legacy tunnels with:
+
+```bash
+python3 scripts/audit-ssh-tunnels.py
+```
+
+The audit reads `/proc`, checks executable, user, forwarding arguments, and
+socket ownership, then uses Linux socket diagnostics to match each listener's
+filesystem inode to the socket pathname. It marks only unreachable listeners
+with no connected Unix sockets as cleanup candidates. Keep every reachable or active tunnel,
+even when several processes list the same pathname. A socket's filesystem inode
+is not the kernel socket inode, and PPID 1 is normal for `ssh -f`.
+The audit never signals processes or removes files. Before stopping a candidate,
+recheck its identity and open sockets; use a pidfd to avoid signalling a reused
+PID. Pause playbooks for any legacy listener you deliberately retire during
+migration. Never use a broad `pkill ssh` or unlink a socket to fix duplicates.
 
 If an RPC response is lost or malformed, fastagent reports an unknown execution
 outcome and stops using that stream. It does not retry the submitted operation;

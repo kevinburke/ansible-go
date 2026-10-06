@@ -56,6 +56,19 @@ python3 -m unittest -v tests.test_stat_differential
 The host needs Python 3 and passwordless sudo, and the agent binary must be
 available the way the connection plugin finds it (see Step 1 below).
 
+The SSH tunnel lifecycle regression uses a separate temporary Python echo
+server and needs only SSH access and Python 3 on the target:
+
+```bash
+FASTAGENT_TEST_TUNNEL_HOST=testhost python3 -m unittest discover \
+    -s plugins/connection -p 'fastagent_test.py' -k SshTunnelLifecycle -v
+```
+
+It replaces a private test tunnel three times, checks that an existing stream
+survives retirement, and waits for the retired SSH process to exit after the
+stream closes. It never uses production daemon sockets. The default suite
+skips this test unless the target is explicitly configured.
+
 ### Setup: install a development build
 
 To run this checkout, uncommitted changes included, against a real

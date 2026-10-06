@@ -145,7 +145,6 @@ import errno
 import json
 import os
 import shlex
-import signal
 import socket as socket_mod
 import stat
 import subprocess
@@ -865,38 +864,64 @@ class Connection(ConnectionBase):
             )
         display.vvv(f"FASTAGENT: daemon started at {remote_socket}", host=host)
 
-    def _kill_stale_forwarder(self, local_socket: str, host: str) -> None:
-        """Best-effort SIGTERM for any process still holding local_socket open.
+    def _retire_stale_forwarder(self, local_socket: str, host: str) -> None:
+        """Stop our dedicated SSH master and let existing channels drain.
 
-        `ssh -f` forks after authentication and the forked child (the one
-        that actually holds the listener open) is never a child of *this*
-        Python process, so we have no PID to track from the call that
-        created it. Shell out to `lsof` instead — it is standard on macOS
-        and virtually every Linux distro used as an Ansible controller. If
-        it is missing, skip the cleanup rather than fail the connection
-        over a leak: the caller unlinks and replaces the socket path
-        either way, so correctness does not depend on this succeeding.
+        OpenSSH's `-O stop` removes its control listener and, with -N,
+        exits once the remaining channels close. Unlinking local_socket
+        afterward prevents new clients reaching the retiring listener.
+        Unlike SIGTERM, this preserves RPCs already using the tunnel.
+        A failed retirement must never orphan a listener by unlinking it.
         """
-        try:
-            result = subprocess.run(
-                ["lsof", "-t", local_socket],
-                capture_output=True,
-                timeout=5,
-            )
-        except (OSError, subprocess.TimeoutExpired) as e:
-            display.vvv(f"FASTAGENT: could not check for stale forwarder: {e}", host=host)
-            return
-
-        for line in result.stdout.decode("utf-8", errors="replace").splitlines():
-            line = line.strip()
-            if not line.isdigit():
-                continue
-            pid = int(line)
-            display.vvv(f"FASTAGENT: killing stale local forwarder pid={pid}", host=host)
+        control_socket = local_socket + ".ctl"
+        if not os.path.lexists(control_socket):
+            # Upgrade path: an old -fN tunnel has no control socket. Never
+            # guess its PID or kill its clients. A refused connect proves
+            # the pathname has no listener; other failures prove nothing.
             try:
-                os.kill(pid, signal.SIGTERM)
+                with socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM) as sock:
+                    sock.settimeout(2)
+                    sock.connect(local_socket)
+            except (FileNotFoundError, ConnectionRefusedError):
+                return
             except OSError as e:
-                display.vvv(f"FASTAGENT: failed to kill stale forwarder pid={pid}: {e}", host=host)
+                raise AnsibleConnectionFailure(
+                    f"fastagent: cannot inspect local listener {local_socket}: {e}; "
+                    "preserving socket and refusing to start a replacement tunnel"
+                ) from e
+            raise AnsibleConnectionFailure(
+                f"fastagent: unmanaged SSH listener at {local_socket}; preserving "
+                "socket and refusing to start a replacement tunnel. Retire the "
+                "legacy tunnel after its active tasks finish, then retry. "
+                "See README's SSH tunnel cleanup instructions."
+            )
+
+        ssh_executable = self.get_option("ssh_executable") or "ssh"
+        # -O never opens a new SSH connection. Ignore ssh_config so its
+        # forwards/Match commands cannot affect this local control request.
+        cmd = [ssh_executable, "-F", "none", "-S", control_socket, "-O", "stop", host]
+        try:
+            info = os.lstat(control_socket)
+            if (not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_mode & 0o077):
+                raise AnsibleConnectionFailure(
+                    f"fastagent: unsafe SSH control socket {control_socket}; "
+                    "preserving socket and refusing to start a replacement tunnel"
+                )
+            result = subprocess.run(cmd, capture_output=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise AnsibleConnectionFailure(
+                f"fastagent: cannot retire SSH forwarder at {control_socket}: {e}; "
+                "preserving socket and refusing to start a replacement tunnel"
+            ) from e
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
+            raise AnsibleConnectionFailure(
+                f"fastagent: cannot retire SSH forwarder at {control_socket} "
+                f"(ssh exit {result.returncode}): {stderr}; preserving socket "
+                "and refusing to start a replacement tunnel"
+            )
+        display.vvv("FASTAGENT: retiring local SSH forwarder; active RPCs may finish", host=host)
 
     def _ensure_ssh_forwarding(
         self,
@@ -907,19 +932,21 @@ class Connection(ConnectionBase):
         remote_socket: str,
     ) -> None:
         """Start a background SSH session that forwards local_socket to remote_socket."""
-        # Clean up any stale local socket, and the `ssh -f -N -L` process
-        # still holding it open. That process is always some earlier
-        # forwarder — either from this same host+become combo (its remote
-        # side went stale) or the loser of a race with a concurrent
-        # ansible-playbook run against the same host. Either way, once we
-        # unlink its socket path nothing can reach it again, so leaving it
-        # running just orphans an SSH session to nothing forever.
-        self._kill_stale_forwarder(local_socket, host)
+        # Retirement runs under the setup lock. A successful stop drains
+        # active channels; removing the pathname prevents new connections
+        # to the old listener. On failure leave it reachable and report it.
+        self._retire_stale_forwarder(local_socket, host)
         if os.path.exists(local_socket):
             os.remove(local_socket)
 
         ssh_executable = self.get_option("ssh_executable") or "ssh"
-        cmd = [ssh_executable]
+        control_socket = local_socket + ".ctl"
+        # SSH uses the first value for -o options. These must precede
+        # ssh_args to isolate this tunnel from the user's shared masters.
+        cmd = [ssh_executable,
+               "-o", "ControlMaster=yes",
+               "-o", "ControlPersist=no",
+               "-o", "ExitOnForwardFailure=yes"]
 
         ssh_args = self.get_option("ssh_args")
         if ssh_args:
@@ -938,8 +965,7 @@ class Connection(ConnectionBase):
         # -N: no remote command
         # -L: forward local Unix socket to remote Unix socket
         cmd.extend([
-            "-f", "-N",
-            "-o", "ExitOnForwardFailure=yes",
+            "-S", control_socket, "-f", "-N",
             "-L", f"{local_socket}:{remote_socket}",
             host,
         ])
@@ -976,13 +1002,14 @@ class Connection(ConnectionBase):
 
         # Wait for the local socket to appear.
         for _ in range(10):
-            if os.path.exists(local_socket):
+            if os.path.exists(local_socket) and os.path.exists(control_socket):
                 display.vvv(f"FASTAGENT: SSH forwarding established", host=host)
                 return
             time_mod.sleep(0.05)
 
         raise AnsibleConnectionFailure(
-            f"fastagent: SSH forwarding socket {local_socket} did not appear"
+            f"fastagent: SSH forwarding or control socket did not appear: "
+            f"{local_socket}, {control_socket}"
         )
 
     def exec_command(

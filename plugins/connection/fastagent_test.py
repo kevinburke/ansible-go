@@ -16,7 +16,9 @@ import contextlib
 import fcntl
 import json
 import os
+import re
 import select
+import signal
 import socket as socket_mod
 import stat as stat_module
 import subprocess
@@ -1022,6 +1024,9 @@ class TestConnectionIsolation(unittest.TestCase):
 
     def test_socket_names_fit_unix_limit_for_long_hostnames(self):
         local, remote = self._paths(host="x" * 180 + ".example.com")
+        # OpenSSH appends a dot plus 16 random characters while binding
+        # the control socket atomically, before renaming it into place.
+        self.assertLess(len((local + ".ctl").encode()) + 17, 104)
         self.assertLess(len(local.encode()), 104)
         self.assertLess(len(remote.encode()), 104)
 
@@ -1256,58 +1261,99 @@ class TestDeferredHello(unittest.TestCase):
     _FASTAGENT_IMPORT_ERROR is not None,
     "ansible is required to run connection plugin tests",
 )
-class TestKillStaleForwarder(unittest.TestCase):
-    """`ssh -f` forks after auth, so the forwarder that actually holds the
-    local socket open is never a child of this process — we can only find
-    it by asking who currently has the path open.
-    """
+class TestRetireStaleForwarder(unittest.TestCase):
+    def setUp(self):
+        patch = mock.patch.object(fastagent_plugin.os, "lstat", return_value=types.SimpleNamespace(
+            st_mode=stat_module.S_IFSOCK | 0o600, st_uid=os.getuid()))
+        patch.start()
+        self.addCleanup(patch.stop)
 
-    def test_kills_pids_reported_by_lsof(self) -> None:
+    def _conn(self):
         conn = _bare_connection()
-        completed = subprocess.CompletedProcess(
-            args=["lsof"], returncode=0, stdout=b"1234\n5678\n", stderr=b"")
+        conn.get_option = lambda key: "ssh" if key == "ssh_executable" else None
+        return conn
 
-        with mock.patch.object(fastagent_plugin.subprocess, "run",
-                                return_value=completed) as mock_run, \
-             mock.patch.object(fastagent_plugin.os, "kill") as mock_kill:
-            conn._kill_stale_forwarder(
-                "/tmp/fastagent-local-host-root-0.0.0.sock", "test-host")
+    def test_cleanup_failure_preserves_socket_and_prevents_replacement(self):
+        conn = self._conn()
+        with mock.patch.object(fastagent_plugin.os.path, "lexists", return_value=True), \
+             mock.patch.object(fastagent_plugin.subprocess, "run",
+                               side_effect=FileNotFoundError("ssh missing")), \
+             mock.patch.object(fastagent_plugin.os, "remove") as remove:
+            with self.assertRaisesRegex(fastagent_plugin.AnsibleConnectionFailure,
+                                        "cannot retire.*preserving"):
+                conn._ensure_ssh_forwarding("host", None, None, "/tmp/local.sock", "/tmp/remote.sock")
+        remove.assert_not_called()
 
-        mock_run.assert_called_once_with(
-            ["lsof", "-t", "/tmp/fastagent-local-host-root-0.0.0.sock"],
-            capture_output=True,
-            timeout=5,
-        )
-        mock_kill.assert_has_calls([
-            mock.call(1234, fastagent_plugin.signal.SIGTERM),
-            mock.call(5678, fastagent_plugin.signal.SIGTERM),
-        ])
+    def test_stop_drains_connections_without_signalling_processes(self):
+        conn = self._conn()
+        completed = subprocess.CompletedProcess([], 0, b"", b"")
+        with mock.patch.object(fastagent_plugin.os.path, "lexists", return_value=True), \
+             mock.patch.object(fastagent_plugin.subprocess, "run", return_value=completed) as run, \
+             mock.patch.object(fastagent_plugin.os, "kill") as kill:
+            conn._retire_stale_forwarder("/tmp/local.sock", "host")
+        self.assertEqual(run.call_args.args[0],
+                         ["ssh", "-F", "none", "-S", "/tmp/local.sock.ctl", "-O", "stop", "host"])
+        kill.assert_not_called()
 
-    def test_missing_lsof_is_non_fatal(self) -> None:
-        conn = _bare_connection()
-        with mock.patch.object(fastagent_plugin.subprocess, "run",
-                                side_effect=FileNotFoundError()), \
-             mock.patch.object(fastagent_plugin.os, "kill") as mock_kill:
-            conn._kill_stale_forwarder("/tmp/fake.sock", "test-host")
-        mock_kill.assert_not_called()
+    def test_nonzero_exit_and_timeout_are_visible(self):
+        for outcome in (subprocess.CompletedProcess([], 255, b"", b"control socket refused"),
+                        subprocess.TimeoutExpired("ssh", 5)):
+            with self.subTest(outcome=outcome):
+                conn = self._conn()
+                with mock.patch.object(fastagent_plugin.os.path, "lexists", return_value=True), \
+                     mock.patch.object(fastagent_plugin.subprocess, "run") as run:
+                    if isinstance(outcome, Exception):
+                        run.side_effect = outcome
+                    else:
+                        run.return_value = outcome
+                    with self.assertRaisesRegex(fastagent_plugin.AnsibleConnectionFailure, "preserving"):
+                        conn._retire_stale_forwarder("/tmp/local.sock", "host")
 
-    def test_already_dead_pid_does_not_raise(self) -> None:
-        conn = _bare_connection()
-        completed = subprocess.CompletedProcess(
-            args=["lsof"], returncode=0, stdout=b"999\n", stderr=b"")
-        with mock.patch.object(fastagent_plugin.subprocess, "run",
-                                return_value=completed), \
-             mock.patch.object(fastagent_plugin.os, "kill",
-                                side_effect=ProcessLookupError()):
-            conn._kill_stale_forwarder("/tmp/fake.sock", "test-host")
+    def test_live_legacy_listener_is_preserved(self):
+        conn = self._conn()
+        with mock.patch.object(fastagent_plugin.os.path, "lexists", return_value=False), \
+             mock.patch.object(fastagent_plugin.socket_mod, "socket") as socket:
+            with self.assertRaisesRegex(fastagent_plugin.AnsibleConnectionFailure, "unmanaged.*preserving"):
+                conn._retire_stale_forwarder("/tmp/local.sock", "host")
+        socket.return_value.__enter__.return_value.connect.assert_called_once_with("/tmp/local.sock")
+
+    def test_dead_legacy_socket_and_absent_socket_allow_setup(self):
+        for error in (ConnectionRefusedError(), FileNotFoundError()):
+            with self.subTest(error=error):
+                conn = self._conn()
+                with mock.patch.object(fastagent_plugin.os.path, "lexists", return_value=False), \
+                     mock.patch.object(fastagent_plugin.socket_mod, "socket") as socket:
+                    socket.return_value.__enter__.return_value.connect.side_effect = error
+                    conn._retire_stale_forwarder("/tmp/local.sock", "host")
+
+    def test_permission_error_is_not_mistaken_for_dead_listener(self):
+        conn = self._conn()
+        with mock.patch.object(fastagent_plugin.os.path, "lexists", return_value=False), \
+             mock.patch.object(fastagent_plugin.socket_mod, "socket") as socket:
+            socket.return_value.__enter__.return_value.connect.side_effect = PermissionError("denied")
+            with self.assertRaisesRegex(fastagent_plugin.AnsibleConnectionFailure, "cannot inspect.*preserving"):
+                conn._retire_stale_forwarder("/tmp/local.sock", "host")
+
+    def test_unsafe_control_socket_is_preserved(self):
+        for mode, uid in ((stat_module.S_IFLNK | 0o600, os.getuid()),
+                          (stat_module.S_IFSOCK | 0o600, os.getuid() + 1),
+                          (stat_module.S_IFSOCK | 0o666, os.getuid())):
+            with self.subTest(mode=mode, uid=uid):
+                conn = self._conn()
+                with mock.patch.object(fastagent_plugin.os.path, "lexists", return_value=True), \
+                     mock.patch.object(fastagent_plugin.os, "lstat", return_value=types.SimpleNamespace(st_mode=mode, st_uid=uid)), \
+                     mock.patch.object(fastagent_plugin.subprocess, "run") as run:
+                    with self.assertRaisesRegex(fastagent_plugin.AnsibleConnectionFailure, "unsafe.*preserving"):
+                        conn._retire_stale_forwarder("/tmp/local.sock", "host")
+                run.assert_not_called()
 
 
 @unittest.skipIf(
     _FASTAGENT_IMPORT_ERROR is not None,
     "ansible is required to run connection plugin tests",
 )
-class TestEnsureSshForwardingKillsStaleForwarder(unittest.TestCase):
-    def test_kills_stale_forwarder_before_replacing_socket(self) -> None:
+class TestEnsureSshForwardingRetiresStaleForwarder(unittest.TestCase):
+    def test_retires_stale_forwarder_before_replacing_socket(self) -> None:
         conn = _bare_connection()
         conn.get_option = lambda key, *a, **kw: {
             "ssh_executable": "ssh",
@@ -1319,7 +1365,7 @@ class TestEnsureSshForwardingKillsStaleForwarder(unittest.TestCase):
         completed = subprocess.CompletedProcess(
             args=["ssh"], returncode=0, stdout=b"", stderr=b"")
 
-        with mock.patch.object(conn, "_kill_stale_forwarder") as mock_kill, \
+        with mock.patch.object(conn, "_retire_stale_forwarder") as retire, \
              mock.patch.object(fastagent_plugin.os.path, "exists", return_value=True), \
              mock.patch.object(fastagent_plugin.os, "remove") as mock_remove, \
              mock.patch.object(fastagent_plugin.subprocess, "run", return_value=completed):
@@ -1327,8 +1373,142 @@ class TestEnsureSshForwardingKillsStaleForwarder(unittest.TestCase):
                 "serval", "kevin", None, local_socket,
                 "/tmp/fastagent-root-0.0.0.sock")
 
-        mock_kill.assert_called_once_with(local_socket, "serval")
+        retire.assert_called_once_with(local_socket, "serval")
         mock_remove.assert_called_once_with(local_socket)
+
+    def test_tunnel_has_its_own_master_even_with_shared_ssh_args(self):
+        conn = _bare_connection()
+        conn.get_option = lambda key: {
+            "ssh_args": "-o ControlMaster=auto -o ControlPersist=60s -S /tmp/shared",
+        }.get(key)
+        with mock.patch.object(conn, "_retire_stale_forwarder"), \
+             mock.patch.object(fastagent_plugin.os.path, "exists", return_value=True), \
+             mock.patch.object(fastagent_plugin.os, "remove"), \
+             mock.patch.object(fastagent_plugin.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 0, b"", b"")) as run:
+            conn._ensure_ssh_forwarding("host", None, None, "/tmp/local.sock", "/tmp/remote.sock")
+        cmd = run.call_args.args[0]
+        self.assertLess(cmd.index("ControlMaster=yes"), cmd.index("ControlMaster=auto"))
+        self.assertLess(cmd.index("ControlPersist=no"), cmd.index("ControlPersist=60s"))
+        self.assertEqual(cmd[len(cmd) - 6:],
+                         ["/tmp/local.sock.ctl", "-f", "-N", "-L", "/tmp/local.sock:/tmp/remote.sock", "host"])
+
+    def test_missing_control_socket_is_a_visible_startup_failure(self):
+        conn = _bare_connection()
+        conn.get_option = lambda key: None
+        with mock.patch.object(conn, "_retire_stale_forwarder"), \
+             mock.patch.object(fastagent_plugin.os.path, "exists", side_effect=lambda p: not p.endswith(".ctl")), \
+             mock.patch.object(fastagent_plugin.os, "remove"), \
+             mock.patch.object(fastagent_plugin.time_mod, "sleep"), \
+             mock.patch.object(fastagent_plugin.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 0, b"", b"")):
+            with self.assertRaisesRegex(fastagent_plugin.AnsibleConnectionFailure, "control socket did not appear"):
+                conn._ensure_ssh_forwarding("host", None, None, "/tmp/local.sock", "/tmp/remote.sock")
+
+
+@unittest.skipIf(_FASTAGENT_IMPORT_ERROR is not None, "ansible is required")
+@unittest.skipUnless(os.environ.get("FASTAGENT_TEST_TUNNEL_HOST"), "set FASTAGENT_TEST_TUNNEL_HOST for real SSH lifecycle test")
+class TestSshTunnelLifecycle(unittest.TestCase):
+    def test_replacement_drains_active_stream_and_reaps_idle_master(self):
+        host = os.environ["FASTAGENT_TEST_TUNNEL_HOST"]
+        # This isolated echo server performs no agent RPCs and uses only
+        # temporary sockets. Closing stdin shuts it down and removes them.
+        server_code = '''
+import os, socket, sys, tempfile, threading
+def echo(conn):
+    with conn:
+        while True:
+            data = conn.recv(4096)
+            if not data:
+                return
+            conn.sendall(data)
+def accept(server):
+    while True:
+        conn, _ = server.accept()
+        threading.Thread(target=echo, args=(conn,), daemon=True).start()
+with tempfile.TemporaryDirectory(prefix="fa-echo-", dir="/tmp") as directory:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+        path = directory + "/echo.sock"
+        server.bind(path)
+        server.listen()
+        threading.Thread(target=accept, args=(server,), daemon=True).start()
+        print(path, flush=True)
+        sys.stdin.readline()
+'''
+        server = subprocess.Popen(
+            ["ssh", "-o", "BatchMode=yes", host, "python3 -u -c " + shlex_quote(server_code)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        conn = _bare_connection()
+        conn.get_option = lambda key: {
+            # Both the config and these arguments may enable sharing. Our
+            # dedicated master must take precedence over either source.
+            "ssh_args": "-o BatchMode=yes -o ControlMaster=auto -o ControlPersist=60s -S /tmp/fa-shared",
+        }.get(key)
+        known_pids = set()
+        streams = []
+
+        def echo(stream, message):
+            stream.sendall(message)
+            response = b""
+            while len(response) < len(message):
+                part = stream.recv(len(message) - len(response))
+                self.assertTrue(part, "echo stream closed early")
+                response += part
+            self.assertEqual(response, message)
+
+        try:
+            self.assertTrue(select.select([server.stdout], [], [], 15)[0], "echo server did not become ready")
+            remote = server.stdout.readline().decode().strip()
+            self.assertTrue(remote.startswith("/tmp/fa-echo-"), remote)
+            with tempfile.TemporaryDirectory(prefix="fa-tunnel-", dir="/tmp") as directory:
+                local = directory + "/local.sock"
+                try:
+                    for cycle in range(3):
+                        conn._ensure_ssh_forwarding(host, None, None, local, remote)
+                        check = subprocess.run(
+                            ["ssh", "-F", "none", "-S", local + ".ctl", "-O", "check", host],
+                            capture_output=True, timeout=5, check=True,
+                        )
+                        match = re.search(rb"pid=(\d+)", check.stderr)
+                        self.assertIsNotNone(match, check.stderr)
+                        pid = int(match.group(1))
+                        self.assertNotIn(pid, known_pids)
+                        known_pids.add(pid)
+                        if streams:
+                            old, old_pid = streams[-1]
+                            echo(old, b"still running\n")
+                            old.close()
+                            deadline = time.monotonic() + 5
+                            while True:
+                                try:
+                                    os.kill(old_pid, 0)
+                                except ProcessLookupError:
+                                    known_pids.remove(old_pid)
+                                    break
+                                if time.monotonic() >= deadline:
+                                    self.fail(f"retired master {old_pid} did not exit after its stream closed")
+                                time.sleep(0.05)
+                        stream = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+                        streams.append((stream, pid))
+                        stream.settimeout(5)
+                        stream.connect(local)
+                        echo(stream, b"hello\n")
+                finally:
+                    for stream, _ in streams:
+                        stream.close()
+                    if os.path.exists(local + ".ctl"):
+                        conn._retire_stale_forwarder(local, host)
+        finally:
+            # These PIDs came from this test's private control socket.
+            # Clean up even if an assertion failed partway through setup.
+            for pid in known_pids:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            stdout, stderr = server.communicate(input=b"\n", timeout=10)
+            self.assertEqual(server.returncode, 0, stderr.decode())
 
 
 @unittest.skipIf(
@@ -1522,7 +1702,7 @@ class TestEnsureSshForwardingBindRace(unittest.TestCase):
         )
 
         probe_results = iter([False, True])
-        with mock.patch.object(conn, "_kill_stale_forwarder"), \
+        with mock.patch.object(conn, "_retire_stale_forwarder"), \
              mock.patch.object(fastagent_plugin.os.path, "exists", return_value=True), \
              mock.patch.object(fastagent_plugin.os, "remove"), \
              mock.patch.object(fastagent_plugin.subprocess, "run", return_value=failed), \
@@ -1546,7 +1726,7 @@ class TestEnsureSshForwardingBindRace(unittest.TestCase):
             stderr=b"Address already in use\n",
         )
 
-        with mock.patch.object(conn, "_kill_stale_forwarder"), \
+        with mock.patch.object(conn, "_retire_stale_forwarder"), \
              mock.patch.object(fastagent_plugin.os.path, "exists", return_value=True), \
              mock.patch.object(fastagent_plugin.os, "remove"), \
              mock.patch.object(fastagent_plugin.subprocess, "run", return_value=failed), \
@@ -1566,7 +1746,7 @@ class TestEnsureSshForwardingBindRace(unittest.TestCase):
             stderr=b"Permission denied (publickey).\n",
         )
 
-        with mock.patch.object(conn, "_kill_stale_forwarder"), \
+        with mock.patch.object(conn, "_retire_stale_forwarder"), \
              mock.patch.object(fastagent_plugin.os.path, "exists", return_value=True), \
              mock.patch.object(fastagent_plugin.os, "remove"), \
              mock.patch.object(fastagent_plugin.subprocess, "run", return_value=failed), \
@@ -1760,7 +1940,7 @@ class TestLocalFilesystemDiagnostics(unittest.TestCase):
                    b"/tmp/fastagent-local-host-root-0.0.0.sock: "
                    b"No space left on device\n",
         )
-        with mock.patch.object(conn, "_kill_stale_forwarder"), \
+        with mock.patch.object(conn, "_retire_stale_forwarder"), \
              mock.patch.object(fastagent_plugin.os.path, "exists", return_value=False), \
              mock.patch.object(fastagent_plugin.subprocess, "run", return_value=failed):
             with self.assertRaises(fastagent_plugin.AnsibleConnectionFailure) as ctx:
