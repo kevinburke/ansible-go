@@ -180,13 +180,13 @@ if [ "$actual" != "$size" ]; then
     echo "fastagent: received $actual bytes for $dest, expected $size" >&2
     exit 1
 fi
-chmod 0755 -- "$tmp"
+chmod -- 0755 "$tmp"
 mv -f -- "$tmp" "$dest"
 trap - EXIT
 '''
 
 # Agent version must match the Go constant.
-AGENT_VERSION = "0.11.0"
+AGENT_VERSION = "0.11.1"
 
 # Bound on how long a controller process waits for another process's
 # local-socket setup lock (see _local_socket_setup_lock) before giving up.

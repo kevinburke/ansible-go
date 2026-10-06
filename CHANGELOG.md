@@ -2,6 +2,35 @@
 
 All notable changes to fastagent are documented in this file.
 
+## 0.11.1 — October 6, 2026
+
+### Bug fixes
+
+- SSH forwarders now use dedicated control sockets. When a tunnel fails its
+  Hello, fastagent asks OpenSSH to stop accepting connections before replacing
+  the forwarding socket. Active RPCs finish on their existing streams, and
+  the retired SSH master exits once they close. Previously, cleanup could
+  silently fail when `lsof` was unavailable, leaving an unreachable SSH
+  listener behind each time the socket was replaced.
+- Failed control requests and unsafe control sockets now produce a visible
+  connection error and preserve the forwarding socket. Healthy tunnels from
+  older plugins are still reused. A failed legacy tunnel that still accepts
+  connections is preserved and reported as unmanaged; a dead legacy socket
+  can be replaced safely.
+- The agent upload script now places `chmod`'s end-of-options marker before
+  the mode, which works with both Linux and macOS. The local atomic-upload
+  regression test previously failed on macOS because `chmod` interpreted
+  the marker after the mode as a filename.
+
+### Tools and documentation
+
+- Added `scripts/audit-ssh-tunnels.py`, a read-only Linux audit that checks
+  process identity, socket ownership and listener reachability. It identifies
+  idle, unreachable legacy listeners as cleanup candidates while preserving
+  reachable, active and unverified listeners. The README documents tunnel
+  retirement and migration, and `docs/testing.md` describes the opt-in real
+  SSH lifecycle regression test.
+
 ## 0.11.0 — September 29, 2026
 
 ### Changes
