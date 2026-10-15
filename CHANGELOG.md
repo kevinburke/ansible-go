@@ -2,7 +2,7 @@
 
 All notable changes to fastagent are documented in this file.
 
-## Unreleased
+## 0.11.2 — October 15, 2026
 
 ### Changes
 
@@ -16,10 +16,10 @@ All notable changes to fastagent are documented in this file.
   active channels. Bootstrap uses separate command helpers with an explicit
   control socket argument; it cannot change the ordinary SSH command builder
   or the connection identity through mutable bootstrap state.
-  In a three-run comparison to columbus-buckeye, five
-  read-only probes plus tunnel setup fell from a median of 4.165 seconds to
-  1.216 seconds. This measures SSH setup, not a complete Ansible task or
-  agent deployment.
+  In a three-run comparison to columbus-buckeye, five read-only probes plus
+  tunnel setup fell from a median of 4.165 seconds to 1.216 seconds. This
+  measures SSH setup, not a complete Ansible task or agent deployment.
+- Updated `golang.org/x/sys` from v0.48.0 to v0.49.0.
 
 ## 0.11.1 — October 6, 2026
 
