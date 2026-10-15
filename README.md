@@ -123,6 +123,11 @@ ansible_connection=kevinburke.fastagent.fastagent
 ansible_user=deploy
 ```
 
+Set `ansible_user` explicitly when the play uses `become`, even if
+`~/.ssh/config` already sets `User` for the host. Ansible never sees the SSH
+config's user, and the root daemon needs to know which account may connect to
+its socket. Without it, fastagent stops with an error naming the host.
+
 Or via `group_vars/`:
 
 ```yaml

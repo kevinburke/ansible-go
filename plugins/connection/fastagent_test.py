@@ -1131,6 +1131,41 @@ class TestConnectionIsolation(unittest.TestCase):
             self.assertNotEqual(probe.call_args_list[0].args[0], probe.call_args_list[1].args[0])
 
 
+    def test_become_without_remote_user_fails_before_any_ssh(self):
+        # A root daemon started without --allow-user makes its socket
+        # unreachable for the SSH user, so every connection is reset. The
+        # user ssh_config supplies is invisible to Ansible, so refuse to
+        # bootstrap rather than start a daemon nobody can reach.
+        for user in (None, ""):
+            with self.subTest(remote_user=user):
+                conn = _bare_connection()
+                conn._use_become = True
+                options = {"host": "serval", "remote_user": user, "port": 22}
+                conn.get_option = lambda key, *a, **kw: options.get(key)
+                with mock.patch.object(conn, "_try_local_socket") as probe, \
+                     mock.patch.object(conn, "_ensure_remote_daemon") as daemon, \
+                     mock.patch.object(conn, "_ensure_ssh_forwarding") as forward:
+                    with self.assertRaises(fastagent_plugin.AnsibleConnectionFailure) as ctx:
+                        conn._connect()
+                message = str(ctx.exception)
+                self.assertIn("serval", message)
+                self.assertIn("ansible_user", message)
+                probe.assert_not_called()
+                daemon.assert_not_called()
+                forward.assert_not_called()
+
+    def test_no_remote_user_is_fine_without_become(self):
+        # The daemon then runs as the SSH user and owns its own socket.
+        local, remote = self._paths(remote_user=None)
+        self.assertTrue(local.startswith("/tmp/fastagent-local-"))
+        self.assertTrue(remote.startswith("/tmp/fastagent-"))
+
+    def test_root_remote_user_with_become_needs_no_allow_user(self):
+        # Root owns the socket it connects to, so no wrap and no flag.
+        local, _ = self._paths(remote_user="root", become=True)
+        self.assertTrue(local.startswith("/tmp/fastagent-local-"))
+
+
 class _HangUpServer:
     """Answers Hello, then records requests and optionally hangs up.
 

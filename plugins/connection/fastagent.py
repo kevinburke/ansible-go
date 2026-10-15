@@ -517,6 +517,20 @@ class Connection(ConnectionBase):
         # which skips become entirely when remote_user equals become_user.
         wrap_with_sudo = use_become and user != "root"
 
+        # A root daemon creates its socket mode 0700 and opens it only to the
+        # --allow-user account. Without a user the daemon starts anyway, and
+        # then resets every connection from the SSH user ("Connection reset
+        # by peer"). A User line in ~/.ssh/config does not help: Ansible
+        # never sees it. Fail here, before any SSH, naming the fix.
+        if wrap_with_sudo and not user:
+            raise AnsibleConnectionFailure(
+                f"fastagent: no remote user for {host}. This play uses become, "
+                "so the daemon runs as root and must be told which user may "
+                "connect to its socket; without that every connection would "
+                "be refused. Set ansible_user (or remote_user) for this host, "
+                "even if ~/.ssh/config already sets User."
+            )
+
         # Include the actual SSH arguments, including omitted user/port options
         # that SSH may resolve from its configuration. Hashing keeps arbitrary
         # hostnames and options out of filenames and below Unix socket limits.
