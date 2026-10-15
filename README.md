@@ -4,14 +4,18 @@ A drop-in Ansible accelerator. Replace your remote execution path with a
 persistent Go agent and cut playbook run times.
 
 ```
-SSH + pipelining (baseline):  57-69s
-fastagent (overrides firing): 30s     (~50% faster)
+SSH + pipelining (baseline):  133s
+fastagent (overrides firing): 34s      (~75% faster, 3.9x)
 ```
 
-Measured on a converged 250-task playbook against a low-latency LAN host.
-Speedup grows with task count, network latency, and number of changed tasks.
-On a fast LAN with mostly-converged ("ok") tasks, the floor is set by Ansible's
-own per-task Python overhead (~50ms per task), not the connection plugin.
+Measured on a converged 250-task playbook (stat, file, copy, command, shell,
+apt, systemd; every task "ok", with become) against a host 59 ms away over
+Tailscale. Median of 5 alternating runs each, with fastagent 0.11.2 and
+Ansible 2.21.4; ranges were 132-137s and 33-36s. Reproduce with
+`scripts/bench/bench.sh HOST`. Speedup grows with task count, network latency,
+and number of changed tasks. On a fast LAN with mostly-converged ("ok") tasks
+the gap is smaller: the floor is set by Ansible's own per-task Python overhead
+(~50ms per task, measured on an earlier version), not the connection plugin.
 
 The speedup comes from **action plugin overrides** that replace Python module
 transfer with direct Go RPCs for common modules (`command`, `shell`, `copy`,
