@@ -599,10 +599,11 @@ _REAL_SUBPROCESS_RUN = subprocess.run
     "ansible is required to run connection plugin tests",
 )
 class TestEnsureAgentDeployed(unittest.TestCase):
-    """The agent binary is uploaded over the same ssh command as every
-    other bootstrap step, so ssh_args (-F, ProxyJump, host key options,
-    ControlPath) apply to it too. It used to go through a separate scp
-    invocation that only got -i and -P.
+    """Binary uploads use the same dedicated SSH master as bootstrap probes.
+
+    Configured SSH arguments are preserved, with the explicit bootstrap
+    control socket taking precedence. Uploads used to go through a separate
+    scp invocation that only got -i and -P.
     """
 
     def _conn(self, options):
@@ -627,7 +628,8 @@ class TestEnsureAgentDeployed(unittest.TestCase):
         self.addCleanup(os.unlink, binary.name)
         with mock.patch.object(conn, "_find_local_binary", return_value=binary.name), \
                 mock.patch.object(fastagent_plugin.subprocess, "run", side_effect=fake_run):
-            conn._ensure_agent_deployed("fabench", None, None, remote_path, "arm64")
+            conn._ensure_agent_deployed("fabench", None, None, remote_path, "arm64",
+                                        control_socket="/tmp/test-bootstrap.ctl")
         return calls, binary.name
 
     def test_upload_uses_ssh_command_and_args(self):
@@ -647,7 +649,9 @@ class TestEnsureAgentDeployed(unittest.TestCase):
         self.assertEqual(len(calls), 2, calls)
         upload_cmd = calls[1]
         self.assertEqual(upload_cmd[0], "/usr/bin/ssh")
-        self.assertEqual(upload_cmd[1:5], ["-F", "/cfg/ssh_config", "-o", "ProxyJump=bastion"])
+        self.assertEqual(upload_cmd[5:9], ["-F", "/cfg/ssh_config", "-o", "ProxyJump=bastion"])
+        for cmd in calls:
+            self.assertEqual(cmd[-4:-2], ["-S", "/tmp/test-bootstrap.ctl"])
         self.assertIn("fabench", upload_cmd)
         self.assertFalse(any("scp" in part for part in upload_cmd[:-1]), upload_cmd)
 
@@ -754,15 +758,16 @@ class TestEnsureRemoteDaemon(unittest.TestCase):
                     conn = self._conn()
                     conn.get_option = lambda key, *a, **kw: binary if key == "agent_path" else None
 
-                    def run_probe(host, user, port, command):
+                    def run_probe(host, user, port, command, *, control_socket):
                         self.assertIn("--connect --socket", command)
                         result = subprocess.run(["sh", "-c", command], capture_output=True, text=True, timeout=5)
                         return result.returncode, result.stdout, result.stderr
 
-                    with mock.patch.object(conn, "_run_ssh_command", side_effect=run_probe) as ssh, \
+                    with mock.patch.object(conn, "_run_bootstrap_ssh_command", side_effect=run_probe) as ssh, \
                          mock.patch.object(conn, "_detect_remote_arch", return_value="amd64"), \
                          mock.patch.object(conn, "_ensure_agent_deployed"):
-                        conn._ensure_remote_daemon("localhost", None, 22, path, False)
+                        conn._ensure_remote_daemon("localhost", None, 22, path, False,
+                                                   control_socket="/tmp/test-bootstrap.ctl")
                     self.assertEqual(ssh.call_count, 1)
                     self.assertIsNone(daemon.poll())
                 finally:
@@ -778,13 +783,13 @@ class TestEnsureRemoteDaemon(unittest.TestCase):
         conn = self._conn()
         commands = []
 
-        def run_ssh(host, user, port, command):
+        def run_ssh(host, user, port, command, *, control_socket):
             commands.append(command)
             if command.startswith("test -S "):
                 return 1, "", ""
             return 0, "", ""
 
-        with mock.patch.object(conn, "_run_ssh_command", side_effect=run_ssh), \
+        with mock.patch.object(conn, "_run_bootstrap_ssh_command", side_effect=run_ssh), \
              mock.patch.object(conn, "_detect_remote_arch", return_value="amd64"), \
              mock.patch.object(conn, "_ensure_agent_deployed"):
             conn._ensure_remote_daemon(
@@ -793,6 +798,7 @@ class TestEnsureRemoteDaemon(unittest.TestCase):
                 None,
                 f"/tmp/fastagent-root-{fastagent_plugin.AGENT_VERSION}.sock",
                 True,
+                control_socket="/tmp/test-bootstrap.ctl",
             )
 
         start_cmd = commands[-1]
@@ -824,13 +830,13 @@ class TestEnsureRemoteDaemon(unittest.TestCase):
         conn = self._conn()
         commands = []
 
-        def run_ssh(host, user, port, command):
+        def run_ssh(host, user, port, command, *, control_socket):
             commands.append(command)
             if command.startswith("test -S "):
                 return 1, "", ""
             return 0, "", ""
 
-        with mock.patch.object(conn, "_run_ssh_command", side_effect=run_ssh), \
+        with mock.patch.object(conn, "_run_bootstrap_ssh_command", side_effect=run_ssh), \
              mock.patch.object(conn, "_detect_remote_arch", return_value="amd64"), \
              mock.patch.object(conn, "_ensure_agent_deployed"):
             conn._ensure_remote_daemon(
@@ -839,6 +845,7 @@ class TestEnsureRemoteDaemon(unittest.TestCase):
                 None,
                 f"/tmp/fastagent-root-{fastagent_plugin.AGENT_VERSION}.sock",
                 False,  # wrap_with_sudo: False because remote_user is root
+                control_socket="/tmp/test-bootstrap.ctl",
             )
 
         start_cmd = commands[-1]
@@ -854,19 +861,20 @@ class TestEnsureRemoteDaemon(unittest.TestCase):
         conn = self._conn()
         commands = []
 
-        def run_ssh(host, user, port, command):
+        def run_ssh(host, user, port, command, *, control_socket):
             commands.append(command)
             if "--connect --socket" in command:
                 return 1, "", "connection refused"
             return 0, "", ""
 
-        with mock.patch.object(conn, "_run_ssh_command", side_effect=run_ssh), \
+        with mock.patch.object(conn, "_run_bootstrap_ssh_command", side_effect=run_ssh), \
              mock.patch.object(conn, "_detect_remote_arch", return_value="amd64"), \
              mock.patch.object(conn, "_ensure_agent_deployed"):
             conn._ensure_remote_daemon(
                 "serval", "admin", None,
                 f"/tmp/fastagent-root-{fastagent_plugin.AGENT_VERSION}.sock",
                 True,
+                control_socket="/tmp/test-bootstrap.ctl",
             )
 
         liveness_cmd = commands[0]
@@ -881,17 +889,18 @@ class TestEnsureRemoteDaemon(unittest.TestCase):
         conn = self._conn()
         commands = []
 
-        def run_ssh(host, user, port, command):
+        def run_ssh(host, user, port, command, *, control_socket):
             commands.append(command)
             return 0, json.dumps({"id": 1, "result": {"version": fastagent_plugin.AGENT_VERSION}}), ""
 
-        with mock.patch.object(conn, "_run_ssh_command", side_effect=run_ssh), \
+        with mock.patch.object(conn, "_run_bootstrap_ssh_command", side_effect=run_ssh), \
              mock.patch.object(conn, "_detect_remote_arch", return_value="amd64"), \
              mock.patch.object(conn, "_ensure_agent_deployed"):
             conn._ensure_remote_daemon(
                 "serval", "kevin", None,
                 f"/tmp/fastagent-root-{fastagent_plugin.AGENT_VERSION}.sock",
                 True,
+                control_socket="/tmp/test-bootstrap.ctl",
             )
 
         self.assertEqual(len(commands), 1)
@@ -902,10 +911,11 @@ class TestEnsureRemoteDaemon(unittest.TestCase):
         for reply in ("not json", '{"id":1}', '{"id":1,"result":{"version":"old"}}'):
             with self.subTest(reply=reply):
                 conn = self._conn()
-                with mock.patch.object(conn, "_run_ssh_command", return_value=(0, reply, "")) as ssh, \
+                with mock.patch.object(conn, "_run_bootstrap_ssh_command", return_value=(0, reply, "")) as ssh, \
                      mock.patch.object(conn, "_detect_remote_arch", return_value="amd64"), \
                      mock.patch.object(conn, "_ensure_agent_deployed"):
-                    conn._ensure_remote_daemon("serval", "deploy", 22, "/tmp/test.sock", False)
+                    conn._ensure_remote_daemon("serval", "deploy", 22, "/tmp/test.sock", False,
+                                               control_socket="/tmp/test-bootstrap.ctl")
                 self.assertIn("--daemon --socket", ssh.call_args.args[3])
 
 
@@ -967,6 +977,80 @@ class TestConnectRetriesLocalSocketProbe(unittest.TestCase):
              mock.patch.object(fastagent_plugin.time_mod, "sleep"):
             with self.assertRaises(fastagent_plugin.AnsibleConnectionFailure):
                 conn._connect()
+
+
+@unittest.skipIf(_FASTAGENT_IMPORT_ERROR is not None, "ansible is required")
+class TestBootstrapSshReuse(unittest.TestCase):
+    def _conn(self):
+        conn = _bare_connection()
+        conn.get_option = lambda key: {
+            "ssh_args": "-F none -o ControlMaster=auto -o ControlPersist=60s -S /tmp/shared",
+        }.get(key)
+        return conn
+
+    def test_bootstrap_uses_the_tunnel_master_before_probing_the_daemon(self):
+        conn = self._conn()
+        events = []
+        commands = []
+        ordinary_command = conn._build_ssh_command("host", "deploy", 2222, "uname -m")
+
+        def bootstrap(*args, control_socket):
+            events.append("daemon")
+            commands.append(conn._build_bootstrap_ssh_command(
+                "host", "deploy", 2222, "uname -m", control_socket=control_socket))
+            # Identity calculation uses the ordinary builder. Its output
+            # must stay unchanged even while bootstrap is in progress.
+            self.assertEqual(conn._build_ssh_command("host", "deploy", 2222, "uname -m"),
+                             ordinary_command)
+
+        with tempfile.TemporaryDirectory(prefix="fa-bootstrap-") as directory:
+            local = directory + "/local.sock"
+            with mock.patch.object(conn, "_try_local_socket", side_effect=[False, True]), \
+                 mock.patch.object(conn, "_ensure_ssh_forwarding",
+                                   side_effect=lambda *args: events.append("forward")), \
+                 mock.patch.object(conn, "_ensure_remote_daemon", side_effect=bootstrap):
+                conn._setup_local_socket("host", "deploy", 2222, local, "/tmp/remote.sock", True)
+
+            self.assertEqual(events, ["forward", "daemon"])
+            # Ask OpenSSH to resolve competing options, rather than merely
+            # checking that our preferred spelling appears in the argv.
+            result = subprocess.run(commands[0][:-2] + ["-G", "host"],
+                                    capture_output=True, text=True, check=True)
+            config = dict(line.split(" ", 1) for line in result.stdout.splitlines())
+            self.assertEqual(config["controlpath"], local + ".ctl")
+            self.assertEqual(config["controlmaster"], "false")
+            self.assertEqual(config["proxycommand"], "false")
+            self.assertEqual(config["user"], "deploy")
+            self.assertEqual(config["port"], "2222")
+            self.assertEqual(conn._build_ssh_command("host", "deploy", 2222, "uname -m"),
+                             ordinary_command)
+
+    def test_bootstrap_failure_retires_the_tunnel(self):
+        conn = self._conn()
+        ordinary_command = conn._build_ssh_command("host", None, None, "")
+        with tempfile.TemporaryDirectory(prefix="fa-bootstrap-") as directory:
+            local = directory + "/local.sock"
+            with mock.patch.object(conn, "_try_local_socket", return_value=False), \
+                 mock.patch.object(conn, "_ensure_ssh_forwarding"), \
+                 mock.patch.object(conn, "_ensure_remote_daemon", side_effect=RuntimeError("bootstrap failed")), \
+                 mock.patch.object(conn, "_retire_stale_forwarder") as retire:
+                with self.assertRaisesRegex(RuntimeError, "bootstrap failed"):
+                    conn._setup_local_socket("host", None, None, local, "/tmp/remote.sock", False)
+            retire.assert_called_once_with(local, "host")
+            self.assertEqual(conn._build_ssh_command("host", None, None, ""), ordinary_command)
+
+    def test_missing_master_cannot_silently_open_another_ssh_connection(self):
+        conn = self._conn()
+        with tempfile.TemporaryDirectory(prefix="fa-bootstrap-") as directory:
+            marker = directory + "/fresh-connection"
+            proxy = shlex_quote("touch " + shlex_quote(marker))
+            conn.get_option = lambda key: {
+                "ssh_args": f"-F none -o BatchMode=yes -o ProxyCommand={proxy}",
+            }.get(key)
+            rc, _, _ = conn._run_bootstrap_ssh_command(
+                "host", None, None, "true", control_socket=directory + "/missing.ctl")
+            self.assertNotEqual(rc, 0)
+            self.assertFalse(os.path.exists(marker), "SSH silently fell back to a fresh connection")
 
 
 @unittest.skipIf(_FASTAGENT_IMPORT_ERROR is not None, "ansible is required")
@@ -1409,6 +1493,44 @@ class TestEnsureSshForwardingRetiresStaleForwarder(unittest.TestCase):
 @unittest.skipIf(_FASTAGENT_IMPORT_ERROR is not None, "ansible is required")
 @unittest.skipUnless(os.environ.get("FASTAGENT_TEST_TUNNEL_HOST"), "set FASTAGENT_TEST_TUNNEL_HOST for real SSH lifecycle test")
 class TestSshTunnelLifecycle(unittest.TestCase):
+    def test_bootstrap_commands_and_upload_share_one_transport(self):
+        host = os.environ["FASTAGENT_TEST_TUNNEL_HOST"]
+        conn = _bare_connection()
+        conn.get_option = lambda key: {
+            "ssh_args": "-o BatchMode=yes -o ControlMaster=auto -o ControlPersist=60s",
+        }.get(key)
+        connections = []
+
+        def bootstrap(*args, control_socket):
+            for _ in range(3):
+                rc, stdout, stderr = conn._run_bootstrap_ssh_command(
+                    host, None, None, 'printf "%s\\n" "$SSH_CONNECTION"',
+                    control_socket=control_socket)
+                self.assertEqual(rc, 0, stderr)
+                self.assertEqual(len(stdout.split()), 4, stdout)
+                connections.append(stdout)
+            # Exercise the stdin path the binary upload uses, without
+            # creating any remote files or deploying an agent.
+            upload = subprocess.run(
+                conn._build_bootstrap_ssh_command(host, None, None, "cat",
+                                                  control_socket=control_socket),
+                input=b"bootstrap upload\n", capture_output=True, timeout=10, check=True)
+            self.assertEqual(upload.stdout, b"bootstrap upload\n")
+
+        with tempfile.TemporaryDirectory(prefix="fa-bootstrap-", dir="/tmp") as directory:
+            local = directory + "/local.sock"
+            try:
+                # No daemon exists at this remote path. The tunnel must
+                # still start and carry the bootstrap SSH sessions.
+                with mock.patch.object(conn, "_try_local_socket", side_effect=[False, True]), \
+                     mock.patch.object(conn, "_ensure_remote_daemon", side_effect=bootstrap):
+                    conn._setup_local_socket(host, None, None, local,
+                                             directory + "/missing.sock", False)
+                self.assertEqual(len(set(connections)), 1, connections)
+            finally:
+                if os.path.exists(local + ".ctl"):
+                    conn._retire_stale_forwarder(local, host)
+
     def test_replacement_drains_active_stream_and_reaps_idle_master(self):
         host = os.environ["FASTAGENT_TEST_TUNNEL_HOST"]
         # This isolated echo server performs no agent RPCs and uses only
@@ -1893,17 +2015,18 @@ class TestRemoteFilesystemDiagnostics(unittest.TestCase):
         )
         commands = []
 
-        def run_ssh(host, user, port, command):
+        def run_ssh(host, user, port, command, *, control_socket):
             commands.append(command)
             if "--daemon" in command:
                 return 1, "", stderr
             return 1, "", ""
 
-        with mock.patch.object(conn, "_run_ssh_command", side_effect=run_ssh), \
+        with mock.patch.object(conn, "_run_bootstrap_ssh_command", side_effect=run_ssh), \
              mock.patch.object(conn, "_detect_remote_arch", return_value="amd64"), \
              mock.patch.object(conn, "_ensure_agent_deployed"):
             with self.assertRaises(fastagent_plugin.AnsibleConnectionFailure) as ctx:
-                conn._ensure_remote_daemon("serval", "deploy", None, remote_socket, True)
+                conn._ensure_remote_daemon("serval", "deploy", None, remote_socket, True,
+                                           control_socket="/tmp/test-bootstrap.ctl")
 
         msg = str(ctx.exception)
         self.assertIn("failed to start daemon on serval: remote /tmp is full", msg)

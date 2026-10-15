@@ -2,6 +2,25 @@
 
 All notable changes to fastagent are documented in this file.
 
+## Unreleased
+
+### Changes
+
+- Bootstrap reuses the dedicated SSH tunnel master for its probes and binary
+  uploads. Previously it ran the probes before starting that master, so each
+  probe authenticated a new connection unless the user supplied a separate
+  SSH control socket. `ControlMaster=auto` and `ControlPersist` alone did not
+  enable reuse. Forwarding now starts first; OpenSSH connects to the remote
+  agent socket only when an RPC client uses the tunnel. A missing master
+  fails visibly, and failed bootstrap retires its tunnel without interrupting
+  active channels. Bootstrap uses separate command helpers with an explicit
+  control socket argument; it cannot change the ordinary SSH command builder
+  or the connection identity through mutable bootstrap state.
+  In a three-run comparison to columbus-buckeye, five
+  read-only probes plus tunnel setup fell from a median of 4.165 seconds to
+  1.216 seconds. This measures SSH setup, not a complete Ansible task or
+  agent deployment.
+
 ## 0.11.1 — October 6, 2026
 
 ### Bug fixes

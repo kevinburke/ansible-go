@@ -361,9 +361,18 @@ Controller                          Remote Host
   sockets. It persists across tasks and forks, with its own `<local socket>.ctl`
   control socket instead of the user's shared SSH ControlMaster.
 - **Connection plugin**: on each task, connects to the local socket, sends
-  RPCs, disconnects. First task bootstraps the daemon and SSH forwarding.
+  RPCs, disconnects. First task starts SSH forwarding, then bootstraps the
+  daemon through that SSH master's control socket. Architecture, home,
+  version, readiness and startup probes, as well as binary uploads, reuse
+  one authenticated transport even without a user-configured `ControlPath`.
 - **Action plugins**: intercept common modules and send RPCs directly instead
   of transferring Python modules.
+
+The first task includes this setup time, even for a cheap `stat`. With cached
+facts, that cost moves from fact gathering to the next remote task. Privileged
+and unprivileged tasks use separate tunnels. Bootstrap fails if its SSH master
+disappears instead of silently opening another connection, and failed bootstrap
+retires the tunnel while allowing any active channels to finish.
 
 Socket names include a hash of the SSH arguments, controller UID, working
 directory, authentication environment, agent path, version, and privilege

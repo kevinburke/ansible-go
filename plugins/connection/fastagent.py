@@ -670,9 +670,6 @@ class Connection(ConnectionBase):
             if self._try_local_socket(local_socket, host):
                 return
 
-            # Ensure the remote daemon is running.
-            self._ensure_remote_daemon(host, user, port, remote_socket, wrap_with_sudo)
-
             # Start SSH socket forwarding if not already running. As
             # defense in depth against a bind race this lock doesn't
             # cover (e.g. a forwarder left by a pre-fix fastagent, or a
@@ -682,6 +679,23 @@ class Connection(ConnectionBase):
             self._ensure_ssh_forwarding(host, user, port, local_socket, remote_socket)
             if self._connected:
                 return
+
+            # OpenSSH opens the remote Unix socket only when a client uses
+            # the forward, so the daemon need not exist yet. Reuse this
+            # master for every bootstrap command (including binary uploads)
+            # instead of authenticating a new SSH connection for each one.
+            try:
+                self._ensure_remote_daemon(
+                    host, user, port, remote_socket, wrap_with_sudo,
+                    control_socket=local_socket + ".ctl",
+                )
+            except BaseException:
+                # Do not leave a live tunnel behind after failed bootstrap.
+                # Stop accepts while preserving any active channels. If
+                # retirement fails, surface that error too and keep the
+                # socket reachable, as on the normal replacement path.
+                self._retire_stale_forwarder(local_socket, host)
+                raise
 
             # Now connect to the local socket. The local socket *file*
             # existing only means OpenSSH's local listener has bound; -L
@@ -762,12 +776,14 @@ class Connection(ConnectionBase):
         port: int | None,
         remote_socket: str,
         wrap_with_sudo: bool,
+        *,
+        control_socket: str,
     ) -> None:
         """Ensure the remote daemon is running, bootstrapping if needed."""
         # Detect arch and deploy binary. The daemon runs as root when
         # become is enabled, so it can always exec the binary out of the
         # connecting user's home — no need to stage to a system path.
-        remote_arch = self._detect_remote_arch(host, user, port)
+        remote_arch = self._detect_remote_arch(host, user, port, control_socket=control_socket)
         agent_path_template = self.get_option("agent_path")
         remote_agent_path = agent_path_template.format(
             version=AGENT_VERSION, os="linux", arch=remote_arch,
@@ -775,7 +791,8 @@ class Connection(ConnectionBase):
         if remote_agent_path.startswith("~/"):
             # Resolve ~ here: the upload and launch commands quote the path,
             # so a literal ~ would never be expanded remotely.
-            rc, home, stderr = self._run_ssh_command(host, user, port, "echo $HOME")
+            rc, home, stderr = self._run_bootstrap_ssh_command(
+                host, user, port, "echo $HOME", control_socket=control_socket)
             if rc != 0 or not home.strip():
                 raise AnsibleConnectionFailure(
                     f"fastagent: could not read $HOME on the remote host to "
@@ -786,6 +803,7 @@ class Connection(ConnectionBase):
 
         self._ensure_agent_deployed(
             host, user, port, remote_agent_path, remote_arch,
+            control_socket=control_socket,
         )
 
         agent_bin = shlex.quote(remote_agent_path)
@@ -794,7 +812,8 @@ class Connection(ConnectionBase):
         # outlive its daemon; only a complete, matching Hello proves readiness.
         hello = json.dumps({"id": 1, "method": "Hello", "params": {"version": AGENT_VERSION}})
         probe = f"printf '%s\\n' {shlex.quote(hello)} | {agent_bin} --connect --socket {shlex.quote(remote_socket)}"
-        rc, stdout, _ = self._run_ssh_command(host, user, port, probe)
+        rc, stdout, _ = self._run_bootstrap_ssh_command(
+            host, user, port, probe, control_socket=control_socket)
         if rc == 0:
             try:
                 response = json.loads(stdout)
@@ -854,7 +873,8 @@ class Connection(ConnectionBase):
             f" {_remote_fs_diag_cmd(socket_dir, log_path)}"
             f" exit 1"
         )
-        rc, stdout, stderr = self._run_ssh_command(host, user, port, start_cmd)
+        rc, stdout, stderr = self._run_bootstrap_ssh_command(
+            host, user, port, start_cmd, control_socket=control_socket)
         if rc != 0:
             hint = _remote_fs_hint(socket_dir, stderr)
             summary = f"{hint}\n" if hint else ""
@@ -1155,6 +1175,11 @@ class Connection(ConnectionBase):
         port: int | None,
         remote_cmd: str,
     ) -> list[str]:
+        """Build configured SSH arguments, also used for connection identity.
+
+        This builder describes configured connection options only. Bootstrap
+        sessions select their control socket with a separate helper.
+        """
         ssh_executable = self.get_option("ssh_executable") or "ssh"
         cmd = [ssh_executable]
 
@@ -1179,15 +1204,41 @@ class Connection(ConnectionBase):
 
         return cmd
 
-    def _run_ssh_command(
+    def _build_bootstrap_ssh_command(
         self,
         host: str,
         user: str | None,
         port: int | None,
         remote_cmd: str,
+        *,
+        control_socket: str,
+    ) -> list[str]:
+        """Open a session through an existing master, with no fresh transport.
+
+        The caller supplies the control socket; this helper never stores it
+        on the connection or owns the master's lifecycle. Keep the regular
+        SSH builder independent so identity calculation cannot change during
+        bootstrap, including while recovering a stale tunnel.
+        """
+        cmd = self._build_ssh_command(host, user, port, remote_cmd)
+        # First -o wins: refuse to create a new transport if the master dies.
+        cmd[1:1] = ["-o", "ControlMaster=no", "-o", "ProxyCommand=false"]
+        # Last -S wins, overriding any shared user master in ssh_args.
+        cmd[-2:-2] = ["-S", control_socket]
+        return cmd
+
+    def _run_bootstrap_ssh_command(
+        self,
+        host: str,
+        user: str | None,
+        port: int | None,
+        remote_cmd: str,
+        *,
+        control_socket: str,
     ) -> tuple[int, str, str]:
-        """Run a one-shot SSH command and return (rc, stdout, stderr)."""
-        ssh_cmd = self._build_ssh_command(host, user, port, remote_cmd)
+        """Run through the bootstrap master and return (rc, stdout, stderr)."""
+        ssh_cmd = self._build_bootstrap_ssh_command(
+            host, user, port, remote_cmd, control_socket=control_socket)
         result = subprocess.run(
             ssh_cmd,
             capture_output=True,
@@ -1204,9 +1255,12 @@ class Connection(ConnectionBase):
         host: str,
         user: str | None,
         port: int | None,
+        *,
+        control_socket: str,
     ) -> str:
         """Detect the remote host's architecture."""
-        rc, stdout, stderr = self._run_ssh_command(host, user, port, "uname -m")
+        rc, stdout, stderr = self._run_bootstrap_ssh_command(
+            host, user, port, "uname -m", control_socket=control_socket)
         if rc != 0:
             raise AnsibleConnectionFailure(
                 f"fastagent: failed to detect remote arch: {stderr}"
@@ -1232,12 +1286,15 @@ class Connection(ConnectionBase):
         port: int | None,
         remote_path: str,
         arch: str,
+        *,
+        control_socket: str,
     ) -> None:
         """Upload agent binary if not already present with the correct version."""
         # Check if the correct version is already deployed.
-        rc, stdout, _ = self._run_ssh_command(
+        rc, stdout, _ = self._run_bootstrap_ssh_command(
             host, user, port,
             f"{shlex.quote(remote_path)} --version 2>/dev/null || true",
+            control_socket=control_socket,
         )
         # `fastagent --version` prints "fastagent <version>". Match it
         # exactly: a substring test accepted any agent whose version
@@ -1257,17 +1314,18 @@ class Connection(ConnectionBase):
 
         display.vvv(f"FASTAGENT: uploading {local_binary} -> {remote_path}", host=host)
 
-        # Stream the binary over the same ssh command every other bootstrap
-        # step uses, so ssh_args (-F, ProxyJump, host key options,
-        # ControlPath) apply to the upload too. A separate scp invocation
-        # would need each option translated for scp, and used to get only
-        # -i and -P.
+        # Stream the binary through the same dedicated master as every
+        # bootstrap probe. Preserve configured SSH arguments, with the
+        # bootstrap helper explicitly selecting our control socket. A
+        # separate scp invocation would need each option translated for
+        # scp, and used to get only -i and -P.
         size = os.path.getsize(local_binary)
         remote_cmd = (
             f"sh -c {shlex.quote(_INSTALL_AGENT_SCRIPT)} sh "
             f"{shlex.quote(remote_path)} {size}"
         )
-        ssh_cmd = self._build_ssh_command(host, user, port, remote_cmd)
+        ssh_cmd = self._build_bootstrap_ssh_command(
+            host, user, port, remote_cmd, control_socket=control_socket)
         with open(local_binary, "rb") as stdin:
             result = subprocess.run(
                 ssh_cmd, stdin=stdin, capture_output=True, timeout=120,
