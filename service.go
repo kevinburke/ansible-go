@@ -49,7 +49,7 @@ func (s *Server) handleServiceSystemd(p ServiceParams) (any, error) {
 				needsAction = true
 			}
 		case "stopped":
-			if currentActive == "active" {
+			if systemdUnitRunning(currentActive) {
 				action = "stop"
 				needsAction = true
 			}
@@ -101,6 +101,20 @@ func (s *Server) handleServiceSystemd(p ServiceParams) (any, error) {
 		State:   currentActive,
 		Enabled: currentEnabled,
 	}, nil
+}
+
+// systemdUnitRunning reports whether a unit in the given `systemctl
+// is-active` state has, or is about to have, a process that state=stopped
+// must stop. A crash-looping unit with Restart= spends nearly all its time
+// in "activating" (auto-restart), so checking only for "active" leaves it
+// running. Upstream Ansible's systemd module stops activating and
+// deactivating units too.
+func systemdUnitRunning(state string) bool {
+	switch state {
+	case "active", "activating", "deactivating", "reloading", "refreshing":
+		return true
+	}
+	return false
 }
 
 func systemctlCommand(p ServiceParams, args ...string) *exec.Cmd {

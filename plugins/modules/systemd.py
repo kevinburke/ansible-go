@@ -46,6 +46,14 @@ options:
 
 from ansible.module_utils.basic import AnsibleModule
 
+# `systemctl is-active` states in which state=stopped must run `systemctl
+# stop`. A crash-looping unit with Restart= is "activating" (auto-restart)
+# nearly all the time, so checking only for "active" left it running.
+# Keep in sync with systemdUnitRunning in service.go.
+RUNNING_STATES = frozenset(
+    ("active", "activating", "deactivating", "reloading", "refreshing")
+)
+
 
 def main():
     module = AnsibleModule(
@@ -159,7 +167,7 @@ def main():
         if state == "started" and current_active != "active":
             action = "start"
             needs_action = True
-        elif state == "stopped" and current_active == "active":
+        elif state == "stopped" and current_active in RUNNING_STATES:
             action = "stop"
             needs_action = True
         elif state == "restarted":
