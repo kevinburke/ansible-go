@@ -46,13 +46,25 @@ options:
 
 from ansible.module_utils.basic import AnsibleModule
 
-# `systemctl is-active` states in which state=stopped must run `systemctl
-# stop`. A crash-looping unit with Restart= is "activating" (auto-restart)
-# nearly all the time, so checking only for "active" left it running.
-# Keep in sync with systemdUnitRunning in service.go.
-RUNNING_STATES = frozenset(
-    ("active", "activating", "deactivating", "reloading", "refreshing")
-)
+def state_action(state, active):
+    """Return the systemctl verb that brings a unit whose `systemctl
+    is-active` state is active to the requested state, or None.
+
+    Mirrors upstream Ansible's systemd_service module: a unit is running when
+    it is active or activating (a crash-looping unit under Restart= is
+    activating between attempts); stopped also stops a deactivating unit;
+    restarted and reloaded start a unit that is not running. Keep in sync
+    with systemdStateAction in service.go; both are checked against
+    testdata/systemd_state_actions.json.
+    """
+    running = active in ("active", "activating")
+    if state == "started":
+        return None if running else "start"
+    if state == "stopped":
+        return "stop" if running or active == "deactivating" else None
+    if state in ("restarted", "reloaded"):
+        return state[: -len("ed")] if running else "start"
+    raise ValueError(f"unsupported service state: {state!r}")
 
 
 def main():
@@ -161,31 +173,20 @@ def main():
 
     # Handle state.
     if state is not None:
-        action = None
-        needs_action = False
+        action = state_action(state, current_active)
+        needs_action = action is not None
 
-        if state == "started" and current_active != "active":
-            action = "start"
-            needs_action = True
-        elif state == "stopped" and current_active in RUNNING_STATES:
-            action = "stop"
-            needs_action = True
-        elif state == "restarted":
-            action = "restart"
-            needs_action = True
-        elif state == "reloaded":
-            action = "reload"
-            needs_action = True
-
-        if needs_action and not module.check_mode:
-            rc, stdout, stderr = module.run_command(systemctl_cmd + [action, name])
-            if rc != 0:
-                module.fail_json(
-                    msg=f"Unable to {action} service {name}",
-                    rc=rc,
-                    stdout=stdout,
-                    stderr=stderr,
-                )
+        # Like upstream, report the change in check mode without running it.
+        if needs_action:
+            if not module.check_mode:
+                rc, stdout, stderr = module.run_command(systemctl_cmd + [action, name])
+                if rc != 0:
+                    module.fail_json(
+                        msg=f"Unable to {action} service {name}",
+                        rc=rc,
+                        stdout=stdout,
+                        stderr=stderr,
+                    )
             changed = True
 
     # Handle enabled.

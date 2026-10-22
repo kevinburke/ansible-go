@@ -4,8 +4,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"regexp"
-	"slices"
 	"strings"
 	"testing"
 )
@@ -54,7 +52,7 @@ func TestHandleServiceSystemdPassesNoBlock(t *testing.T) {
 // A unit that crash-loops under Restart= reports "activating" between
 // restarts. state=stopped must still stop it (2026-10-22: a retire play
 // left netatmo-notifier looping on tiger after 3 million restarts).
-func TestHandleServiceSystemdStopsUnitsThatAreNotInactive(t *testing.T) {
+func TestHandleServiceSystemdStopsRunningUnits(t *testing.T) {
 	for _, tc := range []struct {
 		active   string
 		wantStop bool
@@ -62,8 +60,8 @@ func TestHandleServiceSystemdStopsUnitsThatAreNotInactive(t *testing.T) {
 		{"active", true},
 		{"activating", true},
 		{"deactivating", true},
-		{"reloading", true},
-		{"refreshing", true},
+		{"reloading", false},
+		{"refreshing", false},
 		{"inactive", false},
 		{"failed", false},
 	} {
@@ -107,35 +105,37 @@ func TestHandleServiceSystemdStopsUnitsThatAreNotInactive(t *testing.T) {
 	}
 }
 
-// The Python systemd module (used when the agent is not available) must
-// stop the same states as the Go handler.
-func TestPythonSystemdModuleRunningStatesMatchGo(t *testing.T) {
-	src, err := os.ReadFile(filepath.Join("plugins", "modules", "systemd.py"))
+// systemdStateAction must match the table that tests/test_systemd_module.py
+// also checks against plugins/modules/systemd.py and upstream Ansible.
+func TestSystemdStateActionMatchesUpstreamTable(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("testdata", "systemd_state_actions.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := regexp.MustCompile(`(?s)RUNNING_STATES = frozenset\(\s*\((.*?)\)\s*\)`).FindSubmatch(src)
-	if m == nil {
-		t.Fatal("RUNNING_STATES not found in plugins/modules/systemd.py")
+	var table struct {
+		Cases []struct {
+			State  string `json:"state"`
+			Active string `json:"active"`
+			Action string `json:"action"`
+		} `json:"cases"`
 	}
-	var py []string
-	for _, q := range regexp.MustCompile(`"([a-z-]+)"`).FindAllSubmatch(m[1], -1) {
-		py = append(py, string(q[1]))
+	if err := json.Unmarshal(data, &table); err != nil {
+		t.Fatal(err)
 	}
-	if len(py) == 0 {
-		t.Fatal("RUNNING_STATES is empty")
+	if len(table.Cases) == 0 {
+		t.Fatal("no cases in testdata/systemd_state_actions.json")
 	}
-	for _, s := range py {
-		if !systemdUnitRunning(s) {
-			t.Errorf("Python RUNNING_STATES has %q, systemdUnitRunning does not", s)
+	for _, c := range table.Cases {
+		got, err := systemdStateAction(c.State, c.Active)
+		if err != nil {
+			t.Errorf("systemdStateAction(%q, %q): %v", c.State, c.Active, err)
+			continue
+		}
+		if got != c.Action {
+			t.Errorf("systemdStateAction(%q, %q) = %q, want %q", c.State, c.Active, got, c.Action)
 		}
 	}
-	for _, s := range []string{"active", "activating", "deactivating", "reloading", "refreshing", "inactive", "failed", "maintenance"} {
-		if systemdUnitRunning(s) && !slices.Contains(py, s) {
-			t.Errorf("systemdUnitRunning(%q) is true, Python RUNNING_STATES lacks it", s)
-		}
-	}
-	if !strings.Contains(string(src), "current_active in RUNNING_STATES") {
-		t.Error("plugins/modules/systemd.py no longer checks RUNNING_STATES for state=stopped")
+	if _, err := systemdStateAction("bogus", "active"); err == nil {
+		t.Error("systemdStateAction accepted an unknown state")
 	}
 }

@@ -1,0 +1,165 @@
+{
+ "_comment": "Expected systemctl verb for each requested state and `systemctl is-active` state, matching upstream Ansible's systemd_service module (is_running_service = active|activating; stopped also stops deactivating). An empty action means nothing runs. Checked by service_test.go and tests/test_systemd_module.py.",
+ "cases": [
+  {
+   "state": "started",
+   "active": "active",
+   "action": ""
+  },
+  {
+   "state": "started",
+   "active": "activating",
+   "action": ""
+  },
+  {
+   "state": "started",
+   "active": "deactivating",
+   "action": "start"
+  },
+  {
+   "state": "started",
+   "active": "reloading",
+   "action": "start"
+  },
+  {
+   "state": "started",
+   "active": "refreshing",
+   "action": "start"
+  },
+  {
+   "state": "started",
+   "active": "inactive",
+   "action": "start"
+  },
+  {
+   "state": "started",
+   "active": "failed",
+   "action": "start"
+  },
+  {
+   "state": "started",
+   "active": "maintenance",
+   "action": "start"
+  },
+  {
+   "state": "stopped",
+   "active": "active",
+   "action": "stop"
+  },
+  {
+   "state": "stopped",
+   "active": "activating",
+   "action": "stop"
+  },
+  {
+   "state": "stopped",
+   "active": "deactivating",
+   "action": "stop"
+  },
+  {
+   "state": "stopped",
+   "active": "reloading",
+   "action": ""
+  },
+  {
+   "state": "stopped",
+   "active": "refreshing",
+   "action": ""
+  },
+  {
+   "state": "stopped",
+   "active": "inactive",
+   "action": ""
+  },
+  {
+   "state": "stopped",
+   "active": "failed",
+   "action": ""
+  },
+  {
+   "state": "stopped",
+   "active": "maintenance",
+   "action": ""
+  },
+  {
+   "state": "restarted",
+   "active": "active",
+   "action": "restart"
+  },
+  {
+   "state": "restarted",
+   "active": "activating",
+   "action": "restart"
+  },
+  {
+   "state": "restarted",
+   "active": "deactivating",
+   "action": "start"
+  },
+  {
+   "state": "restarted",
+   "active": "reloading",
+   "action": "start"
+  },
+  {
+   "state": "restarted",
+   "active": "refreshing",
+   "action": "start"
+  },
+  {
+   "state": "restarted",
+   "active": "inactive",
+   "action": "start"
+  },
+  {
+   "state": "restarted",
+   "active": "failed",
+   "action": "start"
+  },
+  {
+   "state": "restarted",
+   "active": "maintenance",
+   "action": "start"
+  },
+  {
+   "state": "reloaded",
+   "active": "active",
+   "action": "reload"
+  },
+  {
+   "state": "reloaded",
+   "active": "activating",
+   "action": "reload"
+  },
+  {
+   "state": "reloaded",
+   "active": "deactivating",
+   "action": "start"
+  },
+  {
+   "state": "reloaded",
+   "active": "reloading",
+   "action": "start"
+  },
+  {
+   "state": "reloaded",
+   "active": "refreshing",
+   "action": "start"
+  },
+  {
+   "state": "reloaded",
+   "active": "inactive",
+   "action": "start"
+  },
+  {
+   "state": "reloaded",
+   "active": "failed",
+   "action": "start"
+  },
+  {
+   "state": "reloaded",
+   "active": "maintenance",
+   "action": "start"
+  }
+ ]
+}

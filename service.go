@@ -39,29 +39,11 @@ func (s *Server) handleServiceSystemd(p ServiceParams) (any, error) {
 
 	// Handle state changes.
 	if p.State != "" {
-		var action string
-		needsAction := false
-
-		switch p.State {
-		case "started":
-			if currentActive != "active" {
-				action = "start"
-				needsAction = true
-			}
-		case "stopped":
-			if systemdUnitRunning(currentActive) {
-				action = "stop"
-				needsAction = true
-			}
-		case "restarted":
-			action = "restart"
-			needsAction = true
-		case "reloaded":
-			action = "reload"
-			needsAction = true
-		default:
-			return nil, fmt.Errorf("unsupported service state: %q", p.State)
+		action, err := systemdStateAction(p.State, currentActive)
+		if err != nil {
+			return nil, err
 		}
+		needsAction := action != ""
 
 		if needsAction {
 			cmd := systemctlCommand(p, action, p.Name)
@@ -103,18 +85,40 @@ func (s *Server) handleServiceSystemd(p ServiceParams) (any, error) {
 	}, nil
 }
 
-// systemdUnitRunning reports whether a unit in the given `systemctl
-// is-active` state has, or is about to have, a process that state=stopped
-// must stop. A crash-looping unit with Restart= spends nearly all its time
-// in "activating" (auto-restart), so checking only for "active" leaves it
-// running. Upstream Ansible's systemd module stops activating and
-// deactivating units too.
-func systemdUnitRunning(state string) bool {
+// systemdStateAction returns the systemctl verb that brings a unit whose
+// `systemctl is-active` state is active to the requested state, or "" when
+// nothing needs to run. It mirrors the decision in upstream Ansible's
+// systemd_service module (lib/ansible/modules/systemd_service.py, main()):
+//
+//   - started: start unless the unit is running (active or activating).
+//   - stopped: stop if the unit is running or deactivating.
+//   - restarted, reloaded: start a unit that is not running; otherwise
+//     restart or reload it.
+//
+// A unit crash-looping under Restart= is "activating" (auto-restart) between
+// attempts, so it counts as running. plugins/modules/systemd.py implements
+// the same table as state_action; testdata/systemd_state_actions.json
+// checks both.
+func systemdStateAction(state, active string) (string, error) {
+	running := active == "active" || active == "activating"
 	switch state {
-	case "active", "activating", "deactivating", "reloading", "refreshing":
-		return true
+	case "started":
+		if !running {
+			return "start", nil
+		}
+	case "stopped":
+		if running || active == "deactivating" {
+			return "stop", nil
+		}
+	case "restarted", "reloaded":
+		if !running {
+			return "start", nil
+		}
+		return strings.TrimSuffix(state, "ed"), nil
+	default:
+		return "", fmt.Errorf("unsupported service state: %q", state)
 	}
-	return false
+	return "", nil
 }
 
 func systemctlCommand(p ServiceParams, args ...string) *exec.Cmd {

@@ -6,13 +6,19 @@ All notable changes to fastagent are documented in this file.
 
 ### Fixes
 
-- `systemd` with `state: stopped` now stops a unit whose `systemctl
-  is-active` state is `activating`, `deactivating`, `reloading` or
-  `refreshing`, as well as `active`. A unit crash-looping under `Restart=`
-  spends nearly all its time in `activating` (auto-restart), so the module
-  reported it as stopped and left it looping. Upstream Ansible already stops
-  activating and deactivating units. Fixed in both the agent and the Python
-  module.
+- `systemd` now decides whether to run `systemctl` the way upstream
+  Ansible's `systemd_service` module does. A unit counts as running when it
+  is `active` or `activating`.
+  - `stopped` stops a running or `deactivating` unit. Before, it stopped
+    only `active` units, so a unit crash-looping under `Restart=`, which is
+    `activating` (auto-restart) nearly all the time, was reported stopped
+    and left looping.
+  - `started` no longer runs `systemctl start` on an `activating` unit,
+    which skipped its `RestartSec` wait.
+  - `restarted` and `reloaded` start a unit that is not running, instead
+    of restarting it or failing to reload it.
+  - The Python module reports a state change in check mode, as upstream
+    does, instead of reporting no change.
 
 ## 0.11.2 — October 15, 2026
 
