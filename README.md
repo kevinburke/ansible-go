@@ -19,7 +19,7 @@ the gap is smaller: the floor is set by Ansible's own per-task Python overhead
 
 The speedup comes from **action plugin overrides** that replace Python module
 transfer with direct Go RPCs for common modules (`command`, `shell`, `copy`,
-`file`, `stat`, `apt`, `systemd`). For the overrides to fire, the
+`file`, `stat`, `slurp`, `apt`, `systemd`). For the overrides to fire, the
 `kevinburke.fastagent` plugin paths must be wired into Ansible's module
 resolution — see [Wire up the override routing](#wire-up-the-override-routing).
 Without that step, fastagent is roughly the same speed as plain SSH (or
@@ -332,10 +332,15 @@ plain SSH.
 | `command`, `shell` | Action plugin | Exec RPC, no module transfer |
 | `file` | Action plugin | File/Stat RPC |
 | `stat` | Action plugin | Stat RPC |
+| `slurp` | Action plugin | ReadFile RPC (absolute paths, base64 reads) |
 | `copy`, `template` | Action plugin | One WriteFile RPC; the agent compares checksums |
 | `apt` | Action plugin | Package RPC with dpkg cache |
 | `systemd` | Action plugin | Service RPC |
 | Everything else | Connection plugin | Persistent daemon + SSH forwarding |
+
+The `slurp` override reuses ReadFile on existing agents. Relative or expanded
+paths, `armor: false`, async tasks and unsupported privilege changes use
+`ansible.builtin.slurp`. Read errors also fall back to preserve stock diagnostics.
 
 The `apt` override includes two optimizations:
 

@@ -122,11 +122,11 @@ class TestTarballContents(unittest.TestCase):
         self.assertIn("plugins/connection/fastagent.py", self.members)
 
     def test_action_plugins_present(self):
-        for name in ("command", "copy", "template", "file", "stat", "apt", "systemd"):
+        for name in ("command", "copy", "template", "file", "stat", "slurp", "apt", "systemd"):
             self.assertIn(f"plugins/action/{name}.py", self.members)
 
     def test_library_modules_present(self):
-        for name in ("apt", "dnf", "systemd"):
+        for name in ("apt", "dnf", "systemd", "slurp"):
             self.assertIn(f"plugins/modules/{name}.py", self.members)
 
     def test_module_utils_present(self):
@@ -256,8 +256,8 @@ class TestInstalledCollection(unittest.TestCase):
         )
         self.assertEqual(result.stdout.strip(), "ok")
 
-    def test_systemd_action_routing(self):
-        """Verify fastagent's systemd action only wins the routes it should.
+    def test_systemd_and_slurp_action_routing(self):
+        """Verify fastagent's systemd and slurp actions route and load correctly.
 
         Plain unqualified ``systemd`` and ``ansible.legacy.systemd`` resolve
         through the configured action plugin path, matching the README routing
@@ -276,28 +276,31 @@ from ansible.plugins.loader import action_loader, init_plugin_loader
 
 init_plugin_loader()
 
-expected = "plugins/action/systemd.py"
-cases = [
-    ("systemd", None, True),
-    ("systemd", ["kevinburke.fastagent"], True),
-    ("ansible.legacy.systemd", None, True),
-    ("kevinburke.fastagent.systemd", None, True),
-    ("ansible.builtin.systemd", None, False),
-]
-for name, collections, should_fastagent in cases:
-    ctx = action_loader.find_plugin_with_context(
-        name,
-        collection_list=collections,
-    )
-    if not ctx.resolved and should_fastagent:
-        raise SystemExit(f"{name} did not resolve")
-    path = ctx.plugin_resolved_path or ""
-    is_fastagent = path.endswith(expected)
-    if is_fastagent != should_fastagent:
-        raise SystemExit(
-            f"{name} resolved to {path}, fastagent={is_fastagent}, "
-            f"want {should_fastagent}"
+for module in ("systemd", "slurp"):
+    expected = f"plugins/action/{module}.py"
+    cases = [
+        (f"{module}", None, True),
+        (f"{module}", ["kevinburke.fastagent"], True),
+        (f"ansible.legacy.{module}", None, True),
+        (f"kevinburke.fastagent.{module}", None, True),
+        (f"ansible.builtin.{module}", None, False),
+    ]
+    for name, collections, should_fastagent in cases:
+        ctx = action_loader.find_plugin_with_context(
+            name,
+            collection_list=collections,
         )
+        if not ctx.resolved and should_fastagent:
+            raise SystemExit(f"{name} did not resolve")
+        path = ctx.plugin_resolved_path or ""
+        is_fastagent = path.endswith(expected)
+        if is_fastagent != should_fastagent:
+            raise SystemExit(
+                f"{name} resolved to {path}, fastagent={is_fastagent}, "
+                f"want {should_fastagent}"
+            )
+        if should_fastagent:
+            assert action_loader.get(name, collection_list=collections, class_only=True) is not None
 print("ok")
 """
         result = subprocess.run(
