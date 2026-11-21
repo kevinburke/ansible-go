@@ -6,6 +6,11 @@ All notable changes to fastagent are documented in this file.
 
 ### Fixes
 
+- `copy` with `force: false` no longer computes an unused checksum of an
+  existing destination, including a source copied into a directory. Creating
+  placeholders for growing evidence logs now checks existence without reading
+  the logs, while preserving existing contents and missing-file behavior.
+
 - `systemd` now decides whether to run `systemctl` the way upstream
   Ansible's `systemd_service` module does. A unit counts as running when it
   is `active` or `activating`.

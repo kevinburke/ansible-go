@@ -45,6 +45,7 @@ class _RecordingAgentClient:
         self.write_result: dict = {"changed": True, "checksum": ""}
         self.file_calls: list[dict] = []
         self.stat_results: list[dict] = []
+        self.stat_checksums: list[bool] = []
         # Remote directories, which WriteFile with report_dir reports as
         # the agent does.
         self.dirs: set[str] = set()
@@ -52,6 +53,7 @@ class _RecordingAgentClient:
 
     def stat(self, path, follow, checksum, checksum_algorithm=None):
         self.calls.append(("Stat", path))
+        self.stat_checksums.append(checksum)
         if self.stat_results:
             return self.stat_results.pop(0)
         return {"exists": False, "isdir": False}
@@ -598,6 +600,29 @@ class TestCopyActionVaultDecrypt(unittest.TestCase):
         self.assertEqual(result.get("dest"), "/tmp/existing.txt")
         self.assertIsNone(client.write_kwargs)
         self.assertEqual(client.file_calls, [])
+        self.assertEqual(client.stat_checksums, [False])
+
+    def test_force_false_directory_destination_does_not_checksum_child(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "evidence.jsonl")
+            with open(source, "w") as stream:
+                stream.write("")
+            action = _make_action(
+                task_args={"src": source, "dest": "/data", "force": False},
+                loader=_RecordingLoader(resolved_path=source),
+            )
+            client = action._connection._agent_client
+            client.stat_results = [
+                {"exists": True, "isdir": True},
+                {"exists": True, "isdir": False},
+            ]
+            with patch.object(ActionBase, "run", return_value={}):
+                result = action.run(task_vars={})
+            self.assertFalse(result.get("failed"), msg=result)
+            self.assertFalse(result["changed"])
+            self.assertEqual(result["dest"], "/data/evidence.jsonl")
+            self.assertEqual(client.stat_checksums, [False, False])
+            self.assertIsNone(client.write_kwargs)
 
     def test_content_to_existing_directory_fails_without_write(self) -> None:
         action = _make_action(

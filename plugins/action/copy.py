@@ -313,7 +313,9 @@ class ActionModule(ActionBase):
             # dest is a directory; the Stat path resolves it.
 
         try:
-            remote_stat = client.stat(dest, follow=True, checksum=True)
+            # force=no only needs existence: hashing a growing log here can
+            # read gigabytes before the unchanged early return below.
+            remote_stat = client.stat(dest, follow=True, checksum=force)
         except Exception as e:
             result["failed"] = True
             result["msg"] = f"fastagent stat failed: {e}"
@@ -330,7 +332,7 @@ class ActionModule(ActionBase):
             dest = os.path.join(dest, basename)
             # Re-stat with the full path.
             try:
-                remote_stat = client.stat(dest, follow=True, checksum=True)
+                remote_stat = client.stat(dest, follow=True, checksum=force)
             except Exception as e:
                 result["failed"] = True
                 result["msg"] = f"fastagent stat failed: {e}"
