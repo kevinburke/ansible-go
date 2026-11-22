@@ -2,9 +2,22 @@
 
 All notable changes to fastagent are documented in this file.
 
-## Unreleased
+## 0.12.0 — November 21, 2026
+
+### New features
+
+- `slurp` now reads ordinary absolute paths through the agent's existing
+  ReadFile RPC, including in check mode. Relative or expanded paths,
+  unsupported arguments, async tasks, privilege changes, and read errors
+  fall back to `ansible.builtin.slurp` to preserve stock behavior and
+  diagnostics.
 
 ### Fixes
+
+- Become now fails before connecting when Ansible has no remote user set.
+  The error names the host and asks for `ansible_user`, even when SSH config
+  supplies a user. Previously the root daemon started without an allowed
+  socket user, causing repeated connection resets and a bootstrap failure.
 
 - `copy` with `force: false` no longer computes an unused checksum of an
   existing destination, including a source copied into a directory. Creating
@@ -24,6 +37,12 @@ All notable changes to fastagent are documented in this file.
     of restarting it or failing to reload it.
   - The Python module reports a state change in check mode, as upstream
     does, instead of reporting no change.
+
+### Tools and dependencies
+
+- Added a reproducible 250-task benchmark at `scripts/bench/bench.sh` and
+  updated the README with measured results and test conditions.
+- Updated `golang.org/x/sys` from v0.49.0 to v0.50.0.
 
 ## 0.11.2 — October 15, 2026
 
