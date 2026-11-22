@@ -2,6 +2,15 @@
 
 All notable changes to fastagent are documented in this file.
 
+## 0.13.0 (unreleased)
+
+- Added the `EnsureFiles` RPC for creating regular files and repairing owner,
+  group and permissions in one call. It preserves existing contents and
+  access/modification timestamps, supports check mode, validates every path
+  before writing and rejects symlinks. A bounded worker pool defaults to four;
+  ordered per-file outcomes expose partial failures after all workers finish.
+  This is an explicit batch API; ordinary RPCs retain their existing ordering.
+
 ## 0.12.0 — November 21, 2026
 
 ### New features

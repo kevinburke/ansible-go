@@ -133,6 +133,8 @@ func (s *Server) dispatch(req Request) Response {
 		result, err = s.handleWriteFile(req.Params)
 	case "File":
 		result, err = s.handleFile(req.Params)
+	case "EnsureFiles":
+		result, err = s.handleEnsureFiles(req.Params)
 	case "Package":
 		result, err = s.handlePackage(req.Params)
 	case "Service":
@@ -168,7 +170,7 @@ func (s *Server) handleHello(params json.RawMessage) (any, error) {
 		Version: Version,
 		Capabilities: []string{
 			"exec", "stat", "read_file", "write_file", "file",
-			"package", "service",
+			"package", "service", "ensure_files",
 		},
 	}, nil
 }

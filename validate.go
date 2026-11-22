@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -126,11 +125,14 @@ func lookPathIn(name string, env statEnv) (string, error) {
 }
 
 // subprocessReturnCode is the returncode Python's subprocess reports: the
-// exit status, or -N for a process killed by signal N. ProcessState.Sys()
-// is a syscall.WaitStatus; x/sys/unix's WaitStatus is a different type, so
-// asserting to it never matches.
+// exit status, or -N for a process killed by signal N. Use the signal methods:
+// os/exec and x/sys/unix return distinct concrete wait-status types.
 func subprocessReturnCode(exitErr *exec.ExitError) int {
-	if ws, ok := exitErr.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+	type signalStatus interface {
+		Signaled() bool
+		Signal() unix.Signal
+	}
+	if ws, ok := exitErr.Sys().(signalStatus); ok && ws.Signaled() {
 		return -int(ws.Signal())
 	}
 	return exitErr.ExitCode()

@@ -369,7 +369,7 @@ Controller                          Remote Host
 
 - **Daemon**: persistent Go process on the remote host. Accepts JSON-RPC over
   a Unix socket. Handles Exec, Stat, ReadFile, WriteFile, File, Package,
-  Service RPCs. Auto-exits after 1 hour idle.
+  Service and EnsureFiles RPCs. Auto-exits after 1 hour idle.
 - **SSH forwarding**: a dedicated `ssh -fN -L local.sock:remote.sock` master
   runs once per connection configuration and bridges the local and remote
   sockets. It persists across tasks and forks, with its own `<local socket>.ctl`
@@ -647,3 +647,25 @@ ansible-core's BSD-2-Clause; see
 license texts. Code copied or translated from another project must be
 listed there, and each translated function's doc comment must name its
 source and say what was changed; `notices_test.go` enforces this.
+
+### File batches
+
+Custom action plugins can call `EnsureFiles` (capability `ensure_files`, added
+in 0.13.0) with `paths`, `owner`, `group`, a four-digit `mode` (0000–0777),
+optional `workers` (1–16, default 4), and `check_mode`. Parents must already
+exist. Paths must be unique, absolute regular files; symlinks are rejected.
+The agent resolves ownership once, validates the entire batch before writing,
+then creates missing files and repairs metadata without reading, truncating or
+touching existing contents or timestamps. Check mode only inspects metadata.
+
+The result has `changed`, optional `failed`/`msg`, and ordered `files` entries
+with `path`, `changed`, `before`, `after` and optional `failed`/`msg`. All workers
+finish before the response. On application failure, `after` is the intended
+metadata, and per-file failures expose partial work. Callers must fail the task
+when `failed` is true. A caller may fall back to another implementation only on
+method-not-found (`-32601`), which guarantees the batch did not run; it must
+never replay a batch after an ambiguous transport error or malformed result.
+
+This batches independent file operations only. Ansible tasks and dependent
+RPCs do not automatically run concurrently. Install files before reloading
+systemd, and finish the reload before starting the affected services.
