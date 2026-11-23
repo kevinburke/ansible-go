@@ -2,7 +2,7 @@
 
 All notable changes to fastagent are documented in this file.
 
-## 0.13.0 (unreleased)
+## 0.13.0 — November 22, 2026
 
 - Added the `EnsureFiles` RPC for creating regular files and repairing owner,
   group and permissions in one call. It preserves existing contents and
@@ -10,6 +10,9 @@ All notable changes to fastagent are documented in this file.
   before writing and rejects symlinks. A bounded worker pool defaults to four;
   ordered per-file outcomes expose partial failures after all workers finish.
   This is an explicit batch API; ordinary RPCs retain their existing ordering.
+- Release builds now derive their version with the local consistency checker.
+  A missing or mismatched version stops Make immediately, without downloading
+  a helper or continuing with an empty artifact filename.
 
 ## 0.12.0 — November 21, 2026
 

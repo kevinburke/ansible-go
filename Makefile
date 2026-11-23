@@ -1,4 +1,9 @@
-VERSION := $(shell go run github.com/kevinburke/bump_version/current_version@latest fastagent.go)
+# Use the local release checker: version discovery must not depend on a
+# network fetch, and a failed check must stop make rather than return "".
+VERSION := $(shell scripts/check-versions.sh --print)
+ifeq ($(strip $(VERSION)),)
+$(error scripts/check-versions.sh failed; cannot determine release version)
+endif
 
 DEPLOY_DIR := $(HOME)/.ansible/fastagent
 COLLECTION_TARBALL := tmp/kevinburke-fastagent-$(VERSION).tar.gz
