@@ -53,7 +53,20 @@ err() { printf '!!  %s\n' "$*" >&2; }
 
 run() {
     # Echo the command, then run it — unless --dry-run.
-    printf '    $ %s\n' "$*"
+    local arg redact=0
+    printf '    $'
+    for arg in "$@"; do
+        if [ "$redact" -eq 1 ]; then
+            printf ' <redacted>'
+            redact=0
+        else
+            printf ' %s' "$arg"
+            if [ "$arg" = '--token' ]; then
+                redact=1
+            fi
+        fi
+    done
+    printf '\n'
     if [ "$DRY_RUN" -eq 0 ]; then
         "$@"
     fi
@@ -77,6 +90,7 @@ cd "$REPO_ROOT"
 log "checking required tools"
 require_tool go
 require_tool make
+require_tool python3
 require_tool python3
 require_tool ansible-galaxy
 require_tool gh
@@ -133,13 +147,10 @@ fi
 # ---- preflight: Galaxy token (if publishing) ------------------------------
 
 if [ "$SKIP_GALAXY" -eq 0 ]; then
-    if [ -z "${ANSIBLE_GALAXY_TOKEN:-}" ] && \
-       [ ! -f "$HOME/.ansible/galaxy_token" ]; then
-        err "Galaxy publish requested but no token found."
-        err "Set ANSIBLE_GALAXY_TOKEN or create ~/.ansible/galaxy_token,"
-        err "or rerun with --skip-galaxy."
-        exit 1
-    fi
+    # Ansible creates an empty token file even for anonymous installs. Check
+    # its contents (and configured token path), not just whether it exists.
+    # Always execute this local check, including in --dry-run mode.
+    python3 "$SCRIPT_DIR/check-galaxy-token.py"
 fi
 
 # ---- build & test ----------------------------------------------------------
