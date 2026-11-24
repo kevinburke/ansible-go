@@ -548,6 +548,7 @@ class FastAgentClient:
         state: str | None = None,
         enabled: bool | None = None,
         no_block: bool = False,
+        daemon_reload: bool = False,
     ) -> dict:
         """Manage system services."""
         params: dict = {"name": name, "manager": manager}
@@ -557,4 +558,6 @@ class FastAgentClient:
             params["enabled"] = enabled
         if no_block:
             params["no_block"] = True
+        if daemon_reload:
+            params["daemon_reload"] = True
         return self.call("Service", params)

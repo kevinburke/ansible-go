@@ -16,9 +16,14 @@ import (
 // server refuses any request that carries a token rather than run it without
 // the at-most-once guarantee the controller relies on.
 type Server struct {
-	Logger *slog.Logger
-	Tokens *OnceTokens
+	Logger   *slog.Logger
+	Tokens   *OnceTokens
+	services serviceManager
 }
+
+// Close interrupts pending service requests and releases the D-Bus session.
+// Stop accepting controller connections before calling it.
+func (s *Server) Close() { s.services.close() }
 
 // Serve reads newline-delimited JSON requests from r and writes responses to w.
 // It blocks until r is closed or an unrecoverable error occurs.

@@ -51,7 +51,9 @@ func main() {
 	switch {
 	case *serve:
 		s := &fastagent.Server{Logger: logger, Tokens: fastagent.NewOnceTokens()}
-		if err := s.Serve(os.Stdin, os.Stdout); err != nil {
+		err := s.Serve(os.Stdin, os.Stdout)
+		s.Close()
+		if err != nil {
 			logger.Error("serve failed", "error", err)
 			os.Exit(1)
 		}

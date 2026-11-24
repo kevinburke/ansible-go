@@ -26,7 +26,7 @@ Buildkite pins ansible-core, goimports, differ, and Staticcheck in
 `.buildkite/pipeline.yml`. CI tests the pinned Ansible release independently of
 the compatibility audit above; updating CI does not redo that audit.
 
-Go and Python are supplied by the Buildkite host. The current ansible-core pin
+Go, Python, and dbus-daemon are supplied by the Buildkite host. The current ansible-core pin
 requires Python 3.12 or newer. The Python setup script creates a standard-library
 venv and upgrades pip when provisioning it; no separate virtualenv package or
 ansible-lint is used. ansible-galaxy, ansible-doc, and ansible-playbook are
@@ -34,6 +34,62 @@ included in ansible-core.
 
 When updating the pins, run the CI format, lint, test, build, python-test, and
 check-versions commands with the pipeline's environment values.
+
+### Systemd D-Bus tests and benchmark
+
+The Go tests launch a private `dbus-daemon` and export a fake systemd API.
+They cover early job completion, failures, lost connections, deadlines,
+serial execution, enablement reloads, and unexpected signal senders without
+changing host services. Install `dbus-daemon` to run these tests; they report
+an explicit skip locally if it is unavailable. CI requires it so these tests
+cannot silently skip. Pure Go service-manager tests always run.
+
+For a read-only benchmark on a real systemd host:
+
+```bash
+FASTAGENT_BENCH_SYSTEMD_UNIT=dbus.service go test -trimpath -run '^$' \
+    -bench '^BenchmarkServiceRead$' -benchtime=200ms -count=20 > bench.txt
+benchstat -col /backend bench.txt
+```
+
+This compares fresh active/enabled queries via two `systemctl` processes
+with the persistent D-Bus path. It never starts, stops, reloads or enables
+a unit. Results measure service query overhead, not complete Ansible runs.
+
+For an end-to-end mutation test before merging or releasing, build this branch
+with `make dev-install` and select a systemd test host with passwordless sudo:
+
+```bash
+make dev-install
+~/.ansible/fastagent-dev/run ansible-playbook \
+    -i 'testhost,' --limit testhost --user deploy \
+    -e fastagent_systemd_smoke=true tests/systemd-smoke.yml
+```
+
+The playbook requires a development collection and explicitly selects the
+fastagent connection. It exercises the action plugin, Python client, Go daemon,
+and real systemd over SSH. It creates uniquely named units under
+`/run/systemd/system`, using an isolated target for enablement, and checks:
+
+- dependency ordering and completed blocking jobs;
+- start/stop idempotency, actual restart execution, and service reload;
+- persistent enable/disable and daemon-reload;
+- check mode without service mutations;
+- a `no_block` job that finishes only after a later task releases it;
+- explicit failed-job reporting and recovery on the following request.
+
+Assertions compare RPC results with independent `systemctl` queries and service
+execution markers. An `always` block stops and disables the test units using
+`systemctl`, clears their failure records, removes their files and links, and
+verifies that no test units or unit files remain.
+Cleanup failures fail the play. The test reloads systemd's configuration, but
+does not restart existing services. Do not interrupt it during cleanup.
+
+Use the same playbook on each supported distribution and on a dbus-broker host;
+the private-bus tests alone do not establish real systemd version compatibility.
+For a separate development install, set `FASTAGENT_DEV_DEST` and
+`FASTAGENT_DEV_AGENT_DIR` when building, then pass the latter as
+`-e fastagent_local_agent_dir=/path/to/agents` when running the playbook.
 
 ### Differential tests
 

@@ -2,6 +2,26 @@
 
 All notable changes to fastagent are documented in this file.
 
+## 0.14.0 — November 24, 2026
+
+- Systemd service operations now lazily open a persistent D-Bus session shared
+  across the daemon's controller connections. Requests remain sequential and
+  read fresh unit state, while avoiding per-operation `systemctl` processes.
+  The existing `Service` RPC now also accepts `daemon_reload`, including
+  reload-only requests. Enabling/disabling units reloads the manager as
+  `systemctl` does. Blocking calls wait for the actual systemd job result;
+  explicit `no_block` retains its asynchronous behavior.
+- Failed state reads and failed, canceled or timed-out systemd jobs now report
+  errors. D-Bus method replies have a 30-second deadline; systemd
+  continues to govern unit/job timeouts. Interrupted mutations report
+  uncertainty rather than being replayed; a later request opens a new session
+  after failure. Agent shutdown interrupts pending waits and closes the session.
+- Added an opt-in smoke playbook for development builds against real systemd.
+  It verifies dependencies, service lifecycle and enablement, check mode,
+  nonblocking jobs, explicit job failures, recovery, and complete fixture
+  cleanup. Private-bus integration tests continue to cover signal ordering
+  and disconnects without modifying host services.
+
 ## 0.13.0 — November 22, 2026
 
 - Added the `EnsureFiles` RPC for creating regular files and repairing owner,
