@@ -1,0 +1,256 @@
+---
+# Run only on a designated systemd test host with a development collection.
+# See docs/testing.md. Every service and enablement link belongs to this run.
+- name: Exercise the development Service RPC against real systemd
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    ansible_connection: kevinburke.fastagent.fastagent
+  tasks:
+    - name: Require an explicitly selected test host and a development build
+      ansible.builtin.assert:
+        that:
+          - fastagent_systemd_smoke | default(false) | bool
+          - >-
+            lookup('ansible.builtin.file', lookup('ansible.builtin.env',
+            'ANSIBLE_ACTION_PLUGINS') + '/../connection/fastagent.py') is
+            search('(?m)^AGENT_VERSION = "[0-9.]+-dev[.][^"]+"$')
+        fail_msg: Use the dev-install wrapper and set fastagent_systemd_smoke=true.
+
+    - name: Create a unique fixture directory
+      ansible.builtin.tempfile:
+        state: directory
+        path: /run
+        prefix: fastagent-systemd-smoke-
+      register: fixture
+
+    - name: Name this run's units
+      ansible.builtin.set_fact:
+        unit_prefix: "{{ fixture.path | basename }}"
+
+    - name: Test temporary units and always clean them up
+      block:
+        - name: Install isolated service fixtures
+          ansible.builtin.copy:
+            dest: "/run/systemd/system/{{ unit_prefix }}-{{ item.name }}"
+            mode: '0644'
+            content: "{{ item.content }}"
+          loop:
+            - name: test.target
+              content: |
+                [Unit]
+                Description=Fastagent smoke test enablement target
+            - name: dependency.service
+              content: |
+                [Unit]
+                Description=Fastagent smoke test dependency
+                [Service]
+                Type=oneshot
+                RemainAfterExit=yes
+                ExecStart=/usr/bin/touch {{ fixture.path }}/dependency-ready
+                ExecStop=/usr/bin/rm -f {{ fixture.path }}/dependency-ready
+                TimeoutStartSec=10
+                TimeoutStopSec=10
+            - name: main.service
+              content: |
+                [Unit]
+                Description=Fastagent smoke test service
+                Requires={{ unit_prefix }}-dependency.service
+                After={{ unit_prefix }}-dependency.service
+                [Service]
+                Type=oneshot
+                RemainAfterExit=yes
+                ExecStart=/usr/bin/test -f {{ fixture.path }}/dependency-ready
+                ExecStart=/usr/bin/touch {{ fixture.path }}/started
+                ExecStart=/bin/sh -c 'echo started >> {{ fixture.path }}/starts'
+                ExecStop=/usr/bin/rm -f {{ fixture.path }}/started
+                ExecReload=/usr/bin/touch {{ fixture.path }}/reloaded
+                TimeoutStartSec=10
+                TimeoutStopSec=10
+                [Install]
+                WantedBy={{ unit_prefix }}-test.target
+            - name: failure.service
+              content: |
+                [Unit]
+                Description=Fastagent smoke test intentional failure
+                [Service]
+                Type=oneshot
+                ExecStart=/usr/bin/false
+                TimeoutStartSec=10
+            - name: delayed.service
+              content: |
+                [Unit]
+                Description=Fastagent smoke test nonblocking start
+                [Service]
+                Type=oneshot
+                RemainAfterExit=yes
+                ExecStart=/bin/sh -c 'while test ! -f {{ fixture.path }}/release; do sleep 0.1; done'
+                TimeoutStartSec=60
+                TimeoutStopSec=10
+
+        - name: Load fixture units through D-Bus
+          ansible.legacy.systemd:
+            daemon_reload: true
+          register: reloaded_manager
+
+        - name: Check mode must leave the main service stopped and disabled
+          ansible.legacy.systemd:
+            name: "{{ unit_prefix }}-main.service"
+            state: started
+            enabled: true
+            daemon_reload: true
+          check_mode: true
+
+        - name: Verify check mode independently with systemctl
+          ansible.builtin.command:
+            argv: [systemctl, show, --property=ActiveState, --property=UnitFileState, "{{ unit_prefix }}-main.service"]
+          changed_when: false
+          register: before_start
+
+        - name: Assert check mode had no service side effects
+          ansible.builtin.assert:
+            that:
+              - not reloaded_manager.changed
+              - "'ActiveState=inactive' in before_start.stdout_lines"
+              - "'UnitFileState=disabled' in before_start.stdout_lines"
+
+        - name: Check service lifecycle and idempotency
+          ansible.builtin.include_tasks: systemd-smoke-step.yml
+          loop:
+            - {state: started, enabled: true, changed: true, active: active, file_state: enabled, starts: 1}
+            - {state: started, enabled: true, changed: false, active: active, file_state: enabled, starts: 1}
+            - {state: reloaded, enabled: true, changed: true, active: active, file_state: enabled, starts: 1}
+            - {state: restarted, enabled: true, changed: true, active: active, file_state: enabled, starts: 2}
+            - {state: stopped, enabled: false, changed: true, active: inactive, file_state: disabled, starts: 2}
+            - {state: stopped, enabled: false, changed: false, active: inactive, file_state: disabled, starts: 2}
+          loop_control:
+            loop_var: step
+
+        - name: Verify ExecReload actually ran
+          ansible.builtin.stat:
+            path: "{{ fixture.path }}/reloaded"
+          register: reload_marker
+
+        - name: Assert reload reached the service
+          ansible.builtin.assert:
+            that: reload_marker.stat.exists
+
+        - name: Queue a job that cannot complete until a later task releases it
+          ansible.legacy.systemd:
+            name: "{{ unit_prefix }}-delayed.service"
+            state: started
+            no_block: true
+          register: queued
+
+        - name: Verify no_block returned while the job was still running
+          ansible.builtin.command:
+            argv: [systemctl, show, --property=ActiveState, --value, "{{ unit_prefix }}-delayed.service"]
+          changed_when: false
+          register: pending
+
+        - name: Assert the job has not completed yet
+          ansible.builtin.assert:
+            that:
+              - queued.changed
+              - pending.stdout == 'activating'
+
+        - name: Release the pending job
+          ansible.builtin.copy:
+            dest: "{{ fixture.path }}/release"
+            content: ''
+            mode: '0600'
+
+        - name: Wait for actual systemd completion
+          ansible.builtin.command:
+            argv: [systemctl, show, --property=ActiveState, --value, "{{ unit_prefix }}-delayed.service"]
+          changed_when: false
+          register: completed
+          until: completed.stdout == 'active'
+          retries: 10
+          delay: 1
+
+        - name: Observe a failed systemd job without aborting cleanup
+          ansible.legacy.systemd:
+            name: "{{ unit_prefix }}-failure.service"
+            state: started
+          register: failed_job
+          failed_when: false
+
+        - name: Require an explicit D-Bus job failure
+          ansible.builtin.assert:
+            that:
+              - "'systemd job result' in failed_job.msg | default('')"
+              - "'failed' in failed_job.msg | default('')"
+            fail_msg: "Expected a D-Bus job failure, got {{ failed_job }}"
+
+        - name: Check recovery on the next request after the failure
+          ansible.legacy.systemd:
+            name: "{{ unit_prefix }}-main.service"
+            state: started
+          register: recovered
+
+        - name: Assert recovery succeeded
+          ansible.builtin.assert:
+            that:
+              - recovered.changed
+              - recovered.state == 'active'
+
+      always:
+        # Cleanup uses stock systemctl so a broken Service RPC cannot prevent it.
+        # Each cleanup step runs even if another fails; failures still fail the play.
+        - name: Clean up services and remove their fixture files
+          block:
+            - name: Stop only this run's units
+              ansible.builtin.command:
+                argv:
+                  - systemctl
+                  - stop
+                  - "{{ unit_prefix }}-main.service"
+                  - "{{ unit_prefix }}-dependency.service"
+                  - "{{ unit_prefix }}-delayed.service"
+                  - "{{ unit_prefix }}-failure.service"
+          always:
+            - name: Remove enablement before removing files
+              block:
+                - name: Disable this run's main service
+                  ansible.builtin.command:
+                    argv: [systemctl, disable, "{{ unit_prefix }}-main.service"]
+                - name: Clear failure records belonging only to this test
+                  ansible.builtin.command:
+                    argv: [systemctl, reset-failed, "{{ unit_prefix }}-*"]
+              always:
+                - name: Remove test unit files and enablement directory
+                  ansible.builtin.file:
+                    path: "{{ item }}"
+                    state: absent
+                  loop:
+                    - "/run/systemd/system/{{ unit_prefix }}-main.service"
+                    - "/run/systemd/system/{{ unit_prefix }}-dependency.service"
+                    - "/run/systemd/system/{{ unit_prefix }}-delayed.service"
+                    - "/run/systemd/system/{{ unit_prefix }}-failure.service"
+                    - "/run/systemd/system/{{ unit_prefix }}-test.target"
+                    - "/etc/systemd/system/{{ unit_prefix }}-test.target.wants"
+                    - "/etc/systemd/system/{{ unit_prefix }}-main.service"
+                    - "{{ fixture.path }}"
+
+                - name: Reload systemd after cleanup
+                  ansible.builtin.command:
+                    argv: [systemctl, daemon-reload]
+
+                - name: Verify no test unit files remain
+                  ansible.builtin.command:
+                    argv: [systemctl, list-unit-files, --no-legend, "{{ unit_prefix }}-*"]
+                  changed_when: false
+                  register: remaining
+                  # systemctl exits 1 when no unit files match the pattern.
+                  failed_when: >-
+                    remaining.rc not in [0, 1] or remaining.stdout | trim != ''
+                    or remaining.stderr | trim != ''
+
+                - name: Verify no active or failed test units remain
+                  ansible.builtin.command:
+                    argv: [systemctl, list-units, --all, --no-legend, "{{ unit_prefix }}-*"]
+                  changed_when: false
+                  register: remaining_units
+                  failed_when: remaining_units.rc != 0 or remaining_units.stdout | trim != ''

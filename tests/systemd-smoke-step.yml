@@ -1,0 +1,30 @@
+---
+- name: "Request {{ step.state }}, enabled={{ step.enabled }}"
+  ansible.legacy.systemd:
+    name: "{{ unit_prefix }}-main.service"
+    state: "{{ step.state }}"
+    enabled: "{{ step.enabled }}"
+  register: service_result
+
+- name: Read actual service state independently
+  ansible.builtin.command:
+    argv: [systemctl, show, --property=ActiveState, --property=UnitFileState, "{{ unit_prefix }}-main.service"]
+  changed_when: false
+  register: actual
+
+- name: Count actual service executions
+  ansible.builtin.command:
+    argv: [wc, --lines, "{{ fixture.path }}/starts"]
+  changed_when: false
+  register: starts
+
+- name: Verify the RPC result and systemd state
+  ansible.builtin.assert:
+    that:
+      - service_result.changed == step.changed
+      - service_result.state == step.active
+      # The ServiceResult wire format omits enabled when it is false.
+      - service_result.enabled | default(false) == step.enabled
+      - starts.stdout.split()[0] | int == step.starts
+      - "('ActiveState=' + step.active) in actual.stdout_lines"
+      - "('UnitFileState=' + step.file_state) in actual.stdout_lines"
