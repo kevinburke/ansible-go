@@ -9,7 +9,7 @@ import (
 )
 
 // Version is the agent version. Bump this when the protocol or behavior changes.
-const Version = "0.13.0"
+const Version = "0.14.0"
 
 // Request is a JSON-RPC request from the controller.
 //
@@ -421,11 +421,12 @@ type PackageResult struct {
 
 // ServiceParams manages system services.
 type ServiceParams struct {
-	Manager string `json:"manager,omitempty"` // systemd, sysvinit
-	Name    string `json:"name"`
-	State   string `json:"state,omitempty"`   // started, stopped, restarted, reloaded
-	Enabled *bool  `json:"enabled,omitempty"` // pointer to distinguish unset from false
-	NoBlock bool   `json:"no_block,omitempty"`
+	Manager      string `json:"manager,omitempty"` // systemd, sysvinit
+	Name         string `json:"name"`
+	State        string `json:"state,omitempty"`   // started, stopped, restarted, reloaded
+	Enabled      *bool  `json:"enabled,omitempty"` // pointer to distinguish unset from false
+	NoBlock      bool   `json:"no_block,omitempty"`
+	DaemonReload bool   `json:"daemon_reload,omitempty"`
 }
 
 // ServiceResult is the result of a service operation.

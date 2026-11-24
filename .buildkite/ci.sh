@@ -55,6 +55,10 @@ run_lint() {
 }
 
 run_test() {
+  if ! command -v dbus-daemon >/dev/null 2>&1; then
+    echo "dbus-daemon is required for systemd D-Bus integration tests" >&2
+    exit 1
+  fi
   go test -race -cover ./...
 }
 

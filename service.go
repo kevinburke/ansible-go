@@ -1,9 +1,9 @@
 package fastagent
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"os/exec"
 	"strings"
 )
 
@@ -12,77 +12,98 @@ func (s *Server) handleService(params json.RawMessage) (any, error) {
 	if err := json.Unmarshal(params, &p); err != nil {
 		return nil, fmt.Errorf("unmarshal ServiceParams: %w", err)
 	}
-	if p.Name == "" {
-		return nil, fmt.Errorf("service name is required")
-	}
-	if p.Manager == "" {
-		p.Manager = "systemd"
-	}
-
-	switch p.Manager {
-	case "systemd":
-		return s.handleServiceSystemd(p)
-	default:
+	if p.Manager != "" && p.Manager != "systemd" {
 		return nil, fmt.Errorf("unsupported service manager: %q", p.Manager)
 	}
-}
-
-func (s *Server) handleServiceSystemd(p ServiceParams) (any, error) {
-	changed := false
-
-	// Get current state.
-	activeOut, _ := exec.Command("systemctl", "is-active", p.Name).Output()
-	currentActive := strings.TrimSpace(string(activeOut))
-
-	enabledOut, _ := exec.Command("systemctl", "is-enabled", p.Name).Output()
-	currentEnabled := strings.TrimSpace(string(enabledOut)) == "enabled"
-
-	// Handle state changes.
+	if p.Name == "" && (!p.DaemonReload || p.State != "" || p.Enabled != nil) {
+		return nil, fmt.Errorf("service name is required")
+	}
 	if p.State != "" {
-		action, err := systemdStateAction(p.State, currentActive)
-		if err != nil {
+		if _, err := systemdStateAction(p.State, "inactive"); err != nil {
 			return nil, err
 		}
-		needsAction := action != ""
+	}
+	name := p.Name
+	p.Name = systemdUnitName(name)
+	result, err := s.services.apply(context.Background(), p)
+	result.Name = name
+	return result, err
+}
 
-		if needsAction {
-			cmd := systemctlCommand(p, action, p.Name)
-			if out, err := cmd.CombinedOutput(); err != nil {
-				return nil, fmt.Errorf("systemctl %s %s: %s\n%s", action, p.Name, err, string(out))
-			}
-			changed = true
+// Match systemctl's default .service suffix, including dotted instance names.
+func systemdUnitName(name string) string {
+	if name == "" {
+		return name
+	}
+	for _, suffix := range []string{".service", ".socket", ".target", ".device", ".mount", ".automount", ".swap", ".timer", ".path", ".slice", ".scope"} {
+		if strings.HasSuffix(name, suffix) {
+			return name
 		}
 	}
+	return name + ".service"
+}
 
-	// Handle enabled changes.
-	if p.Enabled != nil {
-		want := *p.Enabled
-		if want != currentEnabled {
-			action := "disable"
-			if want {
-				action = "enable"
-			}
-			cmd := systemctlCommand(p, action, p.Name)
-			if out, err := cmd.CombinedOutput(); err != nil {
-				return nil, fmt.Errorf("systemctl %s %s: %s\n%s", action, p.Name, err, string(out))
-			}
-			changed = true
-			currentEnabled = want
+func (m *serviceManager) apply(ctx context.Context, p ServiceParams) (result ServiceResult, err error) {
+	m.initialize()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := context.AfterFunc(m.lifetime, cancel)
+	defer stop()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	result = ServiceResult{Name: p.Name}
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
+	bus, err := m.connect(ctx)
+	if err != nil {
+		return result, err
+	}
+	// Do not replay any part of a failed request. Even a successful mutation
+	// followed by a failed status read has an ambiguous final outcome.
+	defer func() {
+		if err != nil {
+			bus.Close()
+			m.bus = nil
+		}
+	}()
+	if p.DaemonReload {
+		if err := bus.Reload(ctx); err != nil {
+			return result, fmt.Errorf("daemon-reload: %w (operation not retried)", err)
 		}
 	}
-
-	// Re-check active state after changes.
-	if changed {
-		activeOut, _ = exec.Command("systemctl", "is-active", p.Name).Output()
-		currentActive = strings.TrimSpace(string(activeOut))
+	if p.Name == "" {
+		return result, nil
 	}
-
-	return ServiceResult{
-		Changed: changed,
-		Name:    p.Name,
-		State:   currentActive,
-		Enabled: currentEnabled,
-	}, nil
+	result.State, result.Enabled, err = bus.State(ctx, p.Name)
+	if err != nil {
+		return result, err
+	}
+	if p.State != "" {
+		action, err := systemdStateAction(p.State, result.State)
+		if err != nil {
+			return result, err
+		}
+		if action != "" {
+			if err := bus.SetState(ctx, p.Name, action, p.NoBlock); err != nil {
+				return result, err
+			}
+			result.Changed = true
+		}
+	}
+	if p.Enabled != nil && *p.Enabled != result.Enabled {
+		if err := bus.SetEnabled(ctx, p.Name, *p.Enabled); err != nil {
+			return result, fmt.Errorf("set %s enabled=%v: %w (operation not retried)", p.Name, *p.Enabled, err)
+		}
+		result.Changed = true
+	}
+	if result.Changed {
+		result.State, result.Enabled, err = bus.State(ctx, p.Name)
+		if err != nil {
+			return result, fmt.Errorf("read state after changes: %w (operation not retried)", err)
+		}
+	}
+	return result, nil
 }
 
 // systemdStateAction returns the systemctl verb that brings a unit whose
@@ -119,13 +140,4 @@ func systemdStateAction(state, active string) (string, error) {
 		return "", fmt.Errorf("unsupported service state: %q", state)
 	}
 	return "", nil
-}
-
-func systemctlCommand(p ServiceParams, args ...string) *exec.Cmd {
-	cmdArgs := make([]string, 0, len(args)+1)
-	if p.NoBlock {
-		cmdArgs = append(cmdArgs, "--no-block")
-	}
-	cmdArgs = append(cmdArgs, args...)
-	return exec.Command("systemctl", cmdArgs...)
 }

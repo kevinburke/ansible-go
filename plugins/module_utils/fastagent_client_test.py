@@ -22,6 +22,18 @@ from fastagent_client import (
 )
 
 
+class TestServiceRequest(unittest.TestCase):
+    def test_reload_only_request_uses_service_rpc(self):
+        output = io.BytesIO()
+        client = FastAgentClient(output, io.BytesIO(b'{"id":1,"result":{"changed":false}}\n'))
+        result = client.service(name="", daemon_reload=True)
+        self.assertFalse(result["changed"])
+        self.assertEqual(json.loads(output.getvalue()), {
+            "id": 1, "method": "Service",
+            "params": {"name": "", "manager": "systemd", "daemon_reload": True},
+        })
+
+
 class TestRPCFailures(unittest.TestCase):
     def test_invalid_response_poisoned_stream_is_not_used_again(self):
         responses = [b"", b"not json\n"] + [
