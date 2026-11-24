@@ -55,31 +55,16 @@ class ActionModule(ActionBase):
         client = self._connection._agent_client
         check_mode = self._play_context.check_mode
 
-        changed = False
-
-        # Handle daemon-reload via Exec.
-        if daemon_reload:
-            if not check_mode:
-                try:
-                    exec_result = client.exec(
-                        argv=["systemctl", "daemon-reload"],
-                    )
-                    if exec_result.get("rc", 1) != 0:
-                        result["failed"] = True
-                        result["msg"] = f"daemon-reload failed: {exec_result.get('stderr', '')}"
-                        return result
-                except Exception as e:
-                    result["failed"] = True
-                    result["msg"] = f"daemon-reload failed: {e}"
-                    return result
-
-        if not name:
-            result["changed"] = changed
+        # Check mode retains the existing prediction, without invoking any
+        # mutation (including daemon-reload) on the agent.
+        if check_mode:
+            result["changed"] = bool(name)
+            if name:
+                result["name"] = name
             return result
 
-        if check_mode:
-            result["changed"] = True
-            result["name"] = name
+        if not name and not daemon_reload:
+            result["changed"] = False
             return result
 
         # Convert enabled to bool if it's a string.
@@ -88,14 +73,16 @@ class ActionModule(ActionBase):
 
         try:
             svc_result = client.service(
-                name=name,
+                name=name or "",
                 manager="systemd",
                 state=state,
                 enabled=enabled,
                 no_block=no_block,
+                daemon_reload=daemon_reload,
             )
-            result["changed"] = svc_result.get("changed", False) or changed
-            result["name"] = name
+            result["changed"] = svc_result.get("changed", False)
+            if name:
+                result["name"] = name
             if svc_result.get("state"):
                 result["state"] = svc_result["state"]
             if "enabled" in svc_result:

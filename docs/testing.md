@@ -26,7 +26,7 @@ Buildkite pins ansible-core, goimports, differ, and Staticcheck in
 `.buildkite/pipeline.yml`. CI tests the pinned Ansible release independently of
 the compatibility audit above; updating CI does not redo that audit.
 
-Go and Python are supplied by the Buildkite host. The current ansible-core pin
+Go, Python, and dbus-daemon are supplied by the Buildkite host. The current ansible-core pin
 requires Python 3.12 or newer. The Python setup script creates a standard-library
 venv and upgrades pip when provisioning it; no separate virtualenv package or
 ansible-lint is used. ansible-galaxy, ansible-doc, and ansible-playbook are
@@ -34,6 +34,27 @@ included in ansible-core.
 
 When updating the pins, run the CI format, lint, test, build, python-test, and
 check-versions commands with the pipeline's environment values.
+
+### Systemd D-Bus tests and benchmark
+
+The Go tests launch a private `dbus-daemon` and export a fake systemd API.
+They cover early job completion, failures, lost connections, deadlines,
+serial execution, enablement reloads, and unexpected signal senders without
+changing host services. Install `dbus-daemon` to run these tests; they report
+an explicit skip locally if it is unavailable. CI requires it so these tests
+cannot silently skip. Pure Go service-manager tests always run.
+
+For a read-only benchmark on a real systemd host:
+
+```bash
+FASTAGENT_BENCH_SYSTEMD_UNIT=dbus.service go test -trimpath -run '^$' \
+    -bench '^BenchmarkServiceRead$' -benchtime=200ms -count=20 > bench.txt
+benchstat -col /backend bench.txt
+```
+
+This compares fresh active/enabled queries via two `systemctl` processes
+with the persistent D-Bus path. It never starts, stops, reloads or enables
+a unit. Results measure service query overhead, not complete Ansible runs.
 
 ### Differential tests
 

@@ -35,7 +35,7 @@ class _RecordingAgentClient:
 
     def service(self, **kwargs):
         self.service_kwargs = kwargs
-        return {"changed": True, "state": "active", "enabled": True}
+        return {"changed": bool(kwargs.get("name")), "state": "active", "enabled": True}
 
 
 class _FakeConnection:
@@ -127,10 +127,10 @@ class TestSystemdActionRPC(unittest.TestCase):
             result = action.run(task_vars={})
 
         self.assertFalse(result["changed"])
-        self.assertEqual(
-            action._connection._agent_client.exec_calls,
-            [{"argv": ["systemctl", "daemon-reload"]}],
-        )
+        client = action._connection._agent_client
+        self.assertEqual(client.exec_calls, [])
+        self.assertEqual(client.service_kwargs["name"], "")
+        self.assertTrue(client.service_kwargs["daemon_reload"])
 
     def test_no_block_is_sent_to_service_rpc(self):
         action = _make_action({"name": "cron", "state": "restarted", "no_block": True})
@@ -146,8 +146,44 @@ class TestSystemdActionRPC(unittest.TestCase):
                 "state": "restarted",
                 "enabled": None,
                 "no_block": True,
+                "daemon_reload": False,
             },
         )
+
+    def test_reload_and_service_share_one_rpc(self):
+        action = _make_action({"name": "cron", "state": "started", "daemon_reload": True})
+        with patch.object(ActionBase, "run", return_value={}):
+            result = action.run(task_vars={})
+        self.assertFalse(result.get("failed", False))
+        client = action._connection._agent_client
+        self.assertEqual(client.exec_calls, [])
+        self.assertTrue(client.service_kwargs["daemon_reload"])
+        self.assertEqual(client.service_kwargs["state"], "started")
+
+    def test_check_mode_does_not_reload_or_change_services(self):
+        for args in ({"daemon_reload": True}, {"name": "cron", "state": "started", "daemon_reload": True}):
+            with self.subTest(args=args):
+                action = _make_action(args, check_mode=True)
+                with patch.object(ActionBase, "run", return_value={}):
+                    result = action.run(task_vars={})
+                self.assertEqual(result["changed"], bool(args.get("name")))
+                client = action._connection._agent_client
+                self.assertEqual(client.exec_calls, [])
+                self.assertIsNone(client.service_kwargs)
+
+    def test_failed_rpc_is_not_replayed_through_exec_or_builtin(self):
+        action = _make_action({"name": "cron", "state": "restarted"})
+        with (
+            patch.object(ActionBase, "run", return_value={}),
+            patch.object(action._connection._agent_client, "service", side_effect=RuntimeError("outcome unknown")) as service,
+            patch.object(ActionModule, "_execute_module") as builtin,
+        ):
+            result = action.run(task_vars={})
+        self.assertTrue(result["failed"])
+        self.assertIn("outcome unknown", result["msg"])
+        service.assert_called_once()
+        builtin.assert_not_called()
+        self.assertEqual(action._connection._agent_client.exec_calls, [])
 
 
 if __name__ == "__main__":

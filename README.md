@@ -370,6 +370,14 @@ Controller                          Remote Host
 - **Daemon**: persistent Go process on the remote host. Accepts JSON-RPC over
   a Unix socket. Handles Exec, Stat, ReadFile, WriteFile, File, Package,
   Service and EnsureFiles RPCs. Auto-exits after 1 hour idle.
+- **Systemd**: the first Service RPC opens a D-Bus session to the existing
+  system bus. The daemon reuses it across controller connections and closes
+  it at shutdown. The Go systemd library uses separate persistent sockets for
+  method calls and completion signals. Service requests execute sequentially,
+  read fresh state, and wait for job completion unless `no_block` is explicit.
+  `daemon_reload` uses the same session. D-Bus method replies have a
+  30-second deadline; job waits retain systemd's configured timeouts. Errors
+  never replay mutations, and a later request can reconnect. The host must have a running system bus.
 - **SSH forwarding**: a dedicated `ssh -fN -L local.sock:remote.sock` master
   runs once per connection configuration and bridges the local and remote
   sockets. It persists across tasks and forks, with its own `<local socket>.ctl`
